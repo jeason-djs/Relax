@@ -21,9 +21,12 @@
 #   DATA_DIR   - dir containing gsm8k/train.jsonl and aime-2024/aime-2024.jsonl
 #   ROLLOUT_MAX_RESPONSE_LEN, EVAL_MAX_RESPONSE_LEN, MAX_TOKENS_PER_GPU,
 #   LOG_PROBS_MAX_TOKENS_PER_GPU, SGLANG_MEM_FRACTION_STATIC - memory tuning knobs
+#   REWARD_NUM_WORKERS - math reward worker count; lower it on small CPU machines
 #   OPTIMIZER_CPU_OFFLOAD=1 - offload optimizer state to CPU for small GPUs
 #   USE_CLEARML=0, USE_METRICS_SERVICE=0 - reduce service overhead on small machines
 #   SGLANG_EXTRA_ARGS - extra space-separated --sglang-* arguments
+#   ATTENTION_BACKEND, MEGATRON_EXTRA_ARGS - Megatron fallback knobs for non-official images
+#   USE_DYNAMIC_BATCH_SIZE=0, MICRO_BATCH_SIZE - static micro-batch fallback knobs
 #
 # Metrics to watch in ClearML:
 #   rollout/raw_reward   -- accuracy 0/1 (expect ~0.5-0.7 initial on GSM8K, rising over training)
@@ -59,6 +62,10 @@ EVAL_MAX_RESPONSE_LEN="${EVAL_MAX_RESPONSE_LEN:=2048}"
 MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:=8192}"
 LOG_PROBS_MAX_TOKENS_PER_GPU="${LOG_PROBS_MAX_TOKENS_PER_GPU:=8192}"
 SGLANG_MEM_FRACTION_STATIC="${SGLANG_MEM_FRACTION_STATIC:=0.45}"
+REWARD_NUM_WORKERS="${REWARD_NUM_WORKERS:=16}"
+ATTENTION_BACKEND="${ATTENTION_BACKEND:=flash}"
+USE_DYNAMIC_BATCH_SIZE="${USE_DYNAMIC_BATCH_SIZE:=1}"
+MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:=1}"
 # train_iters = 100 * 4 * 8 / 16 = 200
 
 CKPT_ARGS=(
@@ -76,6 +83,7 @@ ROLLOUT_ARGS=(
     --rollout-shuffle
 
     --rm-type math
+    --reward-num-workers ${REWARD_NUM_WORKERS}
 
     --num-rollout ${NUM_ROLLOUT}
     --rollout-batch-size ${ROLLOUT_BATCH_SIZE}
@@ -96,10 +104,14 @@ PERF_ARGS=(
     --expert-tensor-parallel-size 1
 
     --calculate-per-token-loss
-    --use-dynamic-batch-size
     --max-tokens-per-gpu ${MAX_TOKENS_PER_GPU}
     --log-probs-max-tokens-per-gpu ${LOG_PROBS_MAX_TOKENS_PER_GPU}
 )
+if [ "${USE_DYNAMIC_BATCH_SIZE}" = "1" ]; then
+    PERF_ARGS+=(--use-dynamic-batch-size)
+else
+    PERF_ARGS+=(--micro-batch-size ${MICRO_BATCH_SIZE})
+fi
 
 GRPO_ARGS=(
     --advantage-estimator grpo
@@ -167,8 +179,12 @@ MISC_ARGS=(
     --hidden-dropout 0.0
     --accumulate-allreduce-grads-in-fp32
     --attention-softmax-in-fp32
-    --attention-backend flash
+    --attention-backend ${ATTENTION_BACKEND}
 )
+if [ -n "${MEGATRON_EXTRA_ARGS:-}" ]; then
+    read -r -a MEGATRON_EXTRA_ARGS_ARRAY <<< "${MEGATRON_EXTRA_ARGS}"
+    MISC_ARGS+=("${MEGATRON_EXTRA_ARGS_ARRAY[@]}")
+fi
 
 mkdir -p log
 ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \

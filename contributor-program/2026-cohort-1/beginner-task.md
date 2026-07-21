@@ -89,11 +89,11 @@ export DATA_DIR=/root/data
 bash contributor-program/2026-cohort-1/run-qwen3-0.6B-1xgpu-grpo.sh
 ```
 
-For Featurize instances where `docker run --gpus all` cannot start the official image, see `featurize-official-image.md`.
+For Featurize instances where `docker run --gpus all` cannot start the official image, see `featurize-official-image.md`. For AutoDL/SeetaCloud machines without Docker or with a non-official host environment, see `autodl-runbook.md`.
 
 Before renting a GPU instance, also check the resource sizing notes in `featurize-official-image.md`. The full GRPO stack is heavier than loading the 0.6B model alone because it starts Megatron actor training, SGLang rollout, Ray Serve, queues, and metrics components at the same time. A 12 GB GPU with about 28 GB host memory was not enough in testing; prefer at least 24 GB GPU memory and 48 GB host memory, with 64 GB host memory recommended.
 
-For a smoke run that still satisfies the 10-step requirement, override rollout count:
+For a smoke run that still satisfies the 10-step requirement on a reasonably provisioned official image, override rollout count:
 
 ```bash
 NUM_ROLLOUT=5 bash contributor-program/2026-cohort-1/run-qwen3-0.6B-1xgpu-grpo.sh
@@ -105,7 +105,35 @@ With the default batch settings, training steps are:
 train_iters = NUM_ROLLOUT * ROLLOUT_BATCH_SIZE * N_SAMPLES / GLOBAL_BATCH_SIZE
 ```
 
-Default values produce `100 * 4 * 8 / 16 = 200` steps. `NUM_ROLLOUT=5` produces 10 steps.
+Default values produce `100 * 4 * 8 / 16 = 200` steps. `NUM_ROLLOUT=5` with default batch settings produces 10 steps.
+
+On small CPU machines, also reduce reward workers. For example, a 12-core AutoDL machine should use `REWARD_NUM_WORKERS=4`; the default 16 workers can leave many Ray actors in `PENDING_CREATION` and block rollout completion.
+
+On a 32 GB single-GPU AutoDL/SeetaCloud machine, the working smoke profile needs both CPU and memory tuning:
+
+```bash
+NUM_ROLLOUT=3 \
+ROLLOUT_BATCH_SIZE=4 \
+N_SAMPLES=4 \
+GLOBAL_BATCH_SIZE=4 \
+REWARD_NUM_WORKERS=4 \
+ROLLOUT_MAX_RESPONSE_LEN=512 \
+EVAL_MAX_RESPONSE_LEN=512 \
+MAX_TOKENS_PER_GPU=2048 \
+LOG_PROBS_MAX_TOKENS_PER_GPU=2048 \
+SGLANG_MEM_FRACTION_STATIC=0.35 \
+OPTIMIZER_CPU_OFFLOAD=1 \
+USE_CLEARML=0 \
+USE_METRICS_SERVICE=0 \
+SGLANG_EXTRA_ARGS="--sglang-disable-cuda-graph --sglang-disable-piecewise-cuda-graph --sglang-max-running-requests 4 --sglang-disable-radix-cache" \
+bash contributor-program/2026-cohort-1/run-qwen3-0.6B-1xgpu-grpo.sh
+```
+
+This profile produces `3 * 4 * 4 / 4 = 12` training steps. Keep `GLOBAL_BATCH_SIZE=4` in this profile; `GLOBAL_BATCH_SIZE=2` with `N_SAMPLES=4` makes the rollout mini plan invalid during actor training.
+
+The AutoDL/SeetaCloud 32 GB smoke run was verified on `2026-07-22` with Ray job `raysubmit_dFf7yDNygAFYScB3`. The job succeeded, reached internal train `step 11`, and logged `All training steps finished`.
+
+If the machine cannot run the official image and must use a patched host conda environment, also see `autodl-runbook.md` for the extra Megatron/SGLang fallback knobs. Those host patches are only for getting a resource-constrained smoke run through; the normal path should remain the official Relax image.
 
 ## Main Flow
 

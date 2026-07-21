@@ -24,6 +24,8 @@ Observed on a small Featurize instance:
 
 This means 12 GB GPU plus about 28 GB host memory is not enough for a reliable run, even with optimizer CPU offload and reduced rollout settings. Use the following as a practical sizing guide:
 
+A later AutoDL/SeetaCloud smoke run on 1 x RTX 4080 SUPER 32 GB, 12 CPU cores, and 62 GB host memory completed successfully with the conservative 12-step profile documented in `autodl-runbook.md`. That run used shorter rollout/eval lengths, CPU optimizer offload, fewer reward workers, and disabled SGLang CUDA graph paths. It proves the beginner task can finish on a 32 GB card when tuned, but the official image and a 48 GB+ GPU are still the cleaner recommendation for fewer environment-specific patches.
+
 | Tier | GPU | CPU | Host memory | Notes |
 | --- | --- | --- | --- | --- |
 | Minimum to try | 24 GB single GPU, such as RTX 4090, L20, or A10 | 8+ cores | 48 GB+ | Use the conservative environment overrides below. |
@@ -165,7 +167,7 @@ Expected counts on the tested download:
 /root/data/aime-2024/aime-2024.jsonl 90
 ```
 
-## 3. Run a 10-Step Smoke Test
+## 3. Run a Conservative Smoke Test
 
 On resource-constrained machines, use conservative settings:
 
@@ -178,10 +180,11 @@ export NUM_CPUS=16
 export MODEL_DIR=/root/model
 export DATA_DIR=/root/data
 
-export NUM_ROLLOUT=5
-export ROLLOUT_BATCH_SIZE=1
+export NUM_ROLLOUT=3
+export ROLLOUT_BATCH_SIZE=4
 export N_SAMPLES=4
-export GLOBAL_BATCH_SIZE=2
+export GLOBAL_BATCH_SIZE=4
+export REWARD_NUM_WORKERS=4
 export ROLLOUT_MAX_RESPONSE_LEN=512
 export EVAL_MAX_RESPONSE_LEN=512
 export MAX_TOKENS_PER_GPU=2048
@@ -199,11 +202,15 @@ The step count is:
 
 ```text
 NUM_ROLLOUT * ROLLOUT_BATCH_SIZE * N_SAMPLES / GLOBAL_BATCH_SIZE
-= 5 * 1 * 4 / 2
-= 10
+= 3 * 4 * 4 / 4
+= 12
 ```
 
 If Ray Serve reports a replica stuck with no CPU resources, increase `NUM_CPUS`. This is a Ray scheduling declaration; it does not create physical CPU cores, but it can unblock local smoke tests where service actors reserve more logical CPU slots than the small instance advertises by default.
+
+If reward workers remain in `PENDING_CREATION`, reduce `REWARD_NUM_WORKERS`. On a 12-core AutoDL machine, 16 reward workers blocked rollout completion, while 4 workers fit the available CPU budget.
+
+Keep the fixed-n-samples rollout mini plan valid. Relax derives `num_rollout_minis = ROLLOUT_BATCH_SIZE * N_SAMPLES / GLOBAL_BATCH_SIZE` and also requires one mini to match `GLOBAL_BATCH_SIZE`. In the 32 GB AutoDL smoke profile, `GLOBAL_BATCH_SIZE=2` with `N_SAMPLES=4` failed even when `ROLLOUT_BATCH_SIZE=4`; use `GLOBAL_BATCH_SIZE=4` and reduce `NUM_ROLLOUT` instead if fewer total steps are needed.
 
 On a 12 GB RTX 3060 with only about 27 GB container-visible host memory, this configuration still failed due to Ray memory pressure during rollout engine initialization:
 
