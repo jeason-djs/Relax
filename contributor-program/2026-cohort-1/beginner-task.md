@@ -91,6 +91,8 @@ bash contributor-program/2026-cohort-1/run-qwen3-0.6B-1xgpu-grpo.sh
 
 For Featurize instances where `docker run --gpus all` cannot start the official image, see `featurize-official-image.md`.
 
+Before renting a GPU instance, also check the resource sizing notes in `featurize-official-image.md`. The full GRPO stack is heavier than loading the 0.6B model alone because it starts Megatron actor training, SGLang rollout, Ray Serve, queues, and metrics components at the same time. A 12 GB GPU with about 28 GB host memory was not enough in testing; prefer at least 24 GB GPU memory and 48 GB host memory, with 64 GB host memory recommended.
+
 For a smoke run that still satisfies the 10-step requirement, override rollout count:
 
 ```bash
