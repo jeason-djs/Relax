@@ -21,6 +21,7 @@
 #   DATA_DIR   - dir containing gsm8k/train.jsonl and aime-2024/aime-2024.jsonl
 #   ROLLOUT_MAX_RESPONSE_LEN, EVAL_MAX_RESPONSE_LEN, MAX_TOKENS_PER_GPU,
 #   LOG_PROBS_MAX_TOKENS_PER_GPU, SGLANG_MEM_FRACTION_STATIC - memory tuning knobs
+#   OPTIMIZER_CPU_OFFLOAD=1 - offload optimizer state to CPU for small GPUs
 #
 # Metrics to watch in ClearML:
 #   rollout/raw_reward   -- accuracy 0/1 (expect ~0.5-0.7 initial on GSM8K, rising over training)
@@ -117,6 +118,13 @@ OPTIMIZER_ARGS=(
     --adam-beta1 0.9
     --adam-beta2 0.98
 )
+if [ "${OPTIMIZER_CPU_OFFLOAD:-0}" = "1" ]; then
+    OPTIMIZER_ARGS+=(
+        --optimizer-cpu-offload
+        --overlap-cpu-optimizer-d2h-h2d
+        --use-precision-aware-optimizer
+    )
+fi
 
 SGLANG_ARGS=(
     --rollout-num-gpus-per-engine 1
