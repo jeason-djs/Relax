@@ -19,6 +19,8 @@
 # Key overridable env vars:
 #   MODEL_DIR  - dir containing Qwen3-0.6B/
 #   DATA_DIR   - dir containing gsm8k/train.jsonl and aime-2024/aime-2024.jsonl
+#   ROLLOUT_MAX_RESPONSE_LEN, EVAL_MAX_RESPONSE_LEN, MAX_TOKENS_PER_GPU,
+#   LOG_PROBS_MAX_TOKENS_PER_GPU, SGLANG_MEM_FRACTION_STATIC - memory tuning knobs
 #
 # Metrics to watch in ClearML:
 #   rollout/raw_reward   -- accuracy 0/1 (expect ~0.5-0.7 initial on GSM8K, rising over training)
@@ -49,6 +51,11 @@ NUM_ROLLOUT="${NUM_ROLLOUT:=100}"
 ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:=4}"
 N_SAMPLES="${N_SAMPLES:=8}"
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:=16}"
+ROLLOUT_MAX_RESPONSE_LEN="${ROLLOUT_MAX_RESPONSE_LEN:=2048}"
+EVAL_MAX_RESPONSE_LEN="${EVAL_MAX_RESPONSE_LEN:=2048}"
+MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:=8192}"
+LOG_PROBS_MAX_TOKENS_PER_GPU="${LOG_PROBS_MAX_TOKENS_PER_GPU:=8192}"
+SGLANG_MEM_FRACTION_STATIC="${SGLANG_MEM_FRACTION_STATIC:=0.45}"
 # train_iters = 100 * 4 * 8 / 16 = 200
 
 CKPT_ARGS=(
@@ -70,7 +77,7 @@ ROLLOUT_ARGS=(
     --num-rollout ${NUM_ROLLOUT}
     --rollout-batch-size ${ROLLOUT_BATCH_SIZE}
     --n-samples-per-prompt ${N_SAMPLES}
-    --rollout-max-response-len 2048
+    --rollout-max-response-len ${ROLLOUT_MAX_RESPONSE_LEN}
     --rollout-temperature 1
 
     --global-batch-size ${GLOBAL_BATCH_SIZE}
@@ -87,8 +94,8 @@ PERF_ARGS=(
 
     --calculate-per-token-loss
     --use-dynamic-batch-size
-    --max-tokens-per-gpu 8192
-    --log-probs-max-tokens-per-gpu 8192
+    --max-tokens-per-gpu ${MAX_TOKENS_PER_GPU}
+    --log-probs-max-tokens-per-gpu ${LOG_PROBS_MAX_TOKENS_PER_GPU}
 )
 
 GRPO_ARGS=(
@@ -114,7 +121,7 @@ OPTIMIZER_ARGS=(
 SGLANG_ARGS=(
     --rollout-num-gpus-per-engine 1
     # About 55% for training; SGLang uses 45%.
-    --sglang-mem-fraction-static 0.45
+    --sglang-mem-fraction-static ${SGLANG_MEM_FRACTION_STATIC}
 )
 
 WANDB_ARGS=(
@@ -131,7 +138,7 @@ EVAL_ARGS=(
     --eval-input-key prompt
     --eval-label-key label
     --n-samples-per-eval-prompt 4
-    --eval-max-response-len 2048
+    --eval-max-response-len ${EVAL_MAX_RESPONSE_LEN}
     --log-passrate
 )
 

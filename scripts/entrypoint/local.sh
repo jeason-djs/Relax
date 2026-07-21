@@ -16,6 +16,7 @@
 #
 # Environment variables:
 #   NUM_GPUS               - Number of GPUs to use (optional, auto-detect from CUDA_VISIBLE_DEVICES)
+#   NUM_CPUS               - Number of CPUs to advertise to Ray (optional, auto-detect by Ray)
 #   CUDA_VISIBLE_DEVICES   - Comma-separated GPU IDs (e.g., "0,1,2,3" → 4 GPUs)
 #   MASTER_ADDR            - Head node IP address (default: 127.0.0.1)
 #   MEGATRON               - Path to Megatron-LM (default: /root/Megatron-LM/)
@@ -90,12 +91,20 @@ fi
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 echo "Starting Ray head node: MASTER_ADDR=$MASTER_ADDR, NUM_GPUS=$NUM_GPUS"
 
-ray start --head \
-    --node-ip-address "${MASTER_ADDR}" \
-    --num-gpus "${NUM_GPUS}" \
-    --disable-usage-stats \
-    --dashboard-host=0.0.0.0 \
+RAY_START_ARGS=(
+    --head
+    --node-ip-address "${MASTER_ADDR}"
+    --num-gpus "${NUM_GPUS}"
+    --disable-usage-stats
+    --dashboard-host=0.0.0.0
     --dashboard-port=8265
+)
+if [ -n "${NUM_CPUS:-}" ]; then
+    RAY_START_ARGS+=(--num-cpus "${NUM_CPUS}")
+fi
+
+ray start \
+    "${RAY_START_ARGS[@]}"
 
 # ── set entrypoint mode ────────────────────────────────────────────────────
 export RELAX_ENTRYPOINT_MODE="local"

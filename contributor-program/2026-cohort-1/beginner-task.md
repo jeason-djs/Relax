@@ -30,6 +30,12 @@ export HF_ENDPOINT=https://hf-mirror.com  # optional in China
 export MODEL_DIR=/root/model
 export DATA_DIR=/root/data
 
+可能需要设置这个环境变量
+export HF_HUB_DISABLE_XET=1
+
+检查是否生效
+echo $HF_HUB_DISABLE_XET
+
 hf download Qwen/Qwen3-0.6B --local-dir $MODEL_DIR/Qwen3-0.6B
 
 hf download openai/gsm8k main \
@@ -82,6 +88,8 @@ export MODEL_DIR=/root/model
 export DATA_DIR=/root/data
 bash contributor-program/2026-cohort-1/run-qwen3-0.6B-1xgpu-grpo.sh
 ```
+
+For Featurize instances where `docker run --gpus all` cannot start the official image, see `featurize-official-image.md`.
 
 For a smoke run that still satisfies the 10-step requirement, override rollout count:
 
