@@ -22,6 +22,8 @@
 #   ROLLOUT_MAX_RESPONSE_LEN, EVAL_MAX_RESPONSE_LEN, MAX_TOKENS_PER_GPU,
 #   LOG_PROBS_MAX_TOKENS_PER_GPU, SGLANG_MEM_FRACTION_STATIC - memory tuning knobs
 #   OPTIMIZER_CPU_OFFLOAD=1 - offload optimizer state to CPU for small GPUs
+#   USE_CLEARML=0, USE_METRICS_SERVICE=0 - reduce service overhead on small machines
+#   SGLANG_EXTRA_ARGS - extra space-separated --sglang-* arguments
 #
 # Metrics to watch in ClearML:
 #   rollout/raw_reward   -- accuracy 0/1 (expect ~0.5-0.7 initial on GSM8K, rising over training)
@@ -131,13 +133,23 @@ SGLANG_ARGS=(
     # About 55% for training; SGLang uses 45%.
     --sglang-mem-fraction-static ${SGLANG_MEM_FRACTION_STATIC}
 )
+if [ -n "${SGLANG_EXTRA_ARGS:-}" ]; then
+    read -r -a SGLANG_EXTRA_ARGS_ARRAY <<< "${SGLANG_EXTRA_ARGS}"
+    SGLANG_ARGS+=("${SGLANG_EXTRA_ARGS_ARRAY[@]}")
+fi
 
-WANDB_ARGS=(
-    --use-clearml
-    --use-metrics-service
+METRICS_ARGS=(
     --tb-project-name ${PROJECT_NAME}
     --tb-experiment-name qwen3-0.6b-GRPO-gsm8k-1xgpu-${now}
 )
+if [ "${USE_CLEARML:-1}" = "1" ]; then
+    METRICS_ARGS+=(--use-clearml)
+fi
+if [ "${USE_METRICS_SERVICE:-1}" = "1" ]; then
+    METRICS_ARGS+=(--use-metrics-service)
+else
+    METRICS_ARGS+=(--no-use-metrics-service)
+fi
 
 EVAL_ARGS=(
     --skip-eval-before-train
@@ -174,7 +186,7 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
     "${EVAL_ARGS[@]}" \
     "${OPTIMIZER_ARGS[@]}" \
     "${GRPO_ARGS[@]}" \
-    "${WANDB_ARGS[@]}" \
+    "${METRICS_ARGS[@]}" \
     "${PERF_ARGS[@]}" \
     "${SGLANG_ARGS[@]}" \
     "${MISC_ARGS[@]}" 2>&1 | tee log/qwen3-0.6b-GRPO-gsm8k-1xgpu-${now}.log

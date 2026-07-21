@@ -102,6 +102,9 @@ export MAX_TOKENS_PER_GPU=2048
 export LOG_PROBS_MAX_TOKENS_PER_GPU=2048
 export SGLANG_MEM_FRACTION_STATIC=0.25
 export OPTIMIZER_CPU_OFFLOAD=1
+export USE_CLEARML=0
+export USE_METRICS_SERVICE=0
+export SGLANG_EXTRA_ARGS="--sglang-disable-cuda-graph --sglang-max-running-requests 4 --sglang-disable-radix-cache"
 
 bash contributor-program/2026-cohort-1/run-qwen3-0.6B-1xgpu-grpo.sh
 ```
