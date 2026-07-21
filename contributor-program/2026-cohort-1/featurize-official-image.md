@@ -21,6 +21,9 @@ docker run -it --name relax-beginner-run --rm \
   --device=/dev/nvidia0 \
   --device=/dev/nvidiactl \
   --device=/dev/nvidia-uvm \
+  --device=/dev/nvidia-uvm-tools \
+  --device=/dev/nvidia-modeset \
+  -v /dev/nvidia-caps:/dev/nvidia-caps \
   -v /usr/bin/nvidia-smi:/usr/bin/nvidia-smi:ro \
   -v /lib/x86_64-linux-gnu/libcuda.so.1:/usr/local/nvidia/lib64/libcuda.so.1:ro \
   -v /lib/x86_64-linux-gnu/libcuda.so:/usr/local/nvidia/lib64/libcuda.so:ro \
@@ -119,4 +122,3 @@ docker rm -f relax-beginner-run 2>/dev/null || true
 ray stop --force 2>/dev/null || true
 pkill -9 -f ray 2>/dev/null || true
 ```
-
