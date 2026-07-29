@@ -53,6 +53,6 @@ fi
 python3 "$UNIT_TEST"
 nvidia-smi --query-gpu=index,name,memory.total,memory.used --format=csv,noheader
 python3 "$GPU_SMOKE" --model-path "$MODEL_PATH" --output "$RUN_DIR/result.json"
-sha256sum "$RUN_DIR/result.json" "$RUN_DIR/smoke.log" > "$RUN_DIR/SHA256SUMS"
+(cd "$RUN_DIR" && sha256sum result.json > SHA256SUMS)
 echo "SUCCEEDED" > "$RUN_DIR/STATUS"
 echo "RUN_DIR=$RUN_DIR"
