@@ -35,6 +35,9 @@ if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
 fi
 source "${MODEL_CONFIG_DIR}/qwen3-4B.sh"
 
+TASK22_TIMING_PREFLIGHT="${SCRIPT_DIR}/../../task22/prepare_sglang_timing_transport.sh"
+bash "$TASK22_TIMING_PREFLIGHT"
+
 PROJECT_NAME="${PROJECT_NAME:=Relax/dev/dapo-math}"
 EXP_DIR="${EXP_DIR:-${SCRIPT_DIR}/../../../../exps}"
 MODEL_DIR="${MODEL_DIR:-${EXP_DIR}}"
@@ -130,6 +133,7 @@ OPTIMIZER_ARGS=(
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 1
    --sglang-mem-fraction-static 0.8
+   --sglang-show-time-cost
 )
 
 WANDB_ARGS=(
