@@ -7,7 +7,7 @@ MODEL_PATH="${MODEL_PATH:-/root/autodl-fs/exps/Qwen3-4B}"
 RUN_ROOT="${RUN_ROOT:-/root/autodl-fs/task22/sglang_timing_smoke}"
 STAMP="$(date +%Y%m%d_%H%M%S)"
 RUN_DIR="${RUN_DIR:-$RUN_ROOT/$STAMP}"
-PREFLIGHT="$REPO/scripts/task22/prepare_sglang_timing_transport.sh"
+PREFLIGHT="$REPO/scripts/task22/prepare_task22_observability.sh"
 GPU_SMOKE="$REPO/scripts/task22/smoke_sglang_timing_transport.py"
 
 mkdir -p "$RUN_DIR"

@@ -32,10 +32,12 @@ def main() -> None:
         show_time_cost=True,
         enable_metrics=True,
     )
+    request_id = "task22:smoke:rid-roundtrip"
     try:
         result = engine.generate(
             prompt="Compute 17 + 25. Answer with only the number.",
             sampling_params={"temperature": 0.0, "max_new_tokens": 4},
+            rid=request_id,
         )
     finally:
         engine.shutdown()
@@ -49,6 +51,8 @@ def main() -> None:
         "forward_entry_time": forward,
         "prefill_finished_time": prefill,
         "queue_time": queue,
+        "request_id": request_id,
+        "returned_request_id": meta.get("id"),
         "prompt_tokens": meta.get("prompt_tokens"),
         "completion_tokens": meta.get("completion_tokens"),
         "text": result.get("text"),
@@ -60,8 +64,9 @@ def main() -> None:
     assert _finite_number(forward) and float(forward) > 1_000_000_000
     assert _finite_number(prefill) and float(prefill) >= float(forward)
     assert _finite_number(queue) and float(queue) >= 0.0
+    assert meta.get("id") == request_id
     print(json.dumps(record, ensure_ascii=False, sort_keys=True))
-    print("PASS: real SGLang response contains valid queue/prefill timing")
+    print("PASS: real SGLang response contains valid queue/prefill timing and matching request ID")
 
 
 if __name__ == "__main__":

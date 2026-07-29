@@ -3,6 +3,8 @@
 import asyncio
 import copy
 import inspect
+import json
+import os
 import time as _time_module  # Task22 instrumentation: absolute wall-clock for cross-process event join
 import uuid
 from argparse import Namespace
@@ -69,6 +71,59 @@ def _task22_as_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _task22_request_observability_enabled() -> bool:
+    return bool(os.environ.get("TASK22_REQUEST_DIR"))
+
+
+def _task22_rid_component(value: Any) -> str:
+    if value is None:
+        return "na"
+    return str(value).replace(":", "_").replace("/", "_")
+
+
+def _task22_make_request_id(sample: Sample, work_class: str) -> str:
+    metadata = sample.metadata if isinstance(getattr(sample, "metadata", None), dict) else {}
+    physical_rollout_id = metadata.get("_task22_physical_rollout_id")
+    session_suffix = str(getattr(sample, "session_id", "") or "na")[-12:]
+    return ":".join(
+        (
+            "task22",
+            f"p{_task22_rid_component(physical_rollout_id)}",
+            f"w{_task22_rid_component(work_class)}",
+            f"g{_task22_rid_component(getattr(sample, 'group_index', None))}",
+            f"s{_task22_rid_component(getattr(sample, 'index', None))}",
+            f"a{_task22_rid_component(getattr(sample, 'abort_count', 0))}",
+            _task22_rid_component(session_suffix),
+        )
+    )
+
+
+def _task22_export_request_rows(state: "GenerateState", physical_rollout_id: int) -> None:
+    output_dir = os.environ.get("TASK22_REQUEST_DIR")
+    if not output_dir:
+        return
+
+    rows = getattr(state, "task22_request_rows", None)
+    if not isinstance(rows, list):
+        rows = []
+    os.makedirs(output_dir, exist_ok=True)
+    output_path = os.path.join(output_dir, f"request_lifecycle_rollout_{physical_rollout_id}.jsonl")
+    with open(output_path, "w", encoding="utf-8") as output_file:
+        for row in rows:
+            output_file.write(json.dumps(row, ensure_ascii=False, sort_keys=True, default=str) + "\n")
+
+    mismatches = sum(row.get("client_status") == "finished" and row.get("rid_match") is not True for row in rows)
+    resumes = sum(row.get("work_class") == "old_debt" for row in rows)
+    logger.info(
+        "TASK22_REQUEST_HEALTH physical_rollout_id=%s rows=%s resumes=%s rid_mismatches=%s path=%s",
+        physical_rollout_id,
+        len(rows),
+        resumes,
+        mismatches,
+        output_path,
+    )
 
 
 class GenerateState(metaclass=SingletonMeta):
@@ -154,6 +209,8 @@ class GenerateState(metaclass=SingletonMeta):
         # 0 before the first step / when the previous step met its target. fully_async only.
         if not hasattr(self, "last_step_current_deficit"):
             self.last_step_current_deficit = 0
+        if not hasattr(self, "task22_request_rows"):
+            self.task22_request_rows: list[dict[str, Any]] = []
 
     def submit_generate_tasks(self, samples: list[list[Sample]]) -> None:
         max_aborted_count = getattr(self.args, "partial_rollout_max_aborted_count", None)
@@ -294,6 +351,7 @@ async def generate(
     # resume vs a fresh start. Pure local reads; no sync.
     _was_resume = getattr(sample, "response_length", 0) > 0
     _prefix_len_before = len(sample.rollout_tokens) if getattr(sample, "rollout_tokens", None) else 0
+    _task22_work_class = "old_debt" if _was_resume else "current"
 
     tokenizer_prompt_ids = state.tokenizer.encode(sample.prompt, add_special_tokens=False)
 
@@ -360,6 +418,32 @@ async def generate(
         if not sample.rollout_tokens:
             sample.rollout_tokens = tokenizer_prompt_ids
 
+    _task22_request_row: dict[str, Any] | None = None
+    if _task22_request_observability_enabled() and not evaluation:
+        _task22_rid = _task22_make_request_id(sample, _task22_work_class)
+        payload["rid"] = _task22_rid
+        _task22_physical_rollout_id = sample.metadata.get("_task22_physical_rollout_id")
+        _task22_request_row = {
+            "rid": _task22_rid,
+            "session_id": getattr(sample, "session_id", None),
+            "group_index": getattr(sample, "group_index", None),
+            "sample_index": getattr(sample, "index", None),
+            "abort_count": int(getattr(sample, "abort_count", 0) or 0),
+            "physical_rollout_id": _task22_physical_rollout_id,
+            "target_partition_hint": (
+                int(_task22_physical_rollout_id) - 1
+                if _task22_work_class == "old_debt" and _task22_physical_rollout_id is not None
+                else _task22_physical_rollout_id
+            ),
+            "work_class": _task22_work_class,
+            "logical_prefix_tokens": len(payload["input_ids"]),
+            "partial_response_tokens": int(getattr(sample, "response_length", 0) or 0),
+            "max_new_tokens": int(sampling_params["max_new_tokens"]),
+            "dispatch_abs": _time_module.time(),
+            "client_status": "dispatched",
+        }
+        state.task22_request_rows.append(_task22_request_row)
+
     # Provide a routing key so cache-affinity routers pin related requests to the same
     # engine and reuse its prefix/KV cache.
     headers = None
@@ -373,9 +457,43 @@ async def generate(
     _t_generate_start = monotonic()
     _t_generate_abs_begin = _time_module.time()
     _diff_realtime_monotonic = _t_generate_abs_begin - _t_generate_start
-    output = await post(url, payload, headers=headers)
+    try:
+        output = await post(url, payload, headers=headers)
+    except BaseException as request_error:
+        if _task22_request_row is not None:
+            _task22_request_row.update(
+                {
+                    "request_end_abs": _time_module.time(),
+                    "client_status": "exception",
+                    "exception_type": type(request_error).__name__,
+                }
+            )
+        raise
     _t_generate = monotonic() - _t_generate_start
     _t_generate_abs_end = _time_module.time()
+
+    if _task22_request_row is not None:
+        _task22_meta_info = output.get("meta_info", {}) if isinstance(output, dict) else {}
+        _task22_returned_rid = _task22_meta_info.get("id")
+        _task22_prompt_tokens = int(_task22_meta_info.get("prompt_tokens", 0) or 0)
+        _task22_cached_tokens = int(_task22_meta_info.get("cached_tokens", 0) or 0)
+        _task22_request_row.update(
+            {
+                "request_begin_abs": _t_generate_abs_begin,
+                "request_end_abs": _t_generate_abs_end,
+                "request_wall": _t_generate,
+                "returned_rid": _task22_returned_rid,
+                "rid_match": _task22_returned_rid == _task22_request_row["rid"],
+                "call_prompt_tokens": _task22_prompt_tokens,
+                "call_cached_tokens": _task22_cached_tokens,
+                "call_new_prompt_tokens": max(_task22_prompt_tokens - _task22_cached_tokens, 0),
+                "generated_tokens_this_attempt": len(output.get("output_ids", [])),
+                "finish_reason": _task22_meta_info.get("finish_reason"),
+                "forward_entry_time": _task22_get_meta_field(_task22_meta_info, "forward_entry_time"),
+                "prefill_finished_time": _task22_get_meta_field(_task22_meta_info, "prefill_finished_time"),
+                "client_status": "finished",
+            }
+        )
 
     _t_post_generate_start = monotonic()
     if args.use_slime_router and "RadixTreeMiddleware" in args.slime_router_middleware_paths:
@@ -785,6 +903,7 @@ async def generate_rollout_async(
     # Task22 instrumentation: current physical rollout call for resume-attempt
     # provenance. submit_generate_tasks stamps it on samples before async generation.
     state.current_rollout_id = rollout_id
+    state.task22_request_rows = []
 
     # Start SGLang profiling if enabled
     await start_sglang_profile(args, rollout_id)
@@ -1094,6 +1213,7 @@ async def generate_rollout_async(
     )
     aborted_samples.extend(new_aborted)
     aborted_samples.extend(completed_protected)
+    _task22_export_request_rows(state, rollout_id)
     if aborted_samples:
         logger.info(
             f"Rollout not completed for rollout_id: {rollout_id}, have {len(aborted_samples)} samples aborted."

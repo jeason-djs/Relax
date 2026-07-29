@@ -3,34 +3,26 @@
 set -euo pipefail
 
 REPO="${REPO:-/root/RelaxRepo}"
-RUN_ROOT="${RUN_ROOT:-/root/autodl-fs/task22/overlap_baseline}"
-ANALYZER="${ANALYZER:-$RUN_ROOT/analyze_overlap_baseline_v2.py}"
+RUN_ROOT="${RUN_ROOT:-/root/autodl-fs/task22/request_shape_canary}"
 BASE_WRAPPER="${BASE_WRAPPER:-$REPO/scripts/training/text/run-qwen3-4B-4xgpu-hybrid-async.sh}"
 MODEL_DIR="${MODEL_DIR:-/root/autodl-fs/exps}"
 DATA_DIR="${DATA_DIR:-/root/autodl-fs/exps}"
 EXP_DIR="${EXP_DIR:-/root/autodl-fs/exps}"
+NUM_ROLLOUT="${NUM_ROLLOUT:-6}"
 STAMP="$(date +%Y%m%d_%H%M%S)"
-RUN_DIR="${RUN_DIR:-$RUN_ROOT/probe15_committed_$STAMP}"
+RUN_DIR="${RUN_DIR:-$RUN_ROOT/canary_${NUM_ROLLOUT}step_$STAMP}"
 RESUME_DIR="$RUN_DIR/task22_resume"
 STALENESS_DIR="$RUN_DIR/task22_staleness"
 REQUEST_DIR="$RUN_DIR/task22_requests"
 PREFLIGHT="$REPO/scripts/task22/prepare_task22_observability.sh"
-REQUEST_ANALYZER="$REPO/scripts/task22/analyze_request_engine_shape.py"
+ANALYZER="$REPO/scripts/task22/analyze_request_engine_shape.py"
 
 if [ "$(git -C "$REPO" status --porcelain | wc -l)" -ne 0 ]; then
-    echo "Relax repository must be clean for a commit-based probe" >&2
-    exit 4
-fi
-if [ ! -x "$BASE_WRAPPER" ] || [ ! -r "$ANALYZER" ]; then
-    echo "Task22 base wrapper or analyzer is missing" >&2
+    echo "Relax repository must be clean for a commit-based canary" >&2
     exit 4
 fi
 
 mkdir -p "$RUN_DIR/logs" "$RESUME_DIR" "$STALENESS_DIR" "$REQUEST_DIR"
-if find "$RESUME_DIR" "$STALENESS_DIR" "$REQUEST_DIR" -mindepth 1 -print -quit | grep -q .; then
-    echo "Task22 output directories must be empty" >&2
-    exit 4
-fi
 
 cleanup() {
     if [ -n "${NVML_PID:-}" ]; then
@@ -41,21 +33,16 @@ cleanup() {
 trap cleanup EXIT
 
 source /root/activate_relax_image.sh >/dev/null 2>&1
-bash "$PREFLIGHT" > "$RUN_DIR/logs/sglang_timing_preflight.log" 2>&1
-grep -q "TASK22_SGLANG_TIMING_PREFLIGHT=PASS" "$RUN_DIR/logs/sglang_timing_preflight.log"
+bash "$PREFLIGHT" > "$RUN_DIR/logs/observability_preflight.log" 2>&1
+grep -q "TASK22_OBSERVABILITY_PREFLIGHT=PASS" "$RUN_DIR/logs/observability_preflight.log"
 
 ray stop --force >/dev/null 2>&1 || true
 sleep 3
 
 {
     echo "repo_head=$(git -C "$REPO" rev-parse HEAD)"
-    echo "num_rollout=15"
-    echo "headline_logical_steps=5..14"
-    echo "resume_dir=$RESUME_DIR"
-    echo "staleness_dir=$STALENESS_DIR"
-    echo "request_dir=$REQUEST_DIR"
-    echo "scheduler_status_interval=1.0"
-    echo "ray_dedup_logs=0"
+    echo "num_rollout=$NUM_ROLLOUT"
+    echo "purpose=request-engine-shape-health-only"
     echo "started_at=$(date '+%Y-%m-%dT%H:%M:%S%z')"
 } > "$RUN_DIR/INFO.txt"
 echo RUNNING > "$RUN_DIR/STATUS"
@@ -73,7 +60,7 @@ NVML_PID=$!
 
 set +e
 RUN_DIR="$RUN_DIR" \
-NUM_ROLLOUT=15 \
+NUM_ROLLOUT="$NUM_ROLLOUT" \
 TASK22_RESUME_DIR="$RESUME_DIR" \
 TASK22_STALENESS_DIR="$STALENESS_DIR" \
 TASK22_REQUEST_DIR="$REQUEST_DIR" \
@@ -83,7 +70,7 @@ RAY_DEDUP_LOGS=0 \
 MODEL_DIR="$MODEL_DIR" \
 DATA_DIR="$DATA_DIR" \
 EXP_DIR="$EXP_DIR" \
-timeout --signal=TERM --kill-after=180 "${RUN_TIMEOUT_S:-5400}" \
+timeout --signal=TERM --kill-after=180 "${RUN_TIMEOUT_S:-3600}" \
     bash "$BASE_WRAPPER" > "$RUN_DIR/driver.log" 2>&1
 RUN_RC=$?
 set -e
@@ -96,41 +83,17 @@ if [ "$RUN_RC" -ne 0 ]; then
 fi
 
 set +e
-python3 "$REQUEST_ANALYZER" \
+python3 "$ANALYZER" \
     --driver-log "$RUN_DIR/driver.log" \
     --request-dir "$REQUEST_DIR" \
     --expected-engines 2 \
     --require-resume \
     --output-json "$RUN_DIR/request_engine_shape_health.json" \
     > "$RUN_DIR/logs/request_engine_shape_health.log" 2>&1
-REQUEST_ANALYZER_RC=$?
-set -e
-echo "$REQUEST_ANALYZER_RC" > "$RUN_DIR/REQUEST_ANALYZER_EXIT_CODE"
-if [ "$REQUEST_ANALYZER_RC" -ne 0 ]; then
-    echo "FAILED_REQUEST_OBSERVABILITY($REQUEST_ANALYZER_RC)" > "$RUN_DIR/STATUS"
-    exit "$REQUEST_ANALYZER_RC"
-fi
-
-set +e
-python3 "$ANALYZER" \
-    --driver-log "$RUN_DIR/driver.log" \
-    --resume-dir "$RESUME_DIR" \
-    --headline-lo 5 \
-    --headline-hi 14 \
-    --base-step-wall 145.9 \
-    > "$RUN_DIR/analysis_steps_5_14.md" 2>&1
 ANALYZER_RC=$?
 set -e
 
 echo "$ANALYZER_RC" > "$RUN_DIR/ANALYZER_EXIT_CODE"
-ANALYZER_VERDICT="$(
-    awk '/^- verdict:/{print $3; exit}' "$RUN_DIR/analysis_steps_5_14.md"
-)"
-if [ -z "$ANALYZER_VERDICT" ]; then
-    ANALYZER_VERDICT=UNPARSEABLE
-    ANALYZER_RC=4
-fi
-echo "$ANALYZER_VERDICT" > "$RUN_DIR/ANALYZER_VERDICT"
 if [ "$ANALYZER_RC" -eq 0 ]; then
     echo SUCCEEDED > "$RUN_DIR/STATUS"
 else
@@ -145,5 +108,4 @@ fi
 )
 
 echo "RUN_DIR=$RUN_DIR"
-echo "ANALYZER_VERDICT=$(cat "$RUN_DIR/ANALYZER_VERDICT")"
 exit "$ANALYZER_RC"

@@ -1,0 +1,36 @@
+diff --git a/python/sglang/srt/observability/scheduler_metrics_mixin.py b/python/sglang/srt/observability/scheduler_metrics_mixin.py
+--- a/python/sglang/srt/observability/scheduler_metrics_mixin.py
++++ b/python/sglang/srt/observability/scheduler_metrics_mixin.py
+@@ -504,6 +504,10 @@ class SchedulerMetricsMixin:
+         batch_iter = (
+             batch.forward_iter
+             if batch is not None and batch.forward_iter is not None
+             else self.forward_ct
+         )
++        # TASK22_REQUEST_SHAPE_PREFILL_STATUS
++        if batch is not None and (x := self.scheduler_status_logger):
++            x.maybe_dump(batch, self.waiting_queue)
++
+         iter_msg = f" [{batch_iter}]" if LOG_FORWARD_ITERS else ""
+diff --git a/python/sglang/srt/utils/scheduler_status_logger.py b/python/sglang/srt/utils/scheduler_status_logger.py
+--- a/python/sglang/srt/utils/scheduler_status_logger.py
++++ b/python/sglang/srt/utils/scheduler_status_logger.py
+@@ -49,7 +49,18 @@ class SchedulerStatusLogger:
+             "scheduler.status",
+             {
+                 "rank": self.rank,
++                "forward_mode": str(running_batch.forward_mode),
+                 "running_rids": [r.rid for r in running_batch.reqs],
++                "running_seq_lens": [int(r.seqlen) for r in running_batch.reqs],
++                "running_origin_input_lens": [
++                    len(r.origin_input_ids) for r in running_batch.reqs
++                ],
++                "running_output_lens": [len(r.output_ids) for r in running_batch.reqs],
++                "decoding_rids": [
++                    r.rid for r in (running_batch.decoding_reqs or [])
++                ],
+                 "queued_rids": [r.rid for r in waiting_queue],
++                "queued_origin_input_lens": [len(r.origin_input_ids) for r in waiting_queue],
++                "queued_output_lens": [len(r.output_ids) for r in waiting_queue],
+             },
+         )

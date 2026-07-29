@@ -136,6 +136,17 @@ SGLANG_ARGS=(
    --sglang-show-time-cost
 )
 
+if [[ -n "${TASK22_REQUEST_DIR:-}" ]]; then
+   # Task 22: level 0 excludes prompt tokens/text and sampling parameters.
+   # stdout preserves the Ray actor pid so request rid can be joined to engine/GPU.
+   SGLANG_ARGS+=(
+      --sglang-log-requests
+      --sglang-log-requests-level 0
+      --sglang-log-requests-format json
+      --sglang-log-requests-target stdout
+   )
+fi
+
 WANDB_ARGS=(
    --use-clearml
    --use-metrics-service
