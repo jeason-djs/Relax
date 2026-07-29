@@ -38,16 +38,16 @@ else
         echo "Installed SGLang timing source not found: $SGLANG_FILE" >&2
         exit 4
     fi
-    if patch --dry-run --batch --reverse -d "$SGLANG_SITE_PACKAGES" -p2 < "$PATCH" >/dev/null 2>&1; then
+    if grep -q -- "_task22_forward_timing_payload" "$SGLANG_FILE"; then
         echo "SGLang timing transport patch already applied to installed package"
-    elif patch --dry-run --batch -d "$SGLANG_SITE_PACKAGES" -p2 < "$PATCH" >/dev/null 2>&1; then
-        patch --batch -d "$SGLANG_SITE_PACKAGES" -p2 < "$PATCH"
+    elif patch --dry-run --batch --forward -d "$SGLANG_SITE_PACKAGES" -p2 < "$PATCH" >/dev/null 2>&1; then
+        patch --batch --forward -d "$SGLANG_SITE_PACKAGES" -p2 < "$PATCH"
         echo "Applied SGLang timing transport patch to installed package"
     else
         echo "Installed SGLang timing patch state is broken" >&2
         exit 4
     fi
-    patch --dry-run --batch --reverse -d "$SGLANG_SITE_PACKAGES" -p2 < "$PATCH" >/dev/null
+    grep -q -- "_task22_forward_timing_payload" "$SGLANG_FILE"
 fi
 
 python3 "$UNIT_TEST"
