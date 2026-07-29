@@ -542,11 +542,51 @@ class Rollout(Base):
         return await handle_predict(self, train_step)
 
     @app.get("/can_do_update_weight_for_async")
-    async def can_do_update_weight_for_async(self):
+    async def can_do_update_weight_for_async(self, sync_id: int | None = None, actor_rollout_id: int | None = None):
         self._logger.debug("Handling can_do_update_weight_for_async request")
         step = self.step
-        can_update = await self._async_check_production_for_update_weight(step)
+        (
+            can_update,
+            ready_partition,
+            candidate_partitions,
+        ) = await self._async_check_production_for_update_weight_with_detail(step)
+        # Task22 flow diagnostics: at most two structured lines per gate cycle
+        # (first blocked observation + ready transition). The production-status
+        # checks and poll cadence are unchanged; this only exposes which logical
+        # partition a physical rollout service step was waiting to close.
+        _flow_key = sync_id if sync_id is not None else f"step_{step}"
+        if not hasattr(self, "_task22_gate_blocked_keys"):
+            self._task22_gate_blocked_keys = set()
+        if not hasattr(self, "_task22_gate_ready_keys"):
+            self._task22_gate_ready_keys = set()
+        if not can_update and _flow_key not in self._task22_gate_blocked_keys:
+            self._task22_gate_blocked_keys.add(_flow_key)
+            self._logger.info(
+                "TASK22_FLOW phase=gate_blocked sync_id=%s rollout_service_step=%s "
+                "actor_rollout_id=%s candidate_partitions=%s t=%.6f"
+                % (
+                    str(sync_id if sync_id is not None else -1),
+                    str(step),
+                    str(actor_rollout_id if actor_rollout_id is not None else -1),
+                    ",".join(candidate_partitions),
+                    time.time(),
+                )
+            )
         if can_update:
+            if _flow_key not in self._task22_gate_ready_keys:
+                self._task22_gate_ready_keys.add(_flow_key)
+                self._logger.info(
+                    "TASK22_FLOW phase=gate_ready sync_id=%s rollout_service_step=%s "
+                    "actor_rollout_id=%s ready_partition=%s candidate_partitions=%s t=%.6f"
+                    % (
+                        str(sync_id if sync_id is not None else -1),
+                        str(step),
+                        str(actor_rollout_id if actor_rollout_id is not None else -1),
+                        str(ready_partition),
+                        ",".join(candidate_partitions),
+                        time.time(),
+                    )
+                )
             self._weight_update_ready.clear()
             self.status = "paused"
             await self.rollout_manager.health_monitoring_pause.remote()
@@ -556,22 +596,42 @@ class Rollout(Base):
         return 0
 
     async def _async_check_production_for_update_weight(self, step: int) -> bool:
+        can_update, _, _ = await self._async_check_production_for_update_weight_with_detail(step)
+        return can_update
+
+    async def _async_check_production_for_update_weight_with_detail(
+        self, step: int
+    ) -> tuple[bool, str | None, list[str]]:
+        """Return gate readiness plus the logical partition that released it.
+
+        This preserves the original short-circuit query order and number of
+        TransferQueue status calls. The extra fields are CPU-only diagnostics.
+        """
         # During final backfill the rollout service may have stepped past
         # num_rollout while train_{num_rollout-1} is still being closed. Do not
         # let a weight update pause/abort that backfill.
         if step >= self.config.num_rollout:
-            return await self._async_check_partition_production_complete(f"train_{self.config.num_rollout - 1}")
+            partition = f"train_{self.config.num_rollout - 1}"
+            ready = await self._async_check_partition_production_complete(partition)
+            return ready, partition if ready else None, [partition]
 
         # No-preset-global-batch path: a tensor-wide .all() flips True as soon as
         # activated rows are produced (even mid-fill across steps), admitting an
         # under-filled partition. Gate on the explicit producer completion signal.
+        prev_partition = f"train_{step - 1}"
+        curr_partition = f"train_{step}"
+        candidate_partitions = [prev_partition, curr_partition]
         if getattr(self.config, "fully_async", False) and getattr(self.config, "use_dynamic_batch_size", False):
-            return await self.data_system_client.async_check_production_completed(
-                f"train_{step - 1}"
-            ) or await self.data_system_client.async_check_production_completed(f"train_{step}")
-        return await self.data_system_client.async_check_production_status(
-            ["tokens"], f"train_{step - 1}"
-        ) or await self.data_system_client.async_check_production_status(["tokens"], f"train_{step}")
+            if await self.data_system_client.async_check_production_completed(prev_partition):
+                return True, prev_partition, candidate_partitions
+            if await self.data_system_client.async_check_production_completed(curr_partition):
+                return True, curr_partition, candidate_partitions
+            return False, None, candidate_partitions
+        if await self.data_system_client.async_check_production_status(["tokens"], prev_partition):
+            return True, prev_partition, candidate_partitions
+        if await self.data_system_client.async_check_production_status(["tokens"], curr_partition):
+            return True, curr_partition, candidate_partitions
+        return False, None, candidate_partitions
 
     async def _async_check_partition_production_complete(self, partition_id: str) -> bool:
         if getattr(self.config, "fully_async", False) and getattr(self.config, "use_dynamic_batch_size", False):

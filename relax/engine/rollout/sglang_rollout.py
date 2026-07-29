@@ -3,6 +3,7 @@
 import asyncio
 import copy
 import inspect
+import time as _time_module  # Task22 instrumentation: absolute wall-clock for cross-process event join
 import uuid
 from argparse import Namespace
 from collections.abc import Callable
@@ -48,6 +49,26 @@ from relax.utils.utils import CURRENT_ROLLOUT_BATCH, compute_dp_size, transfer_b
 __all__ = ["generate_rollout"]
 
 logger = get_logger(__name__)
+
+
+def _task22_get_meta_field(meta_info: dict[str, Any], key: str) -> Any:
+    """Read SGLang timing metadata from direct or nested response shapes."""
+    if key in meta_info:
+        return meta_info.get(key)
+    for nested_key in ("time_stats", "time_info", "time_cost", "request_time_stats"):
+        nested = meta_info.get(nested_key)
+        if isinstance(nested, dict) and key in nested:
+            return nested.get(key)
+    return None
+
+
+def _task22_as_float(value: Any) -> float | None:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 class GenerateState(metaclass=SingletonMeta):
@@ -137,6 +158,15 @@ class GenerateState(metaclass=SingletonMeta):
     def submit_generate_tasks(self, samples: list[list[Sample]]) -> None:
         max_aborted_count = getattr(self.args, "partial_rollout_max_aborted_count", None)
         for group in samples:
+            # Task22 instrumentation: stamp the physical rollout call that is
+            # launching this attempt before the async task runs. A sample can be
+            # resumed in physical rollout 5, aborted again, and later committed in
+            # physical rollout 6; each attempt must preserve the physical rollout
+            # in which it actually executed, not the final transfer rollout.
+            for sample in group:
+                if not isinstance(getattr(sample, "metadata", None), dict):
+                    sample.metadata = {}
+                sample.metadata["_task22_physical_rollout_id"] = getattr(self, "current_rollout_id", None)
             task = asyncio.create_task(
                 generate_and_rm_group(
                     self.args,
@@ -258,6 +288,13 @@ async def generate(
         f"Sample status is {sample.status}"
     )
 
+    # Task22 instrumentation: detect a RESUME attempt (this sample already has a
+    # partial response from a prior aborted step) and snapshot its logical prefix
+    # length BEFORE the call, so we can attribute this call's re-prefill to a
+    # resume vs a fresh start. Pure local reads; no sync.
+    _was_resume = getattr(sample, "response_length", 0) > 0
+    _prefix_len_before = len(sample.rollout_tokens) if getattr(sample, "rollout_tokens", None) else 0
+
     tokenizer_prompt_ids = state.tokenizer.encode(sample.prompt, add_special_tokens=False)
 
     _t_image_processor: float | None = None
@@ -334,8 +371,11 @@ async def generate(
         headers = {"X-SMG-Routing-Key": str(sample.group_index)}
 
     _t_generate_start = monotonic()
+    _t_generate_abs_begin = _time_module.time()
+    _diff_realtime_monotonic = _t_generate_abs_begin - _t_generate_start
     output = await post(url, payload, headers=headers)
     _t_generate = monotonic() - _t_generate_start
+    _t_generate_abs_end = _time_module.time()
 
     _t_post_generate_start = monotonic()
     if args.use_slime_router and "RadixTreeMiddleware" in args.slime_router_middleware_paths:
@@ -429,7 +469,65 @@ async def generate(
         _timing["image_processor"] = _t_image_processor
     if _t_mm_encode is not None:
         _timing["mm_encode"] = _t_mm_encode
+    # Task22 instrumentation: absolute completion timestamp (monotonic epoch) so
+    # the recoverable-window probe can measure the spread between the first and
+    # last sample completing in a partition. One clock read per sample (not per
+    # token); no sync.
+    _timing["complete_ts"] = monotonic()
     sample.metadata["_timing"] = _timing
+
+    # Task22 instrumentation (bounded A+): APPEND a keyed RESUME-attempt event when
+    # this call re-entered a sample that already had a partial response. Append-only
+    # (repeated abort/resume cycles all survive; abort_count permits many). We read
+    # THIS call's prompt/cached tokens directly from output["meta_info"] (NOT the
+    # cumulative Sample.prefix_cache_info, which sums across calls). resume_request_wall
+    # is the whole request wall (queue+prefill+decode until stop/abort) — deliberately
+    # NOT named a prefill wall. rollout_id / target_partition are stamped later in
+    # generate_rollout_async (which has that context). Pure dict reads + arithmetic; no sync.
+    if _was_resume:
+        _mi = output.get("meta_info", {}) if isinstance(output, dict) else {}
+        _prompt_tok = int(_mi.get("prompt_tokens", 0) or 0)
+        _cached_tok = int(_mi.get("cached_tokens", 0) or 0)
+        _wv = _mi.get("weight_version", None)
+        _forward_entry_time = _task22_get_meta_field(_mi, "forward_entry_time")
+        _prefill_finished_time = _task22_get_meta_field(_mi, "prefill_finished_time")
+        _queue_time = _task22_get_meta_field(_mi, "queue_time")
+        if _queue_time is None:
+            _fwd = _task22_as_float(_forward_entry_time)
+            _wait = _task22_as_float(_task22_get_meta_field(_mi, "wait_queue_entry_time"))
+            if _fwd is not None and _wait is not None:
+                _queue_time = _fwd - _wait
+        _attempt = {
+            "session_id": getattr(sample, "session_id", None),
+            "group_index": getattr(sample, "group_index", None),
+            "sample_index": getattr(sample, "index", None),
+            "abort_count": int(getattr(sample, "abort_count", 0) or 0),
+            "physical_rollout_id": sample.metadata.get("_task22_physical_rollout_id"),
+            "logical_prefix_tokens": _prefix_len_before,
+            "call_prompt_tokens": _prompt_tok,
+            "call_cached_tokens": _cached_tok,
+            "call_new_prompt_tokens": max(_prompt_tok - _cached_tok, 0),
+            "resume_request_wall": _t_generate,
+            "request_begin_abs": _t_generate_abs_begin,
+            "request_end_abs": _t_generate_abs_end,
+            "diff_realtime_monotonic": _diff_realtime_monotonic,
+            "returned_weight_version": str(_wv) if _wv is not None else None,
+            # Existing SGLang request timing metadata when exposed by the pinned server.
+            # These are stored raw; the analyzer only derives bounds when both fields
+            # are present and numerically comparable. Do not synthesize timing from
+            # throughput counters.
+            "forward_entry_time": _forward_entry_time,
+            "prefill_finished_time": _prefill_finished_time,
+            "queue_time": _queue_time,
+            "dp_rank": _task22_get_meta_field(_mi, "dp_rank"),
+            "worker_id": _task22_get_meta_field(_mi, "worker_id") or _task22_get_meta_field(_mi, "worker"),
+            "complete_ts": _timing["complete_ts"],
+        }
+        _events = sample.metadata.get("_resume_events")
+        if not isinstance(_events, list):
+            _events = []
+        _events.append(_attempt)
+        sample.metadata["_resume_events"] = _events
 
     return sample
 
@@ -684,6 +782,9 @@ async def generate_rollout_async(
     assert args.rollout_global_dataset
 
     state = GenerateState(args)
+    # Task22 instrumentation: current physical rollout call for resume-attempt
+    # provenance. submit_generate_tasks stamps it on samples before async generation.
+    state.current_rollout_id = rollout_id
 
     # Start SGLang profiling if enabled
     await start_sglang_profile(args, rollout_id)
@@ -710,6 +811,21 @@ async def generate_rollout_async(
     target_data_size = num_old_samples if is_final_backfill else args.rollout_batch_size + num_old_samples
     if target_data_size <= 0:
         raise RuntimeError(f"Final rollout backfill requested for rollout_id={rollout_id} without pending deficit")
+    _task22_physical_begin_abs = _time_module.time()
+    logger.info(
+        "TASK22_FLOW phase=physical_start physical_rollout_id=%s "
+        "previous_partition=train_%s previous_debt_groups=%s "
+        "current_partition=%s current_target_groups=%s work_envelope_groups=%s t=%.6f"
+        % (
+            str(rollout_id),
+            str(rollout_id - 1),
+            str(num_old_samples),
+            "none" if is_final_backfill else f"train_{rollout_id}",
+            str(0 if is_final_backfill else args.rollout_batch_size),
+            str(target_data_size),
+            _task22_physical_begin_abs,
+        )
+    )
 
     # Inner-loop top-up threshold = the commit target. Each submit_generate_tasks call
     # admits a full over_sampling_batch_size of groups, so one round already puts more
@@ -848,6 +964,7 @@ async def generate_rollout_async(
                         rollout_id - 1,
                         data_system_client,
                         is_last=prev_is_last,
+                        physical_rollout_id=rollout_id,
                     )
                 )
                 committed_prev += n
@@ -869,6 +986,7 @@ async def generate_rollout_async(
                             rollout_id - 1,
                             data_system_client,
                             is_last=prev_is_last,
+                            physical_rollout_id=rollout_id,
                         )
                     )
                     committed_prev += n_prev
@@ -890,6 +1008,7 @@ async def generate_rollout_async(
                             rollout_id,
                             data_system_client,
                             is_last=curr_is_last,
+                            physical_rollout_id=rollout_id,
                         )
                     )
                     committed_curr += n
@@ -911,6 +1030,7 @@ async def generate_rollout_async(
                     rollout_id - 1,
                     data_system_client,
                     is_last=prev_is_last,
+                    physical_rollout_id=rollout_id,
                 )
             )
             committed_prev += n
@@ -928,6 +1048,7 @@ async def generate_rollout_async(
                     rollout_id,
                     data_system_client,
                     is_last=curr_is_last,
+                    physical_rollout_id=rollout_id,
                 )
             )
             committed_curr += n
@@ -958,7 +1079,19 @@ async def generate_rollout_async(
 
     # there are still some unfinished requests, abort them
     # abort() returns (aborted_samples, completed_protected_samples)
+    # Task22 instrumentation: time the abort() call (weight-sync-driven abort of
+    # in-flight requests). abort() is already awaited; we only read the clock
+    # around it, no new sync. Absolute wall-clock (time.time) is emitted as a
+    # keyed event so it aligns with actor-side gate/wsync events across processes.
+    _abort_start = monotonic()
+    _abort_start_abs = _time_module.time()
     new_aborted, completed_protected = await abort(args, rollout_id)
+    _abort_wall = monotonic() - _abort_start
+    _abort_end_abs = _time_module.time()
+    logger.info(
+        "TASK22_EVENT phase=abort rollout_id=%s t_begin=%.6f t_end=%.6f dur=%.6f"
+        % (str(rollout_id), _abort_start_abs, _abort_end_abs, _abort_wall)
+    )
     aborted_samples.extend(new_aborted)
     aborted_samples.extend(completed_protected)
     if aborted_samples:
@@ -983,6 +1116,33 @@ async def generate_rollout_async(
     # via the completed-group fast path in generate_and_rm_group). Surplus groups are
     # complete (length == n_samples_per_prompt), satisfying add_samples' assertion.
     aborted_samples.extend(oversample_surplus)
+    _task22_carry_aborted_groups = sum(
+        any(sample.status == Sample.Status.ABORTED for sample in group) for group in aborted_samples
+    )
+    _task22_carry_complete_groups = len(aborted_samples) - _task22_carry_aborted_groups
+    _task22_physical_end_abs = _time_module.time()
+    logger.info(
+        "TASK22_FLOW phase=physical_end physical_rollout_id=%s "
+        "previous_partition=train_%s previous_debt_groups=%s committed_previous_groups=%s "
+        "current_partition=%s committed_current_groups=%s next_debt_groups=%s "
+        "processed_envelope_groups=%s carry_aborted_groups=%s carry_complete_groups=%s "
+        "t_begin=%.6f t_end=%.6f dur=%.6f"
+        % (
+            str(rollout_id),
+            str(rollout_id - 1),
+            str(num_old_samples),
+            str(committed_prev),
+            "none" if is_final_backfill else f"train_{rollout_id}",
+            str(committed_current),
+            str(state.last_step_current_deficit),
+            str(len(data)),
+            str(_task22_carry_aborted_groups),
+            str(_task22_carry_complete_groups),
+            _task22_physical_begin_abs,
+            _task22_physical_end_abs,
+            _task22_physical_end_abs - _task22_physical_begin_abs,
+        )
+    )
     logger.info(
         f"Rollout step {rollout_id} carry-over: committed_current={committed_current} "
         f"next_step_deficit={state.last_step_current_deficit} "
@@ -1013,7 +1173,14 @@ async def generate_rollout_async(
             for group in accepted:
                 data.append(group)
             if accepted:
-                await transfer_batch_to_data_system(args, accepted, len(accepted), rollout_id, data_system_client)
+                await transfer_batch_to_data_system(
+                    args,
+                    accepted,
+                    len(accepted),
+                    rollout_id,
+                    data_system_client,
+                    physical_rollout_id=rollout_id,
+                )
             logger.info(f"Transferred {len(accepted)} extra completed groups to training ")
 
     global CURRENT_ROLLOUT_BATCH
@@ -1022,6 +1189,143 @@ async def generate_rollout_async(
             args, CURRENT_ROLLOUT_BATCH, rollout_id=rollout_id, evaluation=False, tokenizer=state.tokenizer
         )
         rollout_metrics = dict(timing_metrics)
+        # Task22 instrumentation: weight-sync coupling cost on the rollout side.
+        # abort_wall = time spent aborting in-flight requests at this step's sync.
+        # replay-prefill = prompt(+ partial response) tokens that aborted/carried
+        # samples must recompute next step. These are pure counts over CPU-side
+        # sample bookkeeping; no GPU op or sync added.
+        rollout_metrics["rollout/wsync/abort_wall"] = _abort_wall
+        _replay_samples = [
+            s
+            for group in aborted_samples
+            for s in (group if isinstance(group, list) else [group])
+            if getattr(s, "status", None) == Sample.Status.ABORTED
+        ]
+
+        def _emit_dist(prefix: str, xs: list) -> None:
+            if not xs:
+                return
+            xs_sorted = sorted(xs)
+            rollout_metrics[f"{prefix}_sum"] = float(sum(xs))
+            rollout_metrics[f"{prefix}_mean"] = float(sum(xs) / len(xs))
+            rollout_metrics[f"{prefix}_p50"] = float(xs_sorted[len(xs_sorted) // 2])
+            rollout_metrics[f"{prefix}_p95"] = float(xs_sorted[min(len(xs_sorted) - 1, int(len(xs_sorted) * 0.95))])
+            rollout_metrics[f"{prefix}_max"] = float(xs_sorted[-1])
+
+        # LOGICAL prefix tokens = the context a resumed request PRESENTS
+        # (prompt + partial response = len(rollout_tokens); single tokenizer, no
+        # double count). This is NOT the tokens SGLang actually recomputes, because
+        # sibling prefix reuse can make cached_tokens > 0. See new_prompt_tokens below.
+        _logical_prefix_tokens = [
+            len(s.rollout_tokens) if getattr(s, "rollout_tokens", None) else (len(s.tokens) if s.tokens else 0)
+            for s in _replay_samples
+        ]
+        rollout_metrics["rollout/replay/aborted_sample_count"] = float(len(_replay_samples))
+        _emit_dist("rollout/replay/logical_prefix_tokens", _logical_prefix_tokens)
+
+        # ACTUAL new prompt tokens per resume ATTEMPT = per-call
+        # (prompt_tokens - cached_tokens), read directly from each resume call's
+        # SGLang meta_info (NOT cumulative prefix_cache_info). resume_request_wall
+        # is the whole request wall (queue+prefill+decode), an UPPER bound, not a
+        # prefill wall. Iterate the APPEND-ONLY _resume_events list so repeated
+        # abort/resume cycles all count. The keyed JSONL table is exported in
+        # transfer_batch_to_data_system(), where the true target partition is known.
+        _new_prompt_tokens = []
+        _resume_walls = []
+        _resume_attempt_rows = []
+        for group in list(data) + list(aborted_samples):
+            for s in group if isinstance(group, list) else [group]:
+                evs = s.metadata.get("_resume_events") if isinstance(getattr(s, "metadata", None), dict) else None
+                if not isinstance(evs, list):
+                    continue
+                for ev in evs:
+                    _new_prompt_tokens.append(int(ev.get("call_new_prompt_tokens", 0)))
+                    _resume_walls.append(float(ev.get("resume_request_wall", 0.0)))
+                    _resume_attempt_rows.append(ev)
+        rollout_metrics["rollout/replay/resume_attempt_count"] = float(len(_resume_attempt_rows))
+        _emit_dist("rollout/replay/new_prompt_tokens", _new_prompt_tokens)
+        _emit_dist("rollout/replay/resume_request_wall", _resume_walls)
+        # Attempts that remain aborted at the end of this physical rollout are not
+        # sent through transfer_batch_to_data_system() yet, but they consumed rollout
+        # work and must survive as uncommitted rows. Transfer-time export will later
+        # add the true target_partition if/when they are committed.
+        _uncommitted_rows = []
+        for group in aborted_samples:
+            for s in group if isinstance(group, list) else [group]:
+                evs = s.metadata.get("_resume_events") if isinstance(getattr(s, "metadata", None), dict) else None
+                if isinstance(evs, list):
+                    for ev in evs:
+                        row = dict(ev)
+                        row.setdefault("physical_rollout_id", int(rollout_id))
+                        row["target_partition"] = None
+                        row["uncommitted"] = True
+                        _uncommitted_rows.append(row)
+        if _uncommitted_rows:
+            try:
+                import json as _json_mod
+                import os as _os_mod
+
+                _dir = _os_mod.environ.get("TASK22_RESUME_DIR", "/tmp/task22_resume")
+                _os_mod.makedirs(_dir, exist_ok=True)
+                _path = _os_mod.path.join(_dir, f"resume_attempts_uncommitted_rollout_{rollout_id}.jsonl")
+                with open(_path, "w") as _f:
+                    for _row in _uncommitted_rows:
+                        _f.write(_json_mod.dumps(_row) + "\n")
+            except Exception as _rexc:  # noqa: BLE001
+                logger.warning(f"Task22 uncommitted resume-attempt export skipped: {_rexc!r}")
+        # Task22 instrumentation: weight-version bookkeeping.
+        # NOTE: max(weight_versions)-min(weight_versions) within a sample is only
+        # the INTRA-SAMPLE generation span (how many rollout weight versions the
+        # sample straddled while generating). It is NOT actual policy staleness:
+        # a sample generated fully on v5 but consumed by Actor at v7 has span=0 but
+        # true staleness=2. So we (a) report the span honestly named, and (b) emit
+        # the raw end-of-generation version distribution + this rollout_id so that
+        # actual staleness = actor_consume_version - end_generation_version can be
+        # reconstructed offline once the consume-version is aligned. Pure arithmetic.
+        _wv_spans = []
+        _end_gen_versions = []
+        for group in data:
+            for s in group:
+                wv = [int(v) for v in getattr(s, "weight_versions", []) if str(v).isdigit()]
+                if wv:
+                    _wv_spans.append(max(wv) - min(wv))
+                    _end_gen_versions.append(wv[-1])
+        if _wv_spans:
+            _sorted_span = sorted(_wv_spans)
+            rollout_metrics["rollout/weight_version_span/avg"] = float(sum(_wv_spans) / len(_wv_spans))
+            rollout_metrics["rollout/weight_version_span/max"] = float(_sorted_span[-1])
+            rollout_metrics["rollout/weight_version_span/p95"] = float(
+                _sorted_span[min(len(_sorted_span) - 1, int(len(_sorted_span) * 0.95))]
+            )
+        if _end_gen_versions:
+            rollout_metrics["rollout/end_gen_version/this_rollout_id"] = float(rollout_id)
+            rollout_metrics["rollout/end_gen_version/avg"] = float(sum(_end_gen_versions) / len(_end_gen_versions))
+            rollout_metrics["rollout/end_gen_version/min"] = float(min(_end_gen_versions))
+            rollout_metrics["rollout/end_gen_version/max"] = float(max(_end_gen_versions))
+        # Task22 instrumentation (E): recoverable window. Spread between the
+        # first and last committed sample's completion timestamp within this
+        # partition = the maximum time a sync-aware scheduler could overlap
+        # (samples that finished early but had to wait for the slow tail before
+        # the partition was declared complete and weight sync allowed). If this
+        # window is small, adaptive overlap has little to reclaim -> falsifies
+        # the premise. Pure arithmetic over existing completion timestamps.
+        _complete_ts = [
+            s.metadata["_timing"]["complete_ts"]
+            for group in data
+            for s in group
+            if isinstance(getattr(s, "metadata", None), dict)
+            and isinstance(s.metadata.get("_timing"), dict)
+            and "complete_ts" in s.metadata["_timing"]
+        ]
+        if len(_complete_ts) >= 2:
+            _win = max(_complete_ts) - min(_complete_ts)
+            rollout_metrics["rollout/recoverable_window/spread"] = float(_win)
+            _sorted_ct = sorted(_complete_ts)
+            # tail window: time from the median completion to the last completion
+            rollout_metrics["rollout/recoverable_window/tail_after_p50"] = float(
+                _sorted_ct[-1] - _sorted_ct[len(_sorted_ct) // 2]
+            )
+            rollout_metrics["rollout/recoverable_window/committed_samples"] = float(len(_complete_ts))
         if args.partial_rollout:
             assert len(CURRENT_ROLLOUT_BATCH) == len(data) * args.n_samples_per_prompt, (
                 f"len(CURRENT_ROLLOUT_BATCH)={len(CURRENT_ROLLOUT_BATCH)}, len(data) * args.n_samples_per_prompt={len(data) * args.n_samples_per_prompt}"

@@ -908,12 +908,18 @@ def log_rollout_data(
                 "multimodal_train_inputs",
                 "loss_masks",
                 "sample_indices",
+                "group_indices",
                 "rollout_routed_experts",
                 "max_seq_lens",
                 "dynamic_global_batch_size",
                 "packed_seq_params",
                 "vlm_packed_seq_params",
                 "__loss_scale__",
+                # Task22 instrumentation: per-sample scalar carried for actual-staleness
+                # accounting on the Actor; not a trainable per-token value.
+                "generation_start_version",
+                "generation_end_version",
+                "generation_version_span",
                 ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY,
                 ROLLOUT_MINI_GLOBAL_SAMPLE_COUNTS_KEY,
                 ROLLOUT_MINI_PROMPT_GROUP_COUNTS_KEY,

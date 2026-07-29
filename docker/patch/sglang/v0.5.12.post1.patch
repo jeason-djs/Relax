@@ -2558,7 +2558,7 @@ index 326aace027..a111256db8 100644
  from sglang.srt.model_executor.forward_batch_info import ForwardMode
  from sglang.srt.observability.metrics_collector import (
      SchedulerMetricsCollector,
-@@ -575,6 +578,14 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
+@@ -575,16 +578,53 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
  
      # Number of prefill retries for this request
      prefill_retry_count: int = 0
@@ -2573,10 +2573,18 @@ index 326aace027..a111256db8 100644
  
      def __getstate__(self) -> object:
          # send to detokenizer/tokenizer
-@@ -582,9 +593,31 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
+-        if not self.enable_metrics:
++        # The object crosses scheduler -> detokenizer -> tokenizer. The
++        # metrics collector is intentionally not pickled, so enable_metrics is
++        # false after the first hop. Keep a separate, data-only forwarding
++        # marker so the second hop does not discard the timestamp payload.
++        if not self.enable_metrics and not getattr(
++            self, "_task22_forward_timing_payload", False
++        ):
              return {}
  
          state = {
++            "_task22_forward_timing_payload": True,
 +            "disagg_mode": self.disagg_mode,
              "wait_queue_entry_time": self.wait_queue_entry_time,
              "forward_entry_time": self.forward_entry_time,
@@ -2605,7 +2613,7 @@ index 326aace027..a111256db8 100644
              "diff_realtime_monotonic": global_diff_realtime_monotonic,
          }
          return state
-@@ -974,6 +1007,162 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
+@@ -974,6 +1014,162 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
      def get_queueing_time(self) -> float:
          return self.forward_entry_time - self.wait_queue_entry_time
  
@@ -2768,7 +2776,7 @@ index 326aace027..a111256db8 100644
      def convert_to_duration(self) -> str:
          if self.disagg_mode == DisaggregationMode.NULL:
              queue_duration = self.duration_between(
-@@ -1107,6 +1296,24 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
+@@ -1107,6 +1303,24 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                  "queue_time": self.get_queueing_time(),
              }
          )

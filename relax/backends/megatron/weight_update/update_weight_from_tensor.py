@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import time
 from argparse import Namespace
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
@@ -14,6 +15,8 @@ from ray.actor import ActorHandle
 from relax.utils import device as device_utils
 from relax.utils.device import make_current_torch_device
 from relax.utils.distributed_utils import get_gloo_group
+from relax.utils.logging_utils import get_logger
+from relax.utils.timer import timer
 
 from ..sglang import FlattenedTensorBucket, MultiprocessingSerializer
 from .hf_weight_iterator_base import HfWeightIteratorBase
@@ -23,6 +26,26 @@ from .update_weight_from_distributed import (
     post_process_weights,
     update_weights_from_distributed,
 )
+
+
+logger = get_logger(__name__)
+
+
+def _task22_event(phase: str, sync_id, t_begin: float, t_end: float) -> None:
+    """Emit a same-clock keyed sync-phase event for offline timeline alignment.
+
+    Single structured log line (greppable), keyed by ``sync_id`` (the target
+    weight version this synchronization cycle produces), with absolute wall-
+    clock begin/end. The SAME sync_id is used by the Actor gate event and all
+    four wsync phases so one synchronization cycle joins to one key. Canonical
+    phase names are pause|flush|transfer|continue (no wsync_ prefix). Pure
+    logging around already- existing synchronization boundaries; adds no new
+    sync. Only rank 0 emits.
+    """
+    logger.info(
+        "TASK22_EVENT phase=%s sync_id=%s t_begin=%.6f t_end=%.6f dur=%.6f"
+        % (phase, str(sync_id), t_begin, t_end, t_end - t_begin)
+    )
 
 
 class UpdateWeightFromTensor:
@@ -167,8 +190,17 @@ class UpdateWeightFromTensor:
 
         rank = dist.get_rank()
         if rank == 0:
-            ray.get([engine.pause_generation.remote() for engine in all_engines])
-            ray.get([engine.flush_cache.remote() for engine in all_engines])
+            # Task22 instrumentation: pause/flush are blocking ray.get already;
+            # wrap the existing boundary, add no new sync. Also emit same-clock
+            # begin/end events keyed by weight_version for offline timeline join.
+            _tb = time.time()
+            with timer("wsync_pause"):
+                ray.get([engine.pause_generation.remote() for engine in all_engines])
+            _task22_event("pause", self.weight_version, _tb, time.time())
+            _tb = time.time()
+            with timer("wsync_flush"):
+                ray.get([engine.flush_cache.remote() for engine in all_engines])
+            _task22_event("flush", self.weight_version, _tb, time.time())
             if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
                 post_process_weights(
                     restore_weights_before_load=True,
@@ -183,24 +215,31 @@ class UpdateWeightFromTensor:
         # chunk N+1's HF conversion + serialize + gather can proceed in
         # parallel.  We defer ``ray.get`` to the *next* iteration so the
         # two stages overlap.
-        prev_refs: list[ObjectRef] = []
-        prev_long_lived_tensors = None
-        for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(megatron_local_weights):
-            refs, long_lived_tensors = self._send_hf_params(hf_named_tensors)
-            # Wait for the *previous* chunk's IPC to finish before
-            # releasing its GPU tensors.
+        # Task22 instrumentation: time the whole transfer loop as one phase.
+        # We only read the wall clock around the existing loop; no barrier or
+        # ray.get is added, so the chunk pipelining is unchanged.
+        _tb_transfer = time.time()
+        with timer("wsync_transfer"):
+            prev_refs: list[ObjectRef] = []
+            prev_long_lived_tensors = None
+            for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(megatron_local_weights):
+                refs, long_lived_tensors = self._send_hf_params(hf_named_tensors)
+                # Wait for the *previous* chunk's IPC to finish before
+                # releasing its GPU tensors.
+                if prev_refs:
+                    ray.get(prev_refs)
+                del prev_long_lived_tensors
+                prev_refs = refs
+                prev_long_lived_tensors = long_lived_tensors
+                # Backend-specific per-chunk synchronization is handled in device
+                # utils so this path stays hardware-agnostic.
+                device_utils.maybe_backend_barrier_on_weight_chunk(group=get_gloo_group())
+            # Drain the last chunk.
             if prev_refs:
                 ray.get(prev_refs)
             del prev_long_lived_tensors
-            prev_refs = refs
-            prev_long_lived_tensors = long_lived_tensors
-            # Backend-specific per-chunk synchronization is handled in device
-            # utils so this path stays hardware-agnostic.
-            device_utils.maybe_backend_barrier_on_weight_chunk(group=get_gloo_group())
-        # Drain the last chunk.
-        if prev_refs:
-            ray.get(prev_refs)
-        del prev_long_lived_tensors
+        if rank == 0:
+            _task22_event("transfer", self.weight_version, _tb_transfer, time.time())
 
         # All ranks must finish sending before rank 0 triggers Marlin repack,
         # otherwise engines in slower gather groups may still be processing
@@ -215,7 +254,11 @@ class UpdateWeightFromTensor:
                     post_process_quantization=True,
                     rollout_engines=all_engines,
                 )
-            ray.get([engine.continue_generation.remote() for engine in all_engines])
+            # Task22 instrumentation: continue_generation is a blocking ray.get.
+            _tb = time.time()
+            with timer("wsync_continue"):
+                ray.get([engine.continue_generation.remote() for engine in all_engines])
+            _task22_event("continue", self.weight_version, _tb, time.time())
         dist.barrier(group=get_gloo_group())
 
     def _send_hf_params(self, hf_named_tensors) -> tuple[list[ObjectRef], Any]:

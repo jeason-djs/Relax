@@ -1,0 +1,18 @@
+diff --git a/python/sglang/srt/observability/req_time_stats.py b/python/sglang/srt/observability/req_time_stats.py
+--- a/python/sglang/srt/observability/req_time_stats.py
++++ b/python/sglang/srt/observability/req_time_stats.py
+@@ -591,3 +591,9 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
+         # send to detokenizer/tokenizer
+-        if not self.enable_metrics:
++        # The object crosses scheduler -> detokenizer -> tokenizer. The
++        # metrics collector is intentionally not pickled, so enable_metrics is
++        # false after the first hop. Keep a separate, data-only forwarding
++        # marker so the second hop does not discard the timestamp payload.
++        if not self.enable_metrics and not getattr(
++            self, "_task22_forward_timing_payload", False
++        ):
+             return {}
+@@ -595,2 +601,3 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
+         state = {
++            "_task22_forward_timing_payload": True,
+             "disagg_mode": self.disagg_mode,

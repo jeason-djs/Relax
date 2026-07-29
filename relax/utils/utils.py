@@ -2,6 +2,7 @@
 
 import os
 import socket
+import time as _time_module
 from argparse import Namespace
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
@@ -19,6 +20,51 @@ from relax.utils.types import Sample
 
 logger = get_logger(__name__)
 CURRENT_ROLLOUT_BATCH = []
+
+
+def _task22_export_resume_attempts(
+    batch_samples: list[Sample], rollout_id: int, physical_rollout_id: int | None = None
+) -> None:
+    """Export append-only resume attempts after the true target partition is
+    known.
+
+    ``rollout_id`` here is the logical partition ID passed to async_put, not
+    necessarily the physical rollout call ID. This is the only local point
+    where backfill to train_{rollout_id-1} is unambiguous. Pure file append; no
+    sync.
+    """
+    rows = []
+    target_partition = f"train_{rollout_id}"
+    for sample in batch_samples:
+        if not isinstance(getattr(sample, "metadata", None), dict):
+            continue
+        events = sample.metadata.get("_resume_events")
+        if not isinstance(events, list):
+            continue
+        for event in events:
+            row = dict(event)
+            row["target_partition"] = target_partition
+            row.setdefault(
+                "physical_rollout_id", int(physical_rollout_id) if physical_rollout_id is not None else None
+            )
+            row.setdefault("sample_index", getattr(sample, "index", None))
+            row.setdefault("group_index", getattr(sample, "group_index", None))
+            row.setdefault("session_id", getattr(sample, "session_id", None))
+            rows.append(row)
+    if not rows:
+        return
+    try:
+        import json as _json_mod
+
+        out_dir = os.environ.get("TASK22_RESUME_DIR", "/tmp/task22_resume")
+        os.makedirs(out_dir, exist_ok=True)
+        path = os.path.join(out_dir, f"resume_attempts_train_{rollout_id}.jsonl")
+        with open(path, "a") as f:
+            for row in rows:
+                row["export_abs"] = _time_module.time()
+                f.write(_json_mod.dumps(row) + "\n")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"Task22 resume-attempt export skipped: {exc!r}")
 
 
 def _extract_images_seqlens(multimodal_train_inputs) -> list[int]:
@@ -107,7 +153,30 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
         "raw_reward": raw_rewards,
         "truncated": [1 if sample.status == Sample.Status.TRUNCATED else 0 for sample in samples],
         "sample_indices": [sample.index for sample in samples],
+        "group_indices": [sample.group_index if sample.group_index is not None else -1 for sample in samples],
     }
+
+    # Task22 instrumentation: carry per-sample rollout weight versions so the Actor
+    # can compute ACTUAL policy staleness = actor_consume_version - generation_end_version
+    # at consumption time. weight_versions is a list appended per rollout forward
+    # (types.py); start = first, end = last, span = end-start. -1 means unknown.
+    def _int_versions(s):
+        return [int(v) for v in getattr(s, "weight_versions", []) if str(v).isdigit()]
+
+    _gen_start, _gen_end, _gen_span = [], [], []
+    for sample in samples:
+        _wv = _int_versions(sample)
+        if _wv:
+            _gen_start.append(_wv[0])
+            _gen_end.append(_wv[-1])
+            _gen_span.append(_wv[-1] - _wv[0])
+        else:
+            _gen_start.append(-1)
+            _gen_end.append(-1)
+            _gen_span.append(-1)
+    train_data["generation_start_version"] = _gen_start
+    train_data["generation_end_version"] = _gen_end
+    train_data["generation_version_span"] = _gen_span
 
     # loss mask
     # TODO: compress the loss mask
@@ -458,6 +527,7 @@ async def transfer_batch_to_data_system(
     rollout_id: int,
     data_system_client: Any,
     is_last: bool = False,
+    physical_rollout_id: int | None = None,
 ) -> None:
     """Helper function to transfer a batch of samples to the data system
     client.
@@ -484,6 +554,7 @@ async def transfer_batch_to_data_system(
         # Flatten nested groups of samples into a single list
         while isinstance(batch_samples[0], list):
             batch_samples = sum(batch_samples, [])
+        _task22_export_resume_attempts(batch_samples, rollout_id, physical_rollout_id=physical_rollout_id)
         global CURRENT_ROLLOUT_BATCH
         CURRENT_ROLLOUT_BATCH.extend(batch_samples)
         rollout_batch = convert_samples_to_train_data(args, batch_samples)
@@ -502,6 +573,21 @@ async def transfer_batch_to_data_system(
             data=rollout_batch, partition_id=f"train_{rollout_id}", custom_meta=custom_meta, is_last=is_last
         )
 
+        if is_last:
+            # Task22 flow diagnostics: one line per logical partition close.
+            # This is after the existing async_put completes and adds no new
+            # synchronization. It links physical generation work to the logical
+            # train partition that can release the Actor gate.
+            logger.info(
+                "TASK22_FLOW phase=partition_close physical_rollout_id=%s "
+                "target_partition=train_%s groups=%s t=%.6f"
+                % (
+                    str(physical_rollout_id if physical_rollout_id is not None else -1),
+                    str(rollout_id),
+                    str(batch_count),
+                    _time_module.time(),
+                )
+            )
         logger.info(f"Batch {batch_count} transferred successfully for rollout_id: {rollout_id}")
     except Exception as e:
         logger.error(f"Error transferring batch {batch_count}: {e}")

@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import json  # Task22 instrumentation: keyed staleness debug artifact
 import logging
 import os
 import random
@@ -1179,6 +1180,13 @@ class MegatronTrainRayActor(TrainRayActor):
                     "rollout_log_probs",
                     "rewards",
                     "raw_reward",
+                    "sample_indices",
+                    "group_indices",
+                    # Task22 instrumentation: per-sample rollout end-of-generation
+                    # weight version, so actual staleness can be computed at consume.
+                    "generation_start_version",
+                    "generation_end_version",
+                    "generation_version_span",
                 ]
                 data_fields += ["rollout_routed_experts"] if self.args.use_rollout_routing_replay else []
                 if self.args.multimodal_keys is not None:
@@ -1239,6 +1247,15 @@ class MegatronTrainRayActor(TrainRayActor):
                 else:
                     rollout_data[key].append(value)
         rollout_data[ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY] = rollout_mini_local_sample_counts
+
+        # Task22 instrumentation: ACTUAL policy staleness at consumption time.
+        # generation_end_version was transferred per-sample from rollout; the Actor's
+        # current trained weight version is self.weight_updater.weight_version. Actual
+        # staleness = consume_version - end_gen_version. This is the true gap the
+        # rollout-side weight_version_span cannot capture. Pure arithmetic; fail-open so
+        # instrumentation can NEVER affect the training control flow below. Only the
+        # megatron main rank emits to avoid duplicate metric writes.
+        self._task22_emit_actual_staleness(rollout_id, rollout_data)
 
         with inverse_timer("train_wait"), timer("train"):
             if self.args.compute_advantages_and_returns:
@@ -1332,7 +1349,7 @@ class MegatronTrainRayActor(TrainRayActor):
         # Returned flags are for update_weights_fully_async only — hybrid uses
         # the sync update_weights path so we just discard them.
         self._wait_for_previous_eval()
-        self._check_services_health()
+        self._check_services_health(actor_rollout_id=rollout_id)
 
         # Sync weights to rollout via UpdateWeightFromTensor (colocate mode)
         self.update_weights()
@@ -1418,7 +1435,7 @@ class MegatronTrainRayActor(TrainRayActor):
             # Wait for prior eval before pausing rollout for weight sync.
             self._wait_for_previous_eval()
 
-            rollout_only, actor_fwd_only = self._check_services_health()
+            rollout_only, actor_fwd_only = self._check_services_health(actor_rollout_id=rollout_id)
             self.update_weights_fully_async(rollout_id, rollout_only=rollout_only, actor_fwd_only=actor_fwd_only)
             dist.barrier(group=get_gloo_group())
             self._run_step_evaluation(rollout_id, end_update_weight=True)
@@ -1602,8 +1619,93 @@ class MegatronTrainRayActor(TrainRayActor):
             if post_sync_handles:
                 ray.get(post_sync_handles)
 
+    def _task22_emit_actual_staleness(self, rollout_id, rollout_data) -> None:
+        """Task22 instrumentation: compute ACTUAL policy staleness at Actor
+        consume.
+
+        actual_staleness = consume_version - generation_end_version (per sample).
+        Fail-open: any error is logged and swallowed so training control flow is
+        never affected. Emits aggregate scalars (dashboards) AND a bounded keyed
+        per-sample debug JSONL (partition/sample/group/start/end/consume/staleness).
+        Only the megatron main rank emits. Pure arithmetic + local file append; no sync.
+        """
+        try:
+            if not is_megatron_main_rank():
+                return
+            _egv = rollout_data.get("generation_end_version", None)
+            if _egv is None:
+                return
+            _consume = int(getattr(self.weight_updater, "weight_version", -1))
+            _egv_list = [int(v.item()) if hasattr(v, "item") else int(v) for v in _egv]
+            _gsv = rollout_data.get("generation_start_version", None)
+            _gsv_list = (
+                [int(v.item()) if hasattr(v, "item") else int(v) for v in _gsv]
+                if _gsv is not None
+                else [-1] * len(_egv_list)
+            )
+            _sidx = rollout_data.get("sample_indices", None)
+            _sidx_list = (
+                [int(v.item()) if hasattr(v, "item") else int(v) for v in _sidx]
+                if _sidx is not None
+                else [-1] * len(_egv_list)
+            )
+            _gidx = rollout_data.get("group_indices", None)
+            _gidx_list = (
+                [int(v.item()) if hasattr(v, "item") else int(v) for v in _gidx]
+                if _gidx is not None
+                else [-1] * len(_egv_list)
+            )
+            _gspan = rollout_data.get("generation_version_span", None)
+            _gspan_list = (
+                [int(v.item()) if hasattr(v, "item") else int(v) for v in _gspan]
+                if _gspan is not None
+                else [-1] * len(_egv_list)
+            )
+            _stale = [_consume - v for v in _egv_list if v >= 0]
+            _invalid = sum(1 for v in _egv_list if v < 0)
+            _neg = sum(1 for x in _stale if x < 0)
+            if _stale:
+                _ss = sorted(_stale)
+                tracking_utils.log(
+                    self.args,
+                    {
+                        "rollout/actual_staleness/consume_version": float(_consume),
+                        "rollout/actual_staleness/count": float(len(_ss)),
+                        "rollout/actual_staleness/avg": float(sum(_ss) / len(_ss)),
+                        "rollout/actual_staleness/p50": float(_ss[len(_ss) // 2]),
+                        "rollout/actual_staleness/p95": float(_ss[min(len(_ss) - 1, int(len(_ss) * 0.95))]),
+                        "rollout/actual_staleness/max": float(_ss[-1]),
+                        "rollout/actual_staleness/min": float(_ss[0]),
+                        "rollout/actual_staleness/negative_count": float(_neg),
+                        "rollout/actual_staleness/invalid_version_count": float(_invalid),
+                        "rollout/step": compute_rollout_step(self.args, rollout_id),
+                    },
+                    step_key="rollout/step",
+                )
+            # Bounded keyed per-sample debug artifact (JSONL, one line per sample).
+            _dbg_dir = os.environ.get("TASK22_STALENESS_DIR", "/tmp/task22_staleness")
+            os.makedirs(_dbg_dir, exist_ok=True)
+            _path = os.path.join(_dbg_dir, f"actual_staleness_rollout_{rollout_id}.jsonl")
+            with open(_path, "w") as _f:
+                for _i in range(len(_egv_list)):
+                    _end = _egv_list[_i]
+                    _rec = {
+                        "rollout_id": int(rollout_id),
+                        "target_partition": f"train_{rollout_id}",
+                        "sample_index": _sidx_list[_i] if _i < len(_sidx_list) else -1,
+                        "group_index": _gidx_list[_i] if _i < len(_gidx_list) else -1,
+                        "generation_start_version": _gsv_list[_i] if _i < len(_gsv_list) else -1,
+                        "generation_end_version": _end,
+                        "generation_version_span": _gspan_list[_i] if _i < len(_gspan_list) else -1,
+                        "consume_version": _consume,
+                        "actual_staleness": (_consume - _end) if _end >= 0 else None,
+                    }
+                    _f.write(json.dumps(_rec) + "\n")
+        except Exception as _exc:  # never let instrumentation break training
+            logger.warning(f"Task22 actual-staleness instrumentation skipped: {_exc!r}")
+
     @timer("wait update_weights_fully_async")
-    def _check_services_health(self) -> tuple[bool, bool]:
+    def _check_services_health(self, actor_rollout_id: int | None = None) -> tuple[bool, bool]:
         """Check rollout and actor_fwd service health before weight update.
 
         Only rank 0 sends HTTP requests to check service availability, then
@@ -1627,8 +1729,29 @@ class MegatronTrainRayActor(TrainRayActor):
             # Check rollout service
             try:
                 rollout_serve_url = get_serve_url("rollout")
+                # Task22 instrumentation: count gate polls and time-to-ready so we
+                # can separate the real "partition-not-complete" wait from the
+                # 1s sleep quantization of this poll loop. Pure bookkeeping; the
+                # poll cadence (time.sleep(1)) is unchanged.
+                _gate_poll_count = 0
+                _gate_wait_start = time.time()
+                # Pass the target weight version through the existing gate HTTP
+                # request so rollout-side flow diagnostics can join this gate to
+                # the exact physical-rollout/logical-partition state. No extra RPC.
+                try:
+                    _cur_wv = int(getattr(self.weight_updater, "weight_version", -1))
+                    _sync_id = _cur_wv + 1 if _cur_wv >= 0 else -1
+                except Exception:
+                    _sync_id = -1
                 while True:
-                    response = requests.get(f"{rollout_serve_url}/can_do_update_weight_for_async")
+                    _gate_poll_count += 1
+                    response = requests.get(
+                        f"{rollout_serve_url}/can_do_update_weight_for_async",
+                        params={
+                            "sync_id": _sync_id,
+                            "actor_rollout_id": (actor_rollout_id if actor_rollout_id is not None else -1),
+                        },
+                    )
                     response.raise_for_status()
                     res = response.json()
                     if res:
@@ -1637,6 +1760,20 @@ class MegatronTrainRayActor(TrainRayActor):
                         break
                     else:
                         time.sleep(1)
+                _gate_ready = time.time()
+                _gate_ready_latency = _gate_ready - _gate_wait_start
+                Timer().add("gate_first_ready_latency", _gate_ready_latency)
+                Timer().add("gate_poll_count", float(_gate_poll_count))
+                # Task22 instrumentation: same-clock gate event keyed by sync_id =
+                # the TARGET weight version this cycle will produce. The gate runs
+                # BEFORE update_weights() increments the version, so target =
+                # current + 1. This is the SAME sync_id that update_weights emits for
+                # its pause/flush/transfer/continue phases, so one cycle joins to one
+                # key. Pure logging.
+                logger.info(
+                    "TASK22_EVENT phase=gate sync_id=%s t_begin=%.6f t_end=%.6f dur=%.6f poll_count=%d"
+                    % (str(_sync_id), _gate_wait_start, _gate_ready, _gate_ready_latency, _gate_poll_count)
+                )
             except Exception as e:
                 logger.warning(
                     f"Error checking rollout service: {e}, maybe caused by rollout server failure. "
