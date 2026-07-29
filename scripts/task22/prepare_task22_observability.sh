@@ -19,8 +19,8 @@ SCHEDULER_METRICS_FILE="$SGLANG_IMPORT_ROOT/sglang/srt/observability/scheduler_m
 if grep -q -- '"running_seq_lens"' "$SCHEDULER_STATUS_FILE" \
     && grep -q -- "TASK22_REQUEST_SHAPE_PREFILL_STATUS" "$SCHEDULER_METRICS_FILE"; then
     echo "Task22 request/shape observability patch already applied"
-elif patch --dry-run --batch --forward -d "$SGLANG_IMPORT_ROOT" -p2 < "$PATCH" >/dev/null 2>&1; then
-    patch --batch --forward -d "$SGLANG_IMPORT_ROOT" -p2 < "$PATCH"
+elif patch --dry-run --batch --forward -F 4 -d "$SGLANG_IMPORT_ROOT" -p2 < "$PATCH" >/dev/null 2>&1; then
+    patch --batch --forward -F 4 -d "$SGLANG_IMPORT_ROOT" -p2 < "$PATCH"
     echo "Applied Task22 request/shape observability patch"
 else
     echo "Task22 request/shape observability patch state is broken" >&2
