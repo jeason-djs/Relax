@@ -73,6 +73,14 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
+def _non_negative_int(value: str) -> int:
+    """argparse type that rejects negative integers at parse time."""
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError(f"expected a non-negative integer, got {value!r}")
+    return parsed
+
+
 def reset_arg(parser, name, **kwargs):
     """Reset the default value of a Megatron argument.
 
@@ -728,6 +736,55 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "Regardless of whether partial rollout is used or filters are applied, "
                     "the sampling granularity is always determined by this value. "
                     "If this value is None, rollout_batch_size will be used as the default over_sampling_batch_size."
+                ),
+            )
+            parser.add_argument(
+                "--partition-critical-admission-mode",
+                type=str,
+                choices=["off", "shadow", "on"],
+                default="off",
+                help=(
+                    "Control partition-critical bounded admission in fully-async rollout. "
+                    "'off' preserves eager admission, 'shadow' records bounded decisions "
+                    "without changing submissions, and 'on' applies the bounded window."
+                ),
+            )
+            parser.add_argument(
+                "--partition-critical-admission-min-inflight-groups",
+                type=_positive_int,
+                default=None,
+                help=(
+                    "Minimum number of prompt groups kept in flight while the previous "
+                    "training partition is waiting for its closing transfer. Required "
+                    "when partition-critical admission mode is shadow or on."
+                ),
+            )
+            parser.add_argument(
+                "--partition-critical-admission-max-inflight-groups",
+                type=_positive_int,
+                default=None,
+                help=(
+                    "Normal upper bound on prompt groups kept in flight by partition-critical "
+                    "admission. Required when admission mode is shadow or on."
+                ),
+            )
+            parser.add_argument(
+                "--partition-critical-admission-slack-groups",
+                type=_non_negative_int,
+                default=None,
+                help=(
+                    "Extra in-flight prompt groups retained above the previous partition's "
+                    "closing-transfer requirement. Required when admission mode is shadow or on."
+                ),
+            )
+            parser.add_argument(
+                "--rollout-request-observability-dir",
+                type=str,
+                default=None,
+                help=(
+                    "Optional directory for prompt-content-free per-request rollout lifecycle JSONL. "
+                    "Records request ids, token counts, cache/timing metadata and admission context. "
+                    "Disabled by default."
                 ),
             )
             parser.add_argument(
@@ -2547,6 +2604,12 @@ def _normalize_sft_tq_timeout(args, is_sft: bool) -> None:
         raise ValueError("--sft-tq-timeout-minutes must be > 0.")
 
 
+def _validate_partition_critical_admission_args(args) -> None:
+    from relax.engine.rollout.admission import validate_admission_namespace
+
+    validate_admission_namespace(args)
+
+
 def _validate_agentic_rollout_args(args) -> None:
     if not args.use_agentic_rollout:
         return
@@ -2598,6 +2661,7 @@ def slime_validate_args(args):
         args.use_gloo_process_groups = getattr(args, "enable_gloo_process_groups", False)
 
     is_sft = args.loss_type in ("sft", "sft_loss", "sft-loss")
+    _validate_partition_critical_admission_args(args)
     if is_sft and getattr(args, "dynamic_context_parallel", False) and args.eval_interval is not None:
         raise ValueError(
             "--dynamic-context-parallel cannot be used with SFT eval (--eval-interval) yet: "

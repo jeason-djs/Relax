@@ -1,0 +1,422 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
+from argparse import Namespace
+
+import pytest
+
+from relax.engine.rollout.admission import (
+    AdmissionMode,
+    DebtAwareAdmissionConfig,
+    DebtAwareAdmissionController,
+    config_from_namespace,
+    plan_next_admission,
+    previous_partition_release_remaining,
+    validate_admission_namespace,
+)
+
+
+def _enabled_config(mode: AdmissionMode = AdmissionMode.ON) -> DebtAwareAdmissionConfig:
+    return DebtAwareAdmissionConfig(
+        mode=mode,
+        min_inflight_groups=4,
+        max_inflight_groups=8,
+        slack_groups=2,
+    )
+
+
+def _decide(
+    controller: DebtAwareAdmissionController,
+    *,
+    inflight: int,
+    debt: int,
+    available: int = 20,
+    eager: int = 20,
+):
+    return controller.admit_count(
+        inflight_groups=inflight,
+        debt_remaining=debt,
+        available_groups=available,
+        eager_admit_groups=eager,
+    )
+
+
+def test_admission_off_preserves_eager_count() -> None:
+    controller = DebtAwareAdmissionController(DebtAwareAdmissionConfig())
+
+    decision = _decide(controller, inflight=0, debt=6, available=14, eager=14)
+
+    assert decision.actual_admit_groups == 14
+    assert decision.bypass_reason == "disabled"
+
+
+def test_admission_shadow_preserves_eager_but_reports_instant_bounded_count() -> None:
+    controller = DebtAwareAdmissionController(_enabled_config(AdmissionMode.SHADOW))
+
+    decision = _decide(controller, inflight=0, debt=6, available=14, eager=14)
+
+    assert decision.desired_inflight_groups == 8
+    assert decision.bounded_admit_groups == 8
+    assert decision.actual_admit_groups == 14
+
+
+def test_admission_on_tapers_without_refilling_while_debt_closes() -> None:
+    controller = DebtAwareAdmissionController(_enabled_config())
+
+    first = _decide(controller, inflight=0, debt=6, available=14, eager=14)
+    second = _decide(controller, inflight=6, debt=4, available=8, eager=0)
+    third = _decide(controller, inflight=4, debt=2, available=6, eager=0)
+
+    assert first.actual_admit_groups == 8
+    assert first.desired_inflight_groups == 8
+    assert second.actual_admit_groups == 0
+    assert second.desired_inflight_groups == 6
+    assert third.actual_admit_groups == 0
+    assert third.desired_inflight_groups == 4
+
+
+def test_admission_on_refills_when_work_is_dropped_without_closing_debt() -> None:
+    controller = DebtAwareAdmissionController(_enabled_config())
+
+    decision = _decide(controller, inflight=7, debt=6, available=7, eager=0)
+
+    assert decision.desired_inflight_groups == 8
+    assert decision.actual_admit_groups == 1
+
+
+def test_admission_on_uses_normal_max_window_after_debt_closes() -> None:
+    controller = DebtAwareAdmissionController(_enabled_config())
+
+    decision = _decide(controller, inflight=2, debt=0, available=20, eager=0)
+
+    assert decision.desired_inflight_groups == 8
+    assert decision.actual_admit_groups == 6
+
+
+def test_admission_never_fetches_more_than_useful_available_groups() -> None:
+    controller = DebtAwareAdmissionController(_enabled_config())
+
+    decision = _decide(controller, inflight=2, debt=0, available=3, eager=0)
+
+    assert decision.actual_admit_groups == 3
+
+
+def test_admission_final_backfill_preserves_eager_count() -> None:
+    controller = DebtAwareAdmissionController(_enabled_config(), final_backfill=True)
+
+    decision = _decide(controller, inflight=0, debt=6, available=6, eager=14)
+
+    assert decision.actual_admit_groups == 14
+    assert decision.bypass_reason == "final_backfill"
+
+
+def test_admission_fail_open_preserves_eager_count_and_records_reason() -> None:
+    controller = DebtAwareAdmissionController(_enabled_config())
+    controller.fail_open("no_progress")
+
+    decision = _decide(controller, inflight=0, debt=4, available=6, eager=14)
+
+    assert decision.actual_admit_groups == 14
+    assert decision.bypass_reason == "fail_open:no_progress"
+    assert controller.metrics()["rollout/admission/failed_open"] == 1.0
+
+
+def test_previous_partition_release_accounts_for_transfer_batching() -> None:
+    assert (
+        previous_partition_release_remaining(
+            previous_debt_groups=6,
+            completed_groups=0,
+            transfer_batch_groups=8,
+        )
+        == 8
+    )
+    assert (
+        previous_partition_release_remaining(
+            previous_debt_groups=6,
+            completed_groups=6,
+            transfer_batch_groups=8,
+        )
+        == 2
+    )
+    assert (
+        previous_partition_release_remaining(
+            previous_debt_groups=6,
+            completed_groups=8,
+            transfer_batch_groups=8,
+        )
+        == 0
+    )
+
+
+def test_plan_next_admission_matches_task22_fully_async_partial_false_shape() -> None:
+    controller = DebtAwareAdmissionController(_enabled_config())
+
+    initial = plan_next_admission(
+        controller,
+        target_groups=14,
+        progress_groups=0,
+        transferred_groups=0,
+        inflight_groups=0,
+        cumulative_submitted_groups=0,
+        previous_debt_groups=6,
+        transfer_batch_groups=8,
+        eager_fetch_groups=14,
+    )
+    near_close = plan_next_admission(
+        controller,
+        target_groups=14,
+        progress_groups=6,
+        transferred_groups=6,
+        inflight_groups=2,
+        cumulative_submitted_groups=8,
+        previous_debt_groups=6,
+        transfer_batch_groups=8,
+        eager_fetch_groups=14,
+    )
+
+    assert initial.actual_admit_groups == 8
+    assert initial.debt_remaining == 8
+    assert near_close.actual_admit_groups == 2
+    assert near_close.debt_remaining == 2
+
+
+def test_plan_next_admission_refills_after_dynamic_filter_drop() -> None:
+    controller = DebtAwareAdmissionController(_enabled_config())
+
+    decision = plan_next_admission(
+        controller,
+        target_groups=14,
+        progress_groups=2,
+        transferred_groups=2,
+        inflight_groups=5,
+        cumulative_submitted_groups=7,
+        previous_debt_groups=6,
+        transfer_batch_groups=8,
+        eager_fetch_groups=14,
+    )
+
+    assert decision.desired_inflight_groups == 8
+    assert decision.actual_admit_groups == 3
+
+
+def test_plan_next_admission_counts_aborted_group_as_rollout_progress_not_transfer() -> None:
+    controller = DebtAwareAdmissionController(_enabled_config())
+
+    decision = plan_next_admission(
+        controller,
+        target_groups=14,
+        progress_groups=6,
+        transferred_groups=5,
+        inflight_groups=2,
+        cumulative_submitted_groups=8,
+        previous_debt_groups=6,
+        transfer_batch_groups=8,
+        eager_fetch_groups=14,
+    )
+
+    assert decision.available_groups == 6
+    assert decision.debt_remaining == 3
+    assert decision.actual_admit_groups == 3
+
+
+def test_plan_next_admission_closes_debt_then_opens_normal_window_without_overfetch() -> None:
+    controller = DebtAwareAdmissionController(_enabled_config())
+
+    first = plan_next_admission(
+        controller,
+        target_groups=14,
+        progress_groups=0,
+        transferred_groups=0,
+        inflight_groups=0,
+        cumulative_submitted_groups=0,
+        previous_debt_groups=6,
+        transfer_batch_groups=8,
+        eager_fetch_groups=14,
+    )
+    close_debt = plan_next_admission(
+        controller,
+        target_groups=14,
+        progress_groups=6,
+        transferred_groups=6,
+        inflight_groups=2,
+        cumulative_submitted_groups=8,
+        previous_debt_groups=6,
+        transfer_batch_groups=8,
+        eager_fetch_groups=14,
+    )
+    normal = plan_next_admission(
+        controller,
+        target_groups=14,
+        progress_groups=8,
+        transferred_groups=8,
+        inflight_groups=2,
+        cumulative_submitted_groups=10,
+        previous_debt_groups=6,
+        transfer_batch_groups=8,
+        eager_fetch_groups=14,
+    )
+
+    assert first.actual_admit_groups == 8
+    assert close_debt.actual_admit_groups == 2
+    assert normal.actual_admit_groups == 4
+    assert (
+        sum(
+            decision.actual_admit_groups
+            for decision in (
+                first,
+                close_debt,
+                normal,
+            )
+        )
+        == 14
+    )
+
+
+@pytest.mark.parametrize("mode", [AdmissionMode.OFF, AdmissionMode.SHADOW])
+def test_non_on_modes_keep_eager_top_up_active_until_target_is_submitted(mode: AdmissionMode) -> None:
+    controller = DebtAwareAdmissionController(
+        DebtAwareAdmissionConfig(
+            mode=mode,
+            min_inflight_groups=4 if mode is AdmissionMode.SHADOW else 1,
+            max_inflight_groups=8 if mode is AdmissionMode.SHADOW else 1,
+            slack_groups=2 if mode is AdmissionMode.SHADOW else 0,
+        )
+    )
+
+    actual = []
+    for cumulative in (0, 3, 6, 9):
+        decision = plan_next_admission(
+            controller,
+            target_groups=8,
+            progress_groups=0,
+            transferred_groups=0,
+            inflight_groups=cumulative,
+            cumulative_submitted_groups=cumulative,
+            previous_debt_groups=0,
+            transfer_batch_groups=8,
+            eager_fetch_groups=3,
+        )
+        actual.append(decision.actual_admit_groups)
+
+    assert actual == [3, 3, 3, 0]
+
+
+def test_admission_config_defaults_to_off_when_attributes_are_absent() -> None:
+    config, error = config_from_namespace(Namespace())
+
+    assert config == DebtAwareAdmissionConfig()
+    assert error is None
+
+
+def test_admission_config_fails_open_when_enabled_settings_are_incomplete() -> None:
+    config, error = config_from_namespace(Namespace(partition_critical_admission_mode="on"))
+
+    assert config.mode is AdmissionMode.OFF
+    assert error is not None
+    assert "missing admission settings" in error
+
+
+def test_admission_config_fails_open_when_enabled_settings_are_none() -> None:
+    config, error = config_from_namespace(
+        Namespace(
+            partition_critical_admission_mode="shadow",
+            partition_critical_admission_min_inflight_groups=None,
+            partition_critical_admission_max_inflight_groups=None,
+            partition_critical_admission_slack_groups=None,
+        )
+    )
+
+    assert config.mode is AdmissionMode.OFF
+    assert error is not None
+    assert "missing admission settings" in error
+
+
+def test_admission_config_accepts_complete_cli_namespace() -> None:
+    config, error = config_from_namespace(
+        Namespace(
+            partition_critical_admission_mode="on",
+            partition_critical_admission_min_inflight_groups=4,
+            partition_critical_admission_max_inflight_groups=8,
+            partition_critical_admission_slack_groups=2,
+        )
+    )
+
+    assert error is None
+    assert config == _enabled_config()
+
+
+def test_admission_cli_validation_requires_fully_async_when_enabled() -> None:
+    args = Namespace(
+        fully_async=False,
+        hybrid=False,
+        partition_critical_admission_mode="on",
+        partition_critical_admission_min_inflight_groups=4,
+        partition_critical_admission_max_inflight_groups=8,
+        partition_critical_admission_slack_groups=2,
+    )
+
+    with pytest.raises(ValueError, match="requires --fully-async"):
+        validate_admission_namespace(args)
+
+
+def test_admission_cli_validation_accepts_fully_async_complete_config() -> None:
+    args = Namespace(
+        fully_async=True,
+        partition_critical_admission_mode="shadow",
+        partition_critical_admission_min_inflight_groups=4,
+        partition_critical_admission_max_inflight_groups=8,
+        partition_critical_admission_slack_groups=2,
+    )
+
+    assert validate_admission_namespace(args).mode is AdmissionMode.SHADOW
+
+
+def test_admission_cli_validation_accepts_hybrid_before_normalization() -> None:
+    args = Namespace(
+        fully_async=False,
+        hybrid=True,
+        partition_critical_admission_mode="shadow",
+        partition_critical_admission_min_inflight_groups=4,
+        partition_critical_admission_max_inflight_groups=8,
+        partition_critical_admission_slack_groups=2,
+    )
+
+    assert validate_admission_namespace(args).mode is AdmissionMode.SHADOW
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"min_inflight_groups": 0, "max_inflight_groups": 8}, "must be positive"),
+        ({"min_inflight_groups": 8, "max_inflight_groups": 4}, "must be >="),
+        ({"slack_groups": -1}, "must be non-negative"),
+    ],
+)
+def test_admission_config_rejects_unsafe_windows(kwargs: dict, message: str) -> None:
+    config_kwargs = {
+        "mode": AdmissionMode.ON,
+        "min_inflight_groups": 4,
+        "max_inflight_groups": 8,
+        "slack_groups": 2,
+    }
+    config_kwargs.update(kwargs)
+
+    with pytest.raises(ValueError, match=message):
+        DebtAwareAdmissionController(DebtAwareAdmissionConfig(**config_kwargs))
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["inflight_groups", "debt_remaining", "available_groups", "eager_admit_groups"],
+)
+def test_admission_rejects_negative_runtime_state(field: str) -> None:
+    controller = DebtAwareAdmissionController(_enabled_config())
+    values = {
+        "inflight_groups": 0,
+        "debt_remaining": 1,
+        "available_groups": 1,
+        "eager_admit_groups": 1,
+    }
+    values[field] = -1
+
+    with pytest.raises(ValueError, match=field):
+        controller.decide(**values)

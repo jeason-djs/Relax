@@ -22,7 +22,21 @@ from relax.distributed.ray.rollout import _log_rollout_data
 from relax.engine.filters.base_types import MetricGatherer, call_dynamic_filter
 from relax.engine.rewards import async_rm, batched_async_rm
 from relax.engine.rollout import on_policy_distillation as opd
+from relax.engine.rollout.admission import (
+    AdmissionMode,
+    DebtAwareAdmissionConfig,
+    DebtAwareAdmissionController,
+    config_from_namespace,
+    plan_next_admission,
+)
 from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
+from relax.engine.rollout.request_observability import (
+    begin_request_trace,
+    export_request_traces,
+    fail_request_trace,
+    finish_request_trace,
+    request_observability_enabled,
+)
 from relax.utils.async_utils import run
 from relax.utils.data.data import Dataset
 from relax.utils.data.processing_utils import (
@@ -139,9 +153,17 @@ class GenerateState(metaclass=SingletonMeta):
         if not hasattr(self, "last_step_current_deficit"):
             self.last_step_current_deficit = 0
 
-    def submit_generate_tasks(self, samples: list[list[Sample]]) -> None:
+    def submit_generate_tasks(
+        self,
+        samples: list[list[Sample]],
+        *,
+        admission_context: dict[str, Any] | None = None,
+    ) -> None:
         max_aborted_count = getattr(self.args, "partial_rollout_max_aborted_count", None)
         for group in samples:
+            if admission_context is not None and request_observability_enabled(self.args):
+                for sample in group:
+                    sample._relax_admission_context = admission_context
             task = asyncio.create_task(
                 generate_and_rm_group(
                     self.args,
@@ -335,6 +357,24 @@ async def generate(
         if not sample.rollout_tokens:
             sample.rollout_tokens = tokenizer_prompt_ids
 
+    request_trace: dict[str, Any] | None = None
+    request_trace_start = 0.0
+    if request_observability_enabled(args) and not evaluation:
+        try:
+            admission_context = getattr(sample, "_relax_admission_context", None)
+            if hasattr(sample, "_relax_admission_context"):
+                del sample._relax_admission_context
+            request_trace, request_trace_start = begin_request_trace(
+                sample=sample,
+                payload=payload,
+                physical_rollout_id=getattr(state, "current_rollout_id", None),
+                admission_context=admission_context,
+            )
+            state.request_observability_rows.append(request_trace)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"Rollout request observability start skipped: {exc}")
+            request_trace = None
+
     # Provide a routing key so cache-affinity routers pin related requests to the same
     # engine and reuse its prefix/KV cache.
     headers = None
@@ -346,8 +386,28 @@ async def generate(
         headers = {"X-SMG-Routing-Key": str(sample.group_index)}
 
     _t_generate_start = monotonic()
-    output = await post(url, payload, headers=headers)
+    try:
+        output = await post(url, payload, headers=headers)
+    except BaseException as request_error:
+        if request_trace is not None:
+            fail_request_trace(request_trace, request_error)
+        raise
     _t_generate = monotonic() - _t_generate_start
+    if request_trace is not None:
+        try:
+            finish_request_trace(
+                request_trace,
+                output=output,
+                request_start_monotonic=request_trace_start,
+            )
+        except Exception as exc:  # noqa: BLE001
+            request_trace.update(
+                {
+                    "client_status": "trace_error",
+                    "trace_error_type": type(exc).__name__,
+                }
+            )
+            logger.warning(f"Rollout request observability finish skipped: {exc}")
 
     _t_post_generate_start = monotonic()
     if args.use_slime_router and "RadixTreeMiddleware" in args.slime_router_middleware_paths:
@@ -556,6 +616,9 @@ async def generate_and_rm_group(
 
     # eval requests should not be affected by abort state; only skip for training rollout
     if state.aborted and not evaluation:
+        for sample in group:
+            if hasattr(sample, "_relax_admission_context"):
+                del sample._relax_admission_context
         return group
 
     # Generate a unique session_id for each sample in the group
@@ -585,6 +648,12 @@ async def generate_and_rm_group(
         )
 
     group = await asyncio.gather(*tasks)
+    # The default SGLang path consumes this marker when it starts request
+    # tracing. Completed samples and custom generation functions can bypass
+    # that path, so clear any marker that remains after the task finishes.
+    for sample in group:
+        if hasattr(sample, "_relax_admission_context"):
+            del sample._relax_admission_context
 
     # eval should still compute group reward even if abort was triggered by a concurrent rollout
     if (not state.aborted or evaluation) and args.group_rm:
@@ -696,6 +765,8 @@ async def generate_rollout_async(
     assert args.rollout_global_dataset
 
     state = GenerateState(args)
+    state.current_rollout_id = rollout_id
+    state.request_observability_rows: list[dict[str, Any]] = []
 
     # Start SGLang profiling if enabled
     await start_sglang_profile(args, rollout_id)
@@ -714,6 +785,20 @@ async def generate_rollout_async(
     num_old_samples = state.last_step_current_deficit if args.fully_async else 0
 
     is_final_backfill = args.fully_async and rollout_id >= args.num_rollout
+    admission_config, admission_config_error = config_from_namespace(args)
+    if admission_config_error is not None:
+        logger.warning(
+            f"Invalid partition-critical admission config; falling back to eager admission: {admission_config_error}"
+        )
+    if admission_config.mode is not AdmissionMode.OFF and not args.fully_async:
+        logger.warning(
+            "Partition-critical admission currently supports only fully-async rollout; falling back to eager admission"
+        )
+        admission_config = DebtAwareAdmissionConfig()
+    admission_controller = DebtAwareAdmissionController(
+        admission_config,
+        final_backfill=is_final_backfill,
+    )
 
     # target_data_size = how many groups this step COMMITS to the transfer queue:
     # current-partition target (rollout_batch_size) + previous-partition backfill
@@ -722,15 +807,6 @@ async def generate_rollout_async(
     target_data_size = num_old_samples if is_final_backfill else args.rollout_batch_size + num_old_samples
     if target_data_size <= 0:
         raise RuntimeError(f"Final rollout backfill requested for rollout_id={rollout_id} without pending deficit")
-
-    # Inner-loop top-up threshold = the commit target. Each submit_generate_tasks call
-    # admits a full over_sampling_batch_size of groups, so one round already puts more
-    # tasks in flight than target_data_size (the over-sampling envelope). Gating top-up on
-    # target_data_size (not over_sampling_batch_size) keeps the over-sample surplus as slack
-    # that absorbs aborted/filtered groups; gating on over_sampling_batch_size removes that
-    # slack when over_sampling_batch_size == rollout_batch_size and deadlocks the outer loop
-    # on an empty pending set once any group aborts.
-    submit_target = target_data_size
 
     data = []
     do_print = True
@@ -743,6 +819,11 @@ async def generate_rollout_async(
     oversample_surplus = []
     total_transfer_samples = 0
     get_samples_times: list[float] = []
+    transfer_batch_size = (
+        args.global_batch_size // args.num_iters_per_train_update // args.n_samples_per_prompt
+        if args.fully_async
+        else args.rollout_batch_size
+    )
 
     # is_last bookkeeping: a partition train_X is filled across two steps (step X
     # commits committed_current, step X+1 backfills the deficit). Mark is_last on
@@ -756,14 +837,11 @@ async def generate_rollout_async(
     curr_target = 0 if is_final_backfill else args.rollout_batch_size
 
     if is_final_backfill:
-        logger.info(
-            f"Starting final rollout backfill step {rollout_id}: target(prev)={target_data_size}, "
-            f"submit_target={submit_target}"
-        )
+        logger.info(f"Starting final rollout backfill step {rollout_id}: target(prev)={target_data_size}")
     else:
         logger.info(
             f"Starting rollout step {rollout_id}: target(commit)={target_data_size} "
-            f"(rollout_batch={args.rollout_batch_size} + old={num_old_samples}), submit_target={submit_target}"
+            f"(rollout_batch={args.rollout_batch_size} + old={num_old_samples})"
         )
 
     loop = asyncio.get_running_loop()
@@ -773,26 +851,120 @@ async def generate_rollout_async(
             return total_transfer_samples >= target_data_size
         return len(data) >= target_data_size
 
-    # Outer loop stops once we've COMMITTED target_data_size groups; inner loop tops up
-    # submissions whenever in-flight admitted groups drop below the commit target, each
-    # round admitting a full over_sampling_batch_size so the surplus absorbs aborts.
+    # Outer loop stops once we've COMMITTED target_data_size groups. The data source
+    # remains the owner of unadmitted groups. OFF/shadow preserve the original
+    # inner eager top-up loop; ON makes one bounded fetch per completion cycle.
     while not target_reached():
-        while state.remaining_batch_size < submit_target:
-            _t_get_samples = monotonic()
+        while True:
+            inflight_groups = len(state.pendings | state.protected_pendings)
+            progress_groups = total_transfer_samples if is_final_backfill else len(data)
+            eager_fetch_groups = args.over_sampling_batch_size + num_old_samples
+            logical_debt_remaining = max(num_old_samples - min(total_transfer_samples, num_old_samples), 0)
+            try:
+                admission_decision = plan_next_admission(
+                    admission_controller,
+                    target_groups=target_data_size,
+                    progress_groups=progress_groups,
+                    transferred_groups=total_transfer_samples,
+                    inflight_groups=inflight_groups,
+                    cumulative_submitted_groups=state.remaining_batch_size,
+                    previous_debt_groups=num_old_samples,
+                    transfer_batch_groups=transfer_batch_size,
+                    eager_fetch_groups=eager_fetch_groups,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.exception(f"Partition-critical admission failed; falling back to eager admission: {exc}")
+                admission_controller.fail_open(type(exc).__name__)
+                admission_decision = admission_controller.admit_count(
+                    inflight_groups=max(inflight_groups, 0),
+                    debt_remaining=0,
+                    available_groups=max(target_data_size - progress_groups - inflight_groups, 0),
+                    eager_admit_groups=(eager_fetch_groups if state.remaining_batch_size < target_data_size else 0),
+                )
 
+            if admission_config.mode is not AdmissionMode.OFF:
+                logger.info(
+                    "PARTITION_ADMISSION rollout_id=%s mode=%s logical_debt=%s release_remaining=%s available=%s "
+                    "inflight=%s desired=%s bounded_admit=%s actual_admit=%s eager_admit=%s bypass=%s"
+                    % (
+                        rollout_id,
+                        admission_decision.mode.value,
+                        logical_debt_remaining,
+                        admission_decision.debt_remaining,
+                        admission_decision.available_groups,
+                        admission_decision.inflight_groups,
+                        admission_decision.desired_inflight_groups,
+                        admission_decision.bounded_admit_groups,
+                        admission_decision.actual_admit_groups,
+                        admission_decision.eager_admit_groups,
+                        admission_decision.bypass_reason,
+                    )
+                )
+            if admission_decision.actual_admit_groups <= 0:
+                break
+
+            _t_get_samples = monotonic()
             if state.prefetched_samples_ref is not None:
                 ref = state.prefetched_samples_ref
                 state.prefetched_samples_ref = None
                 logger.info(f"Rollout step {rollout_id}: using pre-fetched data from previous step")
             else:
-                ref = data_source.get_samples.remote(args.over_sampling_batch_size + num_old_samples)
+                ref = data_source.get_samples.remote(admission_decision.actual_admit_groups)
 
             samples = await loop.run_in_executor(None, ray.get, ref)
-
             get_samples_times.append(monotonic() - _t_get_samples)
-            state.submit_generate_tasks(samples)
+            state.submit_generate_tasks(
+                samples,
+                admission_context={
+                    "mode": admission_decision.mode.value,
+                    "release_remaining": admission_decision.debt_remaining,
+                    "inflight_before": admission_decision.inflight_groups,
+                    "desired_inflight": admission_decision.desired_inflight_groups,
+                    "available_groups": admission_decision.available_groups,
+                    "bounded_admit_groups": admission_decision.bounded_admit_groups,
+                    "eager_admit_groups": admission_decision.eager_admit_groups,
+                    "decision_admit_groups": admission_decision.actual_admit_groups,
+                    "bypass": admission_decision.bypass_reason,
+                },
+            )
+            if admission_config.mode is AdmissionMode.ON:
+                break
+
         # wait for the generation to finish (from both normal and protected pending sets)
         all_pendings = state.pendings | state.protected_pendings
+        if not all_pendings and admission_config.mode is AdmissionMode.ON and not is_final_backfill:
+            logger.error("Partition-critical admission made no progress; failing open for this physical rollout")
+            admission_controller.fail_open("no_progress")
+            fallback_decision = admission_controller.admit_count(
+                inflight_groups=0,
+                debt_remaining=admission_decision.debt_remaining,
+                available_groups=max(target_data_size - progress_groups, 0),
+                eager_admit_groups=eager_fetch_groups,
+            )
+            fallback_count = fallback_decision.actual_admit_groups
+            _t_get_samples = monotonic()
+            ref = data_source.get_samples.remote(fallback_count)
+            samples = await loop.run_in_executor(None, ray.get, ref)
+            get_samples_times.append(monotonic() - _t_get_samples)
+            state.submit_generate_tasks(
+                samples,
+                admission_context={
+                    "mode": fallback_decision.mode.value,
+                    "release_remaining": fallback_decision.debt_remaining,
+                    "inflight_before": 0,
+                    "desired_inflight": fallback_decision.desired_inflight_groups,
+                    "available_groups": fallback_decision.available_groups,
+                    "bounded_admit_groups": fallback_decision.bounded_admit_groups,
+                    "eager_admit_groups": fallback_decision.eager_admit_groups,
+                    "decision_admit_groups": fallback_count,
+                    "bypass": fallback_decision.bypass_reason,
+                },
+            )
+            all_pendings = state.pendings | state.protected_pendings
+        if not all_pendings and admission_config.mode is AdmissionMode.ON and not is_final_backfill:
+            raise RuntimeError(
+                f"Rollout made no progress after fail-open (release_remaining={admission_decision.debt_remaining})"
+            )
         done, remaining = await asyncio.wait(all_pendings, return_when=asyncio.FIRST_COMPLETED)
         state.pendings = state.pendings & remaining
         state.protected_pendings = state.protected_pendings & remaining
@@ -841,11 +1013,6 @@ async def generate_rollout_async(
                 pbar.update(args.n_samples_per_prompt)
 
         # Only spawn a transfer task when there are samples to transfer.
-        transfer_batch_size = (
-            args.global_batch_size // args.num_iters_per_train_update // args.n_samples_per_prompt
-            if args.fully_async
-            else args.rollout_batch_size
-        )  # Samples per batch to transfer
         # in fully async mode, we transfer all remaining samples when we reach the target size
         if len(batch_to_transfer) >= transfer_batch_size:
             if total_transfer_samples <= num_old_samples:
@@ -973,6 +1140,30 @@ async def generate_rollout_async(
     new_aborted, completed_protected = await abort(args, rollout_id)
     aborted_samples.extend(new_aborted)
     aborted_samples.extend(completed_protected)
+    if request_observability_enabled(args):
+        try:
+            request_output_path = export_request_traces(
+                state.request_observability_rows,
+                output_dir=args.rollout_request_observability_dir,
+                physical_rollout_id=rollout_id,
+            )
+            finished_request_rows = sum(
+                row.get("client_status") == "finished" for row in state.request_observability_rows
+            )
+            resume_request_rows = sum(row.get("attempt_kind") == "resume" for row in state.request_observability_rows)
+            logger.info(
+                "ROLLOUT_REQUEST_OBSERVABILITY physical_rollout_id=%s rows=%s "
+                "finished=%s resumes=%s path=%s"
+                % (
+                    rollout_id,
+                    len(state.request_observability_rows),
+                    finished_request_rows,
+                    resume_request_rows,
+                    request_output_path,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"Rollout request observability export skipped: {exc}")
     if aborted_samples:
         logger.info(
             f"Rollout not completed for rollout_id: {rollout_id}, have {len(aborted_samples)} samples aborted."
@@ -1034,6 +1225,7 @@ async def generate_rollout_async(
             args, CURRENT_ROLLOUT_BATCH, rollout_id=rollout_id, evaluation=False, tokenizer=state.tokenizer
         )
         rollout_metrics = dict(timing_metrics)
+        rollout_metrics.update(admission_controller.metrics())
         if args.partial_rollout and not args.fully_async:
             assert len(CURRENT_ROLLOUT_BATCH) == len(data) * args.n_samples_per_prompt, (
                 f"len(CURRENT_ROLLOUT_BATCH)={len(CURRENT_ROLLOUT_BATCH)}, len(data) * args.n_samples_per_prompt={len(data) * args.n_samples_per_prompt}"
@@ -1052,9 +1244,11 @@ async def generate_rollout_async(
         # Cleanup
         CURRENT_ROLLOUT_BATCH.clear()
 
+    output_metrics = metric_gatherer.collect()
+    output_metrics.update(admission_controller.metrics())
     state.reset()
 
-    return RolloutFnTrainOutput(samples=data, metrics=metric_gatherer.collect()), aborted_samples
+    return RolloutFnTrainOutput(samples=data, metrics=output_metrics), aborted_samples
 
 
 EVAL_PROMPT_DATASET = {}
