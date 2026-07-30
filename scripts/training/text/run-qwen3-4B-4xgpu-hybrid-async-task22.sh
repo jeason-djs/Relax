@@ -76,7 +76,26 @@ if [[ -n "$REQUEST_OBSERVABILITY_DIR" ]]; then
     bash "$REPO/scripts/task22/prepare_rollout_observability.sh"
     export SGLANG_LOG_SCHEDULER_STATUS_TARGET="${SGLANG_LOG_SCHEDULER_STATUS_TARGET:-stdout}"
     export SGLANG_LOG_SCHEDULER_STATUS_INTERVAL="${SGLANG_LOG_SCHEDULER_STATUS_INTERVAL:-1.0}"
+    export RELAX_RID_ONLY_REQUEST_LOGGING=1
     export RAY_DEDUP_LOGS=0
+    RUNTIME_ENV_JSON="$(
+        RUNTIME_ENV_JSON="$RUNTIME_ENV_JSON" python3 -c '
+import json
+import os
+
+runtime_env = json.loads(os.environ["RUNTIME_ENV_JSON"])
+env_vars = runtime_env.setdefault("env_vars", {})
+for name in (
+    "SGLANG_LOG_SCHEDULER_STATUS_TARGET",
+    "SGLANG_LOG_SCHEDULER_STATUS_INTERVAL",
+    "RELAX_RID_ONLY_REQUEST_LOGGING",
+    "RAY_DEDUP_LOGS",
+):
+    env_vars[name] = os.environ[name]
+print(json.dumps(runtime_env))
+'
+    )"
+    export RUNTIME_ENV_JSON
     ROLLOUT_ARGS+=(--rollout-request-observability-dir "$REQUEST_OBSERVABILITY_DIR")
 fi
 

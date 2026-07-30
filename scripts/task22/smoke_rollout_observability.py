@@ -9,7 +9,7 @@ import pickle
 
 from sglang.srt.observability import scheduler_metrics_mixin
 from sglang.srt.observability.req_time_stats import SchedulerReqTimeStats
-from sglang.srt.utils import scheduler_status_logger
+from sglang.srt.utils import request_logger, scheduler_status_logger
 
 
 def _round_trip(value: SchedulerReqTimeStats) -> SchedulerReqTimeStats:
@@ -44,6 +44,7 @@ def main() -> None:
 
     status_source = inspect.getsource(scheduler_status_logger.SchedulerStatusLogger)
     metrics_source = inspect.getsource(scheduler_metrics_mixin.SchedulerMetricsMixin)
+    request_logger_source = inspect.getsource(request_logger.RequestLogger)
     for field in (
         "forward_mode",
         "running_seq_lens",
@@ -58,6 +59,7 @@ def main() -> None:
         "RELAX_REQUEST_SHAPE_OBSERVABILITY" in metrics_source
         or "TASK22_REQUEST_SHAPE_PREFILL_STATUS" in metrics_source
     )
+    assert "RELAX_RID_ONLY_REQUEST_LOGGING" in request_logger_source
     print("PASS: SGLang request timing and scheduler shape observability")
 
 

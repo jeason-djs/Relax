@@ -130,7 +130,7 @@ def test_rollout_observability_analyzer_rejects_nested_content_in_any_request_ev
                     {
                         "event": "request.finished",
                         "rid": rid,
-                        "out": {"debug": {"input_ids": [1, 2, 3]}},
+                        "out": {"meta_info": {"output_token_logprobs": [[-0.1, 123, None]]}},
                     },
                 ),
                 _event(
@@ -159,4 +159,4 @@ def test_rollout_observability_analyzer_rejects_nested_content_in_any_request_ev
     assert result["verdict"] == "FAIL"
     assert not result["checks"]["server_request_log_has_no_large_fields"]
     assert result["counts"]["forbidden_fields"] == 1
-    assert result["failures"]["forbidden_fields"][0]["paths"] == ["$.out.debug.input_ids"]
+    assert result["failures"]["forbidden_fields"][0]["paths"] == ["$.out.meta_info.output_token_logprobs"]

@@ -24,6 +24,12 @@ FORBIDDEN_FIELDS = {
     "audio_data",
     "video_data",
     "sampling_params",
+    "token_ids_logprob",
+    "input_token_logprobs",
+    "output_token_logprobs",
+    "input_top_logprobs",
+    "output_top_logprobs",
+    "output_ids",
 }
 
 
