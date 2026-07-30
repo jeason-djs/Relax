@@ -4,7 +4,10 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
+import os
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -62,6 +65,25 @@ def _flatten_int_values(value: Any) -> list[int]:
     if hasattr(value, "item"):
         value = value.item()
     return [int(value)]
+
+
+def _atomic_write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
+    """Publish a complete JSONL snapshot without exposing a partial file."""
+
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as output_file:
+            for row in rows:
+                output_file.write(json.dumps(row, ensure_ascii=False, sort_keys=True, default=str) + "\n")
+            output_file.flush()
+            os.fsync(output_file.fileno())
+        os.replace(temporary_name, path)
+    except BaseException:
+        try:
+            os.unlink(temporary_name)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def build_consumption_records(
@@ -141,9 +163,7 @@ def export_consumption_records(
     destination = Path(output_dir)
     destination.mkdir(parents=True, exist_ok=True)
     output_path = destination / f"consumption_ledger_rollout_{rollout_id}_rank_{rank}.jsonl"
-    with output_path.open("w", encoding="utf-8") as output_file:
-        for row in rows:
-            output_file.write(json.dumps(row, ensure_ascii=False, sort_keys=True, default=str) + "\n")
+    _atomic_write_jsonl(output_path, rows)
     return output_path
 
 
@@ -294,6 +314,14 @@ def record_request_outcome(
     row["outcome_abs"] = time.time()
 
 
+def close_discarded_abort_outcomes(groups: list[list[Sample]]) -> None:
+    """Close attempts discarded by a non-partial rollout abort."""
+
+    for group in groups:
+        for sample in group:
+            record_request_outcome(sample, "aborted")
+
+
 def export_partition_outcomes(
     samples: list[Sample],
     *,
@@ -303,7 +331,7 @@ def export_partition_outcomes(
     outcome: str,
     error_type: str | None = None,
 ) -> Path | None:
-    """Append partition outcomes after the true async_put result is known."""
+    """Atomically extend partition outcomes after async_put is known."""
 
     rows = []
     outcome_abs = time.time()
@@ -346,9 +374,17 @@ def export_partition_outcomes(
     destination.mkdir(parents=True, exist_ok=True)
     rollout_component = physical_rollout_id if physical_rollout_id is not None else "unknown"
     output_path = destination / f"admission_outcomes_rollout_{rollout_component}.jsonl"
-    with output_path.open("a", encoding="utf-8") as output_file:
-        for row in rows:
-            output_file.write(json.dumps(row, ensure_ascii=False, sort_keys=True, default=str) + "\n")
+    lock_path = destination / f".{output_path.name}.lock"
+    with lock_path.open("a", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            existing_rows = []
+            if output_path.exists():
+                with output_path.open(encoding="utf-8") as source:
+                    existing_rows = [json.loads(line) for line in source if line.strip()]
+            _atomic_write_jsonl(output_path, [*existing_rows, *rows])
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
     return output_path
 
 
@@ -391,9 +427,7 @@ def export_request_traces(
     destination = Path(output_dir)
     destination.mkdir(parents=True, exist_ok=True)
     output_path = destination / f"request_lifecycle_rollout_{physical_rollout_id}.jsonl"
-    with output_path.open("w", encoding="utf-8") as output_file:
-        for row in rows:
-            output_file.write(json.dumps(row, ensure_ascii=False, sort_keys=True, default=str) + "\n")
+    _atomic_write_jsonl(output_path, rows)
     return output_path
 
 
@@ -409,7 +443,5 @@ def export_admission_ledger(
     destination = Path(output_dir)
     destination.mkdir(parents=True, exist_ok=True)
     output_path = destination / f"admission_ledger_rollout_{physical_rollout_id}.jsonl"
-    with output_path.open("w", encoding="utf-8") as output_file:
-        for row in [*decision_rows, *request_rows]:
-            output_file.write(json.dumps(row, ensure_ascii=False, sort_keys=True, default=str) + "\n")
+    _atomic_write_jsonl(output_path, [*decision_rows, *request_rows])
     return output_path

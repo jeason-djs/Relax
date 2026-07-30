@@ -107,6 +107,12 @@ def _read_jsonl(path: Path, validation: Validation) -> list[dict[str, Any]]:
     return rows
 
 
+def _complete_driver_text(text: str) -> str:
+    if text and not text.endswith(("\n", "\r")):
+        text = text.rsplit("\n", 1)[0] + ("\n" if "\n" in text else "")
+    return text
+
+
 def _load_glob(directory: Path, pattern: str, validation: Validation) -> tuple[list[Path], list[dict[str, Any]]]:
     paths = sorted(directory.glob(pattern))
     rows = [row for path in paths for row in _read_jsonl(path, validation)]
@@ -344,7 +350,7 @@ def validate_run(
 
     if not driver_log.is_file() or not observability_dir.is_dir():
         return validation.result(counts={})
-    driver_text = driver_log.read_text(encoding="utf-8", errors="replace")
+    driver_text = _complete_driver_text(driver_log.read_text(encoding="utf-8", errors="replace"))
 
     try:
         request_analysis = analyze_requests(
@@ -532,8 +538,29 @@ def validate_run(
                 mode_semantics_valid = False
                 validation.failures["admission_mode_semantics"].append(row.get("decision_id"))
         debt = row.get("release_remaining")
-        inflight = row.get("inflight_groups")
         available = row.get("available_groups")
+        if bypass == "final_backfill":
+            logical_debt = row.get("logical_debt_groups")
+            validation.check(
+                "final_backfill_actual_within_debt",
+                isinstance(actual, int)
+                and not isinstance(actual, bool)
+                and isinstance(debt, int)
+                and not isinstance(debt, bool)
+                and isinstance(logical_debt, int)
+                and not isinstance(logical_debt, bool)
+                and isinstance(available, int)
+                and not isinstance(available, bool)
+                and 0 <= actual <= min(debt, logical_debt, available),
+                {
+                    "decision_id": row.get("decision_id"),
+                    "actual_admit_groups": actual,
+                    "release_remaining": debt,
+                    "logical_debt_groups": logical_debt,
+                    "available_groups": available,
+                },
+            )
+        inflight = row.get("inflight_groups")
         valid_inputs = all(
             isinstance(value, int) and not isinstance(value, bool) and value >= 0
             for value in (debt, inflight, available)
@@ -834,10 +861,58 @@ def validate_run(
         for phase in SYNC_EVENT_PHASES
     }
     gate_sync_ids = sync_ids_by_phase["gate"]
+    bootstrap_sync_ids = (
+        set.intersection(*(sync_ids_by_phase[phase] for phase in ("pause", "flush", "transfer", "continue")))
+        - gate_sync_ids
+    )
+    expected_non_gate_sync_ids = gate_sync_ids | bootstrap_sync_ids
     validation.check(
-        "keyed_sync_id_sets_match",
-        all(sync_ids_by_phase[phase] == gate_sync_ids for phase in SYNC_EVENT_PHASES),
+        "unique_bootstrap_sync_cycle",
+        len(bootstrap_sync_ids) == 1
+        and all(
+            sync_ids_by_phase[phase] == expected_non_gate_sync_ids
+            for phase in ("pause", "flush", "transfer", "continue")
+        ),
         {phase: sorted(ids) for phase, ids in sync_ids_by_phase.items()},
+    )
+    bootstrap_rows_for_order = [
+        row
+        for row in event_rows
+        if row.get("sync_id") in bootstrap_sync_ids
+        and row.get("phase") in {"pause", "flush", "transfer", "continue"}
+    ]
+    runtime_rows_for_order = [
+        row
+        for row in event_rows
+        if row.get("sync_id") in gate_sync_ids and row.get("phase") in SYNC_EVENT_PHASES
+    ]
+    bootstrap_ends = [_finite_field(row, "t_end") for row in bootstrap_rows_for_order]
+    runtime_begins = [_finite_field(row, "t_begin") for row in runtime_rows_for_order]
+    validation.check(
+        "bootstrap_sync_precedes_runtime",
+        len(bootstrap_sync_ids) == 1
+        and bool(bootstrap_ends)
+        and bool(runtime_begins)
+        and all(value is not None for value in bootstrap_ends + runtime_begins)
+        and max(value for value in bootstrap_ends if value is not None)
+        <= min(value for value in runtime_begins if value is not None) + 1e-3,
+        {
+            "bootstrap_sync_ids": sorted(bootstrap_sync_ids),
+            "bootstrap_ends": bootstrap_ends,
+            "runtime_begins": runtime_begins,
+        },
+    )
+    validation.check(
+        "runtime_keyed_sync_id_sets_match",
+        all(
+            sync_ids_by_phase[phase] - bootstrap_sync_ids == gate_sync_ids
+            for phase in SYNC_EVENT_PHASES
+        )
+        and gate_sync_ids.isdisjoint(bootstrap_sync_ids),
+        {
+            "runtime": sorted(gate_sync_ids),
+            "bootstrap": sorted(bootstrap_sync_ids),
+        },
     )
     validation.check(
         "gate_cycle_count_exact",
@@ -861,6 +936,31 @@ def validate_run(
             ]
             validation.check(
                 "keyed_sync_phase_order_valid",
+                all(
+                    begin is not None
+                    and end is not None
+                    and (index == 0 or intervals[index - 1][1] <= begin + 1e-3)
+                    for index, (begin, end) in enumerate(intervals)
+                ),
+                {"sync_id": sync_id, "intervals": intervals},
+            )
+    for sync_id in sorted(bootstrap_sync_ids):
+        bootstrap_rows = [
+            event_by_phase_key[(phase, str(sync_id))][0]
+            for phase in ("pause", "flush", "transfer", "continue")
+            if len(event_by_phase_key[(phase, str(sync_id))]) == 1
+        ]
+        validation.check(
+            "bootstrap_sync_cycle_complete",
+            len(bootstrap_rows) == 4,
+            {"sync_id": sync_id},
+        )
+        if len(bootstrap_rows) == 4:
+            intervals = [
+                (_finite_field(row, "t_begin"), _finite_field(row, "t_end")) for row in bootstrap_rows
+            ]
+            validation.check(
+                "bootstrap_sync_phase_order_valid",
                 all(
                     begin is not None
                     and end is not None

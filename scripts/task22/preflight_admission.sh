@@ -21,6 +21,7 @@ echo "TASK22_PREFLIGHT mode=$MODE repo=$REPO"
 "$PYTHON_BIN" -m py_compile \
     scripts/task22/analyze_rollout_observability.py \
     scripts/task22/compare_admission_pair.py \
+    scripts/task22/monitor_admission_run.py \
     scripts/task22/simulate_request_placement.py \
     scripts/task22/validate_admission_run.py \
     relax/engine/router/placement.py \
@@ -41,8 +42,10 @@ bash -n \
     tests/engine/rollout/test_request_placement_simulator.py \
     tests/engine/rollout/test_rollout_observability_analyzer.py \
     tests/engine/rollout/test_admission_matched_runner.py \
+    tests/engine/rollout/test_admission_online_monitor.py \
     tests/engine/rollout/test_admission_run_validator.py \
-    tests/engine/rollout/test_admission_pair_comparator.py
+    tests/engine/rollout/test_admission_pair_comparator.py \
+    tests/utils/test_timeline_trace.py
 
 for source_file in \
     relax/backends/megatron/actor.py \

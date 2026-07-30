@@ -1,8 +1,10 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import json
+import multiprocessing
 import sys
 from argparse import Namespace
+from concurrent.futures import ThreadPoolExecutor
 from types import ModuleType, SimpleNamespace
 
 
@@ -26,6 +28,7 @@ from relax.engine.rollout.request_observability import (
     attempt_token_from_id,
     begin_request_trace,
     build_consumption_records,
+    close_discarded_abort_outcomes,
     export_partition_outcomes,
     export_request_traces,
     finish_request_trace,
@@ -41,6 +44,38 @@ def _sample(*, response_length: int = 0):
         index=23,
         abort_count=1,
     )
+
+
+def _export_partition_outcome(output_dir: str, writer_id: int) -> None:
+    sample = SimpleNamespace(
+        metadata={
+            "_last_request_attempt_id": f"attempt:{writer_id}",
+            "_last_request_attempt_token": writer_id,
+            "_request_attempt_sequence": writer_id,
+        },
+        group_index=writer_id,
+        index=writer_id,
+        abort_count=0,
+    )
+    export_partition_outcomes(
+        [sample],
+        output_dir=output_dir,
+        physical_rollout_id=0,
+        target_partition="train_0",
+        outcome="committed",
+    )
+
+
+def test_non_partial_abort_closes_each_discarded_attempt_outcome() -> None:
+    aborted = Sample(status=Sample.Status.ABORTED)
+    completed = Sample(status=Sample.Status.COMPLETED)
+    for sample in (aborted, completed):
+        sample.metadata["_active_request_trace"] = {"attempt_id": str(id(sample)), "outcome": None}
+
+    close_discarded_abort_outcomes([[aborted, completed]])
+
+    assert aborted.metadata["_active_request_trace"]["outcome"] == "aborted"
+    assert completed.metadata["_active_request_trace"]["outcome"] == "aborted"
 
 
 def test_request_observability_is_disabled_without_output_directory() -> None:
@@ -143,6 +178,76 @@ def test_export_request_traces_writes_one_json_object_per_line(tmp_path) -> None
 
     loaded = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines()]
     assert loaded == rows
+    assert not list(tmp_path.glob(".*.tmp"))
+
+
+def test_partition_outcome_extension_republishes_complete_jsonl(tmp_path) -> None:
+    sample = _sample()
+    row, _ = begin_request_trace(
+        sample=sample,
+        payload={"input_ids": [1], "sampling_params": {"max_new_tokens": 1}},
+        physical_rollout_id=0,
+        admission_context={"decision_id": "admission:0:1", "decision_sequence": 1},
+    )
+    sample.metadata["_admission_decision_id"] = "admission:0:1"
+    sample.metadata["_admission_decision_sequence"] = 1
+    sample.metadata["_admission_decision_physical_rollout_id"] = 0
+
+    path = export_partition_outcomes(
+        [sample],
+        output_dir=str(tmp_path),
+        physical_rollout_id=0,
+        target_partition="train_0",
+        outcome="committed",
+    )
+    export_partition_outcomes(
+        [sample],
+        output_dir=str(tmp_path),
+        physical_rollout_id=0,
+        target_partition="train_0",
+        outcome="committed",
+    )
+
+    loaded = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    assert len(loaded) == 2
+    assert all(item["attempt_id"] == row["attempt_id"] for item in loaded)
+    assert not list(tmp_path.glob(".*.tmp"))
+
+
+def test_partition_outcome_concurrent_threads_do_not_lose_appends(tmp_path) -> None:
+    writer_ids = list(range(40))
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        list(
+            executor.map(
+                lambda writer_id: _export_partition_outcome(str(tmp_path), writer_id),
+                writer_ids,
+            )
+        )
+
+    output_path = tmp_path / "admission_outcomes_rollout_0.jsonl"
+    loaded = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines()]
+    assert {row["attempt_id"] for row in loaded} == {f"attempt:{writer_id}" for writer_id in writer_ids}
+    assert len(loaded) == len(writer_ids)
+
+
+def test_partition_outcome_concurrent_processes_do_not_lose_appends(tmp_path) -> None:
+    writer_ids = list(range(12))
+    context = multiprocessing.get_context("spawn")
+    processes = [
+        context.Process(target=_export_partition_outcome, args=(str(tmp_path), writer_id)) for writer_id in writer_ids
+    ]
+
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=30)
+        assert process.exitcode == 0
+
+    output_path = tmp_path / "admission_outcomes_rollout_0.jsonl"
+    loaded = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines()]
+    assert {row["attempt_id"] for row in loaded} == {f"attempt:{writer_id}" for writer_id in writer_ids}
+    assert len(loaded) == len(writer_ids)
 
 
 def test_abort_response_increments_sample_abort_count_once() -> None:

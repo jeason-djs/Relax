@@ -4,6 +4,7 @@
 
 import json
 import os
+import tempfile
 from typing import Any, Dict, List
 
 from relax.utils.timer import TimelineEvent
@@ -27,8 +28,8 @@ class TimelineTraceAdapter:
         self.dump_dir = dump_dir
         self.enabled = bool(dump_dir and dump_dir.strip())
         self._all_events: List[Dict[str, Any]] = []
-        self._dump_cnt = 0
         self._max_dump = max_dump
+        self._dumped_steps: set[int] = set()
 
         if self.enabled:
             # Ensure the directory exists
@@ -62,7 +63,7 @@ class TimelineTraceAdapter:
 
         self._all_events.extend(event_dicts)
 
-    def dump(self, step: int):
+    def dump(self, step: int) -> bool:
         """Dump all collected events to a JSON file.
 
         The file is written to {dump_dir}/timeline_step_{step}.json
@@ -71,13 +72,15 @@ class TimelineTraceAdapter:
             step: The current step number.
         """
         if not self.enabled:
-            return
+            return False
 
         if not self._all_events:
-            return
+            return False
 
-        if self._dump_cnt >= self._max_dump:
-            return
+        # The quota is per unique step. Re-reporting a step may refresh its
+        # file, but must not consume another slot and starve later steps.
+        if step not in self._dumped_steps and len(self._dumped_steps) >= self._max_dump:
+            return False
 
         # Sort events by timestamp
         sorted_events = sorted(self._all_events, key=lambda e: e.get("ts", 0))
@@ -85,17 +88,34 @@ class TimelineTraceAdapter:
         filename = f"timeline_step_{step}.json"
         filepath = os.path.join(self.dump_dir, filename)
 
-        with open(filepath, "w") as f:
-            json.dump(sorted_events, f)
+        fd, temporary_path = tempfile.mkstemp(
+            prefix=f".{filename}.",
+            suffix=".tmp",
+            dir=self.dump_dir,
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as output:
+                json.dump(sorted_events, output)
+                output.write("\n")
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temporary_path, filepath)
+        except BaseException:
+            try:
+                os.unlink(temporary_path)
+            except FileNotFoundError:
+                pass
+            raise
 
-        self._dump_cnt += 1
+        self._dumped_steps.add(step)
 
         # DO NOT CLEAR
         # self._all_events.clear()
+        return True
 
-    def dump_all(self, step: int):
+    def dump_all(self, step: int) -> bool:
         """Alias for dump() for backward compatibility."""
-        self.dump(step)
+        return self.dump(step)
 
     def clear(self):
         """Clear all stored events without dumping."""

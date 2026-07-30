@@ -6,6 +6,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 REPO="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
 WRAPPER="$REPO/scripts/training/text/run-qwen3-4B-4xgpu-hybrid-async-task22.sh"
 VALIDATOR="$REPO/scripts/task22/validate_admission_run.py"
+MONITOR="$REPO/scripts/task22/monitor_admission_run.py"
 COMPARATOR="$REPO/scripts/task22/compare_admission_pair.py"
 PREFLIGHT="$REPO/scripts/task22/preflight_admission.sh"
 PYTHON_BIN="${TASK22_PYTHON:-python3}"
@@ -187,7 +188,19 @@ else
 fi
 
 sampler_pid=""
+training_pid=""
+monitor_pid=""
 cleanup() {
+    if [[ -n "$monitor_pid" ]]; then
+        kill "$monitor_pid" >/dev/null 2>&1 || true
+        wait "$monitor_pid" >/dev/null 2>&1 || true
+        monitor_pid=""
+    fi
+    if [[ -n "$training_pid" ]]; then
+        kill -TERM -- "-$training_pid" >/dev/null 2>&1 || true
+        wait "$training_pid" >/dev/null 2>&1 || true
+        training_pid=""
+    fi
     if [[ -n "$sampler_pid" ]]; then
         kill "$sampler_pid" >/dev/null 2>&1 || true
         wait "$sampler_pid" >/dev/null 2>&1 || true
@@ -228,10 +241,16 @@ def package_version(name):
 
 
 fingerprinted_files = (
+    "relax/engine/rollout/admission.py",
+    "relax/engine/rollout/request_observability.py",
+    "relax/engine/rollout/sglang_rollout.py",
     "relax/engine/router/placement.py",
     "relax/engine/router/router.py",
+    "relax/utils/metrics/service.py",
+    "relax/utils/metrics/timeline_trace.py",
     "scripts/task22/analyze_rollout_observability.py",
     "scripts/task22/compare_admission_pair.py",
+    "scripts/task22/monitor_admission_run.py",
     "scripts/task22/preflight_admission.sh",
     "scripts/task22/prepare_rollout_observability.sh",
     "scripts/task22/run_admission_matched_ab.sh",
@@ -349,8 +368,34 @@ run_one() {
     REQUEST_OBSERVABILITY_DIR="$run_dir/observability" \
     TIMELINE_DUMP_DIR="$run_dir/timeline" \
     DRIVER_LOG_PATH="$run_dir/driver.log" \
-    timeout --signal=TERM --kill-after=180 "$RUN_TIMEOUT_S" bash "$WRAPPER"
+    "$PYTHON_BIN" -c \
+        'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
+        timeout --signal=TERM --kill-after=180 "$RUN_TIMEOUT_S" bash "$WRAPPER" &
+    training_pid=$!
+    "$PYTHON_BIN" "$MONITOR" \
+        --run-dir "$run_dir" \
+        --pid "$training_pid" \
+        --process-group-id "$training_pid" \
+        --expected-mode "$mode" \
+        --expected-rollouts "$NUM_ROLLOUT" \
+        --expected-samples-per-partition "$EXPECTED_SAMPLES_PER_PARTITION" \
+        --expected-engines "$EXPECTED_ENGINES" \
+        --max-staleness "$MAX_STALENESS" \
+        --admission-min "$PARTITION_ADMISSION_MIN" \
+        --admission-max "$PARTITION_ADMISSION_MAX" \
+        --admission-slack "$PARTITION_ADMISSION_SLACK" \
+        --headline-lo "$HEADLINE_LO" \
+        --headline-hi "$HEADLINE_HI" \
+        --poll-interval "${TASK22_MONITOR_POLL_INTERVAL:-1}" \
+        --evidence-grace "${TASK22_MONITOR_EVIDENCE_GRACE:-5}" \
+        > "$run_dir/logs/online_monitor.log" 2>&1 &
+    monitor_pid=$!
+    wait "$training_pid"
     local run_rc=$?
+    training_pid=""
+    wait "$monitor_pid"
+    local monitor_rc=$?
+    monitor_pid=""
     set -e
 
     kill "$sampler_pid" >/dev/null 2>&1 || true
@@ -358,11 +403,12 @@ run_one() {
     sampler_pid=""
     ray stop --force >/dev/null 2>&1 || true
     printf '%s\n' "$run_rc" > "$run_dir/EXIT_CODE"
+    printf '%s\n' "$monitor_rc" > "$run_dir/ONLINE_MONITOR_EXIT_CODE"
     date '+%Y-%m-%dT%H:%M:%S%z' > "$run_dir/FINISHED_AT"
-    if [[ "$run_rc" -eq 0 ]]; then
+    if [[ "$run_rc" -eq 0 && "$monitor_rc" -eq 0 ]]; then
         printf '%s\n' SUCCEEDED > "$run_dir/STATUS"
     else
-        printf 'FAILED(%s)\n' "$run_rc" > "$run_dir/STATUS"
+        printf 'FAILED(training=%s,monitor=%s)\n' "$run_rc" "$monitor_rc" > "$run_dir/STATUS"
     fi
 
     set +e
@@ -380,7 +426,7 @@ run_one() {
     local validator_rc=$?
     set -e
     printf '%s\n' "$validator_rc" > "$run_dir/VALIDATOR_EXIT_CODE"
-    if [[ "$run_rc" -ne 0 || "$validator_rc" -ne 0 ]]; then
+    if [[ "$run_rc" -ne 0 || "$monitor_rc" -ne 0 || "$validator_rc" -ne 0 ]]; then
         return 4
     fi
 }

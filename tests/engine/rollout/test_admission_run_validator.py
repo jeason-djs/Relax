@@ -143,6 +143,12 @@ def _driver_lines() -> list[str]:
         _server_event(100, {"event": "request.finished", "rid": RID}),
         _server_event(100, scheduler),
     ]
+    for index, phase in enumerate(("pause", "flush", "transfer", "continue"), 1):
+        begin = index / 10
+        lines.append(
+            f"TASK22_EVENT phase={phase} sync_id=bootstrap "
+            f"t_begin={begin:.6f} t_end={begin + 0.1:.6f} dur=0.100000"
+        )
     for index, phase in enumerate(("gate", "pause", "flush", "transfer", "continue"), 1):
         lines.append(
             f"TASK22_EVENT phase={phase} sync_id=1 "
@@ -247,6 +253,8 @@ def test_admission_run_validator_accepts_complete_evidence(tmp_path) -> None:
     assert result["verdict"] == "PASS", result["failures"]
     assert all(result["checks"].values())
     assert result["counts"]["consumption_rows"] == 1
+    assert result["checks"]["unique_bootstrap_sync_cycle"]
+    assert result["checks"]["runtime_keyed_sync_id_sets_match"]
 
 
 def test_admission_run_validator_rejects_missing_admission_ledger(tmp_path) -> None:
@@ -258,6 +266,45 @@ def test_admission_run_validator_rejects_missing_admission_ledger(tmp_path) -> N
     assert result["verdict"] == "FAIL"
     assert not result["checks"]["expected_admission_ledgers_exact"]
     assert not result["checks"]["attempt_decision_exists"]
+
+
+def test_admission_run_validator_rejects_ledger_only_attempt(tmp_path) -> None:
+    run_dir = _build_valid_run(tmp_path)
+    (run_dir / "observability" / "request_lifecycle_rollout_0.jsonl").unlink()
+
+    result = _validate(run_dir)
+
+    assert result["verdict"] == "FAIL"
+    assert not result["checks"]["ledger_attempts_match_request_rows"]
+
+
+def test_admission_run_validator_rejects_empty_physical_flow(tmp_path) -> None:
+    run_dir = _build_valid_run(tmp_path)
+    driver_log = run_dir / "driver.log"
+    lines = [
+        line
+        for line in driver_log.read_text(encoding="utf-8").splitlines()
+        if "TASK22_FLOW phase=physical_" not in line
+    ]
+    driver_log.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    result = _validate(run_dir)
+
+    assert result["verdict"] == "FAIL"
+    assert not result["checks"]["physical_flow_complete"]
+
+
+def test_admission_run_validator_ignores_trailing_incomplete_driver_line(tmp_path) -> None:
+    run_dir = _build_valid_run(tmp_path)
+    driver_log = run_dir / "driver.log"
+    driver_log.write_text(
+        driver_log.read_text(encoding="utf-8")
+        + "TASK22_FLOW phase=physical_start physical_rollout_id=0 t=999"
+    )
+
+    result = _validate(run_dir)
+
+    assert result["verdict"] == "PASS", result["failures"]
 
 
 def test_admission_run_validator_rejects_duplicate_consume(tmp_path) -> None:
@@ -331,7 +378,8 @@ def test_admission_run_validator_rejects_orphan_timeline_keys(tmp_path) -> None:
     result = _validate(run_dir)
 
     assert result["verdict"] == "FAIL"
-    assert not result["checks"]["keyed_sync_id_sets_match"]
+    assert not result["checks"]["unique_bootstrap_sync_cycle"]
+    assert not result["checks"]["runtime_keyed_sync_id_sets_match"]
     assert not result["checks"]["gate_flow_sync_ids_closed"]
     assert not result["checks"]["partition_close_partitions_exact"]
 
@@ -357,9 +405,35 @@ def test_admission_run_validator_rejects_extra_complete_sync_cycle(tmp_path) -> 
     result = _validate(run_dir)
 
     assert result["verdict"] == "FAIL"
-    assert result["checks"]["keyed_sync_id_sets_match"]
+    assert result["checks"]["unique_bootstrap_sync_cycle"]
+    assert result["checks"]["runtime_keyed_sync_id_sets_match"]
     assert result["checks"]["gate_flow_sync_ids_closed"]
     assert not result["checks"]["gate_cycle_count_exact"]
+
+
+def test_admission_run_validator_requires_bootstrap_before_runtime(tmp_path) -> None:
+    run_dir = _build_valid_run(tmp_path)
+    driver_log = run_dir / "driver.log"
+    lines = driver_log.read_text(encoding="utf-8").splitlines()
+    rewritten = []
+    bootstrap_index = 0
+    for line in lines:
+        if "TASK22_EVENT" in line and "sync_id=bootstrap" in line:
+            begin = 20.0 + bootstrap_index
+            phase = ("pause", "flush", "transfer", "continue")[bootstrap_index]
+            line = (
+                f"TASK22_EVENT phase={phase} sync_id=bootstrap "
+                f"t_begin={begin:.6f} t_end={begin + 0.5:.6f} dur=0.500000"
+            )
+            bootstrap_index += 1
+        rewritten.append(line)
+    driver_log.write_text("\n".join(rewritten) + "\n", encoding="utf-8")
+
+    result = _validate(run_dir)
+
+    assert result["verdict"] == "FAIL"
+    assert result["checks"]["unique_bootstrap_sync_cycle"]
+    assert not result["checks"]["bootstrap_sync_precedes_runtime"]
 
 
 def test_admission_run_validator_rejects_excessive_staleness(tmp_path) -> None:
@@ -429,6 +503,21 @@ def test_admission_run_validator_recomputes_bounded_admission(tmp_path) -> None:
     assert not result["checks"]["admission_bounded_recomputes"]
 
 
+def test_admission_run_validator_rejects_final_backfill_past_debt(tmp_path) -> None:
+    run_dir = _build_valid_run(tmp_path)
+    ledger_path = run_dir / "observability" / "admission_ledger_rollout_0.jsonl"
+    decision = _decision_row()
+    decision["bypass_reason"] = "final_backfill"
+    decision["logical_debt_groups"] = 2
+    decision["actual_admit_groups"] = 3
+    _jsonl(ledger_path, [decision, _request_row()])
+
+    result = _validate(run_dir)
+
+    assert result["verdict"] == "FAIL"
+    assert not result["checks"]["final_backfill_actual_within_debt"]
+
+
 def test_admission_run_validator_strictly_parses_timeline_and_gpu_snapshots(tmp_path) -> None:
     run_dir = _build_valid_run(tmp_path)
     (run_dir / "timeline" / "timeline_step_0.json").write_text(
@@ -445,3 +534,20 @@ def test_admission_run_validator_strictly_parses_timeline_and_gpu_snapshots(tmp_
     assert result["verdict"] == "FAIL"
     assert not result["checks"]["headline_timeline_files_complete"]
     assert not result["checks"]["gpu_snapshots_parse_strictly"]
+
+
+def test_admission_run_validator_accepts_noncontiguous_unique_gpu_indices(tmp_path) -> None:
+    run_dir = _build_valid_run(tmp_path)
+    (run_dir / "logs" / "nvidia_smi_1s.csv").write_text(
+        "2026-07-30T10:00:00+0800\n"
+        "4, 1024 MiB, 75 %, 10 %, 200 W\n"
+        "9, 1010 MiB, 70 %, 9 %, 195 W\n"
+        "2026-07-30T10:00:01+0800\n"
+        "4, 1030 MiB, 80 %, 12 %, 205 W\n"
+        "9, 1020 MiB, 78 %, 11 %, 202 W\n",
+        encoding="utf-8",
+    )
+
+    result = _validate(run_dir)
+
+    assert result["verdict"] == "PASS", result["failures"]

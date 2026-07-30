@@ -204,6 +204,11 @@ class DebtAwareAdmissionController:
         actual_admit = bounded_admit if self.config.mode is AdmissionMode.ON else eager_admit_groups
         if bypass_reason is not None:
             actual_admit = eager_admit_groups
+        if self.final_backfill:
+            # Final backfill has no current partition that could own surplus
+            # work. Preserve eager scheduling, but never submit beyond the
+            # remaining previous-partition debt.
+            actual_admit = min(actual_admit, debt_remaining, available_groups)
 
         return AdmissionDecision(
             decision_id="unrecorded",

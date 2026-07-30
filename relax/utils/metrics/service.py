@@ -301,9 +301,12 @@ class MetricsService:
             if self._timeline_adapter and self._timeline_adapter.get_event_count() > 0:
                 try:
                     event_count = self._timeline_adapter.get_event_count()
-                    self._timeline_adapter.dump(step)
-                    report_results["timeline"] = f"dumped {event_count} events"
-                    logger.info(f"Dumped {event_count} timeline events for step {step}")
+                    if self._timeline_adapter.dump(step):
+                        report_results["timeline"] = f"dumped {event_count} events"
+                        logger.info(f"Dumped {event_count} timeline events for step {step}")
+                    else:
+                        report_results["timeline"] = "not_dumped"
+                        logger.warning(f"Timeline events were not dumped for step {step}")
                 except Exception as e:
                     report_results["timeline"] = f"error: {e}"
                     logger.exception(f"Failed to dump timeline: {e}")

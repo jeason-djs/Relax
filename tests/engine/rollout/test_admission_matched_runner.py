@@ -8,14 +8,25 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 RUNNER = REPO_ROOT / "scripts" / "task22" / "run_admission_matched_ab.sh"
+PRODUCTION_FINGERPRINTED_FILES = (
+    "relax/engine/rollout/admission.py",
+    "relax/engine/rollout/request_observability.py",
+    "relax/engine/rollout/sglang_rollout.py",
+    "relax/utils/metrics/service.py",
+    "relax/utils/metrics/timeline_trace.py",
+)
 FINGERPRINTED_FILES = (
+    *PRODUCTION_FINGERPRINTED_FILES,
     "relax/engine/router/placement.py",
     "relax/engine/router/router.py",
     "scripts/task22/analyze_rollout_observability.py",
     "scripts/task22/compare_admission_pair.py",
+    "scripts/task22/monitor_admission_run.py",
     "scripts/task22/preflight_admission.sh",
     "scripts/task22/prepare_rollout_observability.sh",
     "scripts/task22/run_admission_matched_ab.sh",
@@ -50,13 +61,40 @@ def _build_fake_repo(tmp_path: Path) -> tuple[Path, Path, dict[str, str]]:
             _write(path, "# runner contract fixture\n")
 
     _write(
+        repo / "scripts/task22/monitor_admission_run.py",
+        "#!/usr/bin/env python3\nraise SystemExit(0)\n",
+        executable=True,
+    )
+    _write(
         repo / "scripts/task22/preflight_admission.sh",
         "#!/usr/bin/env bash\nset -euo pipefail\nprintf '%s\\n' TASK22_PREFLIGHT=PASS\n",
         executable=True,
     )
     _write(
         repo / "scripts/training/text/run-qwen3-4B-4xgpu-hybrid-async-task22.sh",
-        "#!/usr/bin/env bash\nset -euo pipefail\nprintf '%s\\n' TASK22_WRAPPER=PASS\n",
+        """#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' '{"outcome":"committed","attempt_id":"fixture"}' \
+  > "$REQUEST_OBSERVABILITY_DIR/request_lifecycle_rollout_0.jsonl"
+printf '%s\n' '{"record_type":"attempt","outcome":"committed","attempt_id":"fixture"}' \
+  > "$REQUEST_OBSERVABILITY_DIR/admission_ledger_rollout_0.jsonl"
+for phase in pause flush transfer continue; do
+  printf 'TASK22_EVENT phase=%s sync_id=bootstrap t_begin=0 t_end=1 dur=1\n' "$phase" \
+    >> "$DRIVER_LOG_PATH"
+done
+for sync_id in $(seq 1 15); do
+  for phase in gate pause flush transfer continue; do
+    printf 'TASK22_EVENT phase=%s sync_id=%s t_begin=0 t_end=1 dur=1\n' "$phase" "$sync_id" \
+      >> "$DRIVER_LOG_PATH"
+  done
+done
+for step in $(seq 5 14); do
+  printf '[{"name":"train","ph":"X","ts":1,"dur":1,"pid":1,"tid":1}]\n' \
+    > "$TIMELINE_DUMP_DIR/timeline_step_${step}.json"
+  printf 'perf %s: {"perf/step_time": 1.0}\n' "$step" >> "$DRIVER_LOG_PATH"
+done
+printf '%s\n' TASK22_WRAPPER=PASS
+""",
         executable=True,
     )
     validator = """#!/usr/bin/env python3
@@ -110,6 +148,17 @@ while [[ "${1:-}" == --* ]]; do
 done
 shift
 exec "$@"
+""",
+        executable=True,
+    )
+    _write(
+        fake_bin / "setsid",
+        """#!/usr/bin/env python3
+import os
+import sys
+
+os.setsid()
+os.execvp(sys.argv[1], sys.argv[1:])
 """,
         executable=True,
     )
@@ -173,6 +222,7 @@ for raw_path in sys.argv[1:]:
         "RUN_ROOT": str(run_root),
         "TASK22_RUN_STAMP": "fixture",
         "RUN_TIMEOUT_S": "5400",
+        "TASK22_MONITOR_POLL_INTERVAL": "0.01",
     }
     return repo, run_root, env
 
@@ -300,6 +350,60 @@ def test_runner_resume_rejects_tampered_shadow_artifacts(tmp_path) -> None:
     assert not (pair_dir / "on").exists()
 
 
+@pytest.mark.parametrize("relative_path", PRODUCTION_FINGERPRINTED_FILES)
+def test_runner_resume_rejects_production_source_drift_without_head_change(
+    tmp_path, relative_path
+) -> None:
+    repo, run_root, env = _build_fake_repo(tmp_path)
+    runner = repo / "scripts/task22/run_admission_matched_ab.sh"
+    subprocess.run(
+        ["bash", str(runner), "--run", "--stop-after-shadow"],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    pair_dir = next(run_root.glob("admission_matched_*_fixture"))
+    frozen_contract = json.loads(
+        (pair_dir / "shadow" / "run_contract.json").read_text(encoding="utf-8")
+    )
+    assert relative_path in frozen_contract["source_sha256"]
+    frozen_head = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    source_path = repo / relative_path
+    source_path.write_text(
+        source_path.read_text(encoding="utf-8") + "# drift after Shadow freeze\n",
+        encoding="utf-8",
+    )
+    assert (
+        subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        == frozen_head
+    )
+
+    resume_env = {**env, "TASK22_AUTHORIZE_ON_RUN": "1"}
+    denied = subprocess.run(
+        ["bash", str(runner), "--run", "--resume-on", str(pair_dir)],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=resume_env,
+    )
+
+    assert denied.returncode == 4
+    assert "requires a clean git worktree" in denied.stderr
+    assert not (pair_dir / "on").exists()
+
+
 def test_runner_default_run_still_executes_complete_pair(tmp_path) -> None:
     repo, run_root, env = _build_fake_repo(tmp_path)
     runner = repo / "scripts/task22/run_admission_matched_ab.sh"
@@ -318,3 +422,135 @@ def test_runner_default_run_still_executes_complete_pair(tmp_path) -> None:
     assert (pair_dir / "shadow" / "validation.json").is_file()
     assert (pair_dir / "on" / "validation.json").is_file()
     assert (pair_dir / "PAIR_VALID").read_text(encoding="utf-8").strip() == "PASS"
+
+
+def test_runner_online_monitor_fails_closed_and_stops_training(tmp_path) -> None:
+    repo, run_root, env = _build_fake_repo(tmp_path)
+    runner = repo / "scripts/task22/run_admission_matched_ab.sh"
+    monitor = repo / "scripts/task22/monitor_admission_run.py"
+    wrapper = repo / "scripts/training/text/run-qwen3-4B-4xgpu-hybrid-async-task22.sh"
+    _write(
+        monitor,
+        """#!/usr/bin/env python3
+import argparse
+import json
+import os
+import signal
+import time
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--run-dir", required=True)
+parser.add_argument("--pid", required=True, type=int)
+parser.add_argument("--process-group-id", required=True, type=int)
+args, _ = parser.parse_known_args()
+event_log = os.path.join(args.run_dir, "online_monitor.jsonl")
+with open(event_log, "a", encoding="utf-8") as output:
+    output.write(json.dumps({"event": "monitor_failed", "reason": "fixture_failure"}) + "\\n")
+for _ in range(100):
+    try:
+        if os.getpgid(args.pid) == args.process_group_id:
+            break
+    except ProcessLookupError:
+        pass
+    time.sleep(0.01)
+else:
+    raise SystemExit("training process group was not ready")
+os.killpg(args.process_group_id, signal.SIGTERM)
+with open(event_log, "a", encoding="utf-8") as output:
+    output.write(json.dumps({"event": "training_stop_requested"}) + "\\n")
+raise SystemExit(4)
+""",
+        executable=True,
+    )
+    _write(
+        wrapper,
+        """#!/usr/bin/env bash
+set -euo pipefail
+sleep 10
+printf '%s\n' TRAINING_COMPLETED > "$REQUEST_OBSERVABILITY_DIR/training_completed"
+""",
+        executable=True,
+    )
+    subprocess.run(["git", "-C", str(repo), "add", str(monitor), str(wrapper)], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "-c",
+            "user.name=Task22 Test",
+            "-c",
+            "user.email=task22@example.invalid",
+            "commit",
+            "-qm",
+            "broken monitor fixture",
+        ],
+        check=True,
+    )
+
+    failed = subprocess.run(
+        ["bash", str(runner), "--run", "--stop-after-shadow"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=5,
+    )
+
+    assert failed.returncode == 5
+    pair_dir = next(run_root.glob("admission_matched_*_fixture"))
+    assert (pair_dir / "shadow" / "ONLINE_MONITOR_EXIT_CODE").read_text().strip() == "4"
+    assert (pair_dir / "shadow" / "EXIT_CODE").read_text().strip() != "0"
+    status = (pair_dir / "shadow" / "STATUS").read_text().strip()
+    assert status.startswith("FAILED(training=")
+    assert "monitor=4" in status
+    assert not (pair_dir / "shadow" / "observability" / "training_completed").exists()
+    monitor_rows = [
+        json.loads(line)
+        for line in (pair_dir / "shadow" / "online_monitor.jsonl").read_text().splitlines()
+    ]
+    assert any(row["event"] == "monitor_failed" for row in monitor_rows)
+    assert any(row["event"] == "training_stop_requested" for row in monitor_rows)
+
+
+def test_runner_status_reports_monitor_failure_when_training_exits_zero(tmp_path) -> None:
+    repo, run_root, env = _build_fake_repo(tmp_path)
+    runner = repo / "scripts/task22/run_admission_matched_ab.sh"
+    monitor = repo / "scripts/task22/monitor_admission_run.py"
+    _write(
+        monitor,
+        "#!/usr/bin/env python3\nraise SystemExit(4)\n",
+        executable=True,
+    )
+    subprocess.run(["git", "-C", str(repo), "add", str(monitor)], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "-c",
+            "user.name=Task22 Test",
+            "-c",
+            "user.email=task22@example.invalid",
+            "commit",
+            "-qm",
+            "monitor failure fixture",
+        ],
+        check=True,
+    )
+
+    failed = subprocess.run(
+        ["bash", str(runner), "--run", "--stop-after-shadow"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    assert failed.returncode == 5
+    pair_dir = next(run_root.glob("admission_matched_*_fixture"))
+    assert (pair_dir / "shadow" / "EXIT_CODE").read_text().strip() == "0"
+    assert (pair_dir / "shadow" / "ONLINE_MONITOR_EXIT_CODE").read_text().strip() == "4"
+    assert (
+        pair_dir / "shadow" / "STATUS"
+    ).read_text().strip() == "FAILED(training=0,monitor=4)"

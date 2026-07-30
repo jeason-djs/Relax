@@ -101,13 +101,21 @@ def test_admission_never_fetches_more_than_useful_available_groups() -> None:
     assert decision.actual_admit_groups == 3
 
 
-def test_admission_final_backfill_preserves_eager_count() -> None:
+def test_admission_final_backfill_caps_eager_count_at_remaining_debt() -> None:
     controller = DebtAwareAdmissionController(_enabled_config(), final_backfill=True)
 
     decision = _decide(controller, inflight=0, debt=6, available=6, eager=14)
 
-    assert decision.actual_admit_groups == 14
+    assert decision.actual_admit_groups == 6
     assert decision.bypass_reason == "final_backfill"
+
+
+def test_admission_final_backfill_never_submits_past_available_debt() -> None:
+    controller = DebtAwareAdmissionController(_enabled_config(), final_backfill=True)
+
+    decision = _decide(controller, inflight=1, debt=3, available=2, eager=14)
+
+    assert decision.actual_admit_groups == 2
 
 
 def test_admission_fail_open_preserves_eager_count_and_records_reason() -> None:

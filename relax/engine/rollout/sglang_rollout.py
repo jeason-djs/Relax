@@ -35,6 +35,7 @@ from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainO
 from relax.engine.rollout.request_observability import (
     admission_decision_record,
     begin_request_trace,
+    close_discarded_abort_outcomes,
     export_admission_ledger,
     export_request_traces,
     fail_request_trace,
@@ -736,6 +737,10 @@ async def abort(args: Namespace, rollout_id: int) -> tuple[list[list[Sample]], l
         done, state.pendings = await asyncio.wait(state.pendings, return_when=asyncio.FIRST_COMPLETED)
 
         if not args.partial_rollout:
+            # Non-partial mode intentionally discards work interrupted by the
+            # step boundary, but observability still requires every dispatched
+            # attempt to receive a terminal business outcome.
+            close_discarded_abort_outcomes([task.result() for task in done])
             continue
 
         # for partial rollout, collect the partial samples into the data buffer

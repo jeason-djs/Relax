@@ -6,7 +6,9 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import re
+import tempfile
 from bisect import bisect_right
 from collections import Counter, defaultdict
 from datetime import datetime
@@ -35,6 +37,14 @@ FORBIDDEN_FIELDS = {
     "output_ids",
 }
 SERVER_ENVELOPE_TOLERANCE_S = 1.0
+
+
+def _complete_driver_lines(path: Path) -> list[str]:
+    text = path.read_text(encoding="utf-8", errors="replace")
+    lines = text.splitlines()
+    if text and not text.endswith(("\n", "\r")):
+        lines.pop()
+    return lines
 
 
 def _load_client_rows(request_dir: Path) -> list[dict[str, Any]]:
@@ -209,7 +219,7 @@ def export_placement_trace(driver_log: Path, request_dir: Path, output_path: Pat
     received_engines: dict[str, set[str]] = defaultdict(set)
     scheduler_snapshots: dict[str, list[dict[str, Any]]] = defaultdict(list)
     engine_pids = set()
-    for raw_line in driver_log.read_text(encoding="utf-8", errors="replace").splitlines():
+    for raw_line in _complete_driver_lines(driver_log):
         clean = ANSI_RE.sub("", raw_line)
         pid_match = ENGINE_PID_RE.search(clean)
         if not pid_match:
@@ -274,9 +284,24 @@ def export_placement_trace(driver_log: Path, request_dir: Path, output_path: Pat
         if snapshot.get("snapshot_age_s") is not None
     ]
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("w", encoding="utf-8") as output_file:
-        for row in rows:
-            output_file.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{output_path.name}.",
+        suffix=".tmp",
+        dir=output_path.parent,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as output_file:
+            for row in rows:
+                output_file.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+            output_file.flush()
+            os.fsync(output_file.fileno())
+        os.replace(temporary_name, output_path)
+    except BaseException:
+        try:
+            os.unlink(temporary_name)
+        except FileNotFoundError:
+            pass
+        raise
     return {
         "rows": len(rows),
         "physical_rollouts": len({row["physical_rollout_id"] for row in rows}),
@@ -319,7 +344,7 @@ def analyze(
     running_context_tokens: dict[str, list[int]] = defaultdict(list)
     running_output_tokens: dict[str, list[int]] = defaultdict(list)
 
-    for line_no, raw_line in enumerate(driver_log.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+    for line_no, raw_line in enumerate(_complete_driver_lines(driver_log), 1):
         clean = ANSI_RE.sub("", raw_line)
         pid_match = ENGINE_PID_RE.search(clean)
         if not pid_match:
