@@ -174,6 +174,11 @@ class Sample:
     def effective_response_length(self):
         return sum(self.loss_mask) if self.loss_mask is not None else self.response_length
 
+    def mark_aborted(self) -> None:
+        """Record one aborted generation attempt."""
+        self.abort_count += 1
+        self.status = Sample.Status.ABORTED
+
     def update_from_meta_info(self, args, meta_info: dict):
         """Update the sample with new information from meta_info returned by
         the rollout engine.
@@ -194,7 +199,7 @@ class Sample:
             case "length":
                 self.status = Sample.Status.TRUNCATED
             case "abort":
-                self.status = Sample.Status.ABORTED
+                self.mark_aborted()
             case "stop":
                 self.status = Sample.Status.COMPLETED
 

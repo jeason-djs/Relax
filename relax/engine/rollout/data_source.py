@@ -220,6 +220,7 @@ class RolloutDataSource(DataSource):
             group = []
             for _ in range(self.args.n_samples_per_prompt):
                 sample = _shallow_copy_sample(prompt_sample)
+                sample.metadata["work_origin"] = "fresh"
                 sample.group_index = self.sample_group_index
                 sample.index = self.sample_index
                 self.sample_index += 1
@@ -336,6 +337,11 @@ class RolloutDataSourceWithBuffer(RolloutDataSource):
                 f"the length of the elements of samples must be equal to n_samples_per_prompt, got {len(samples[i])} != {self.args.n_samples_per_prompt}"
             )
             group = samples[i]  # type: ignore
+            group_origin = (
+                "old_debt" if any(sample.status == Sample.Status.ABORTED for sample in group) else "surplus"
+            )
+            for sample in group:
+                sample.metadata["work_origin"] = group_origin
             self.buffer.append(group)
 
     # TODO remove

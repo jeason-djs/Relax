@@ -10,6 +10,16 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from starlette.responses import Response
 
+from relax.engine.router.placement import (
+    PlacementMode,
+    PlacementRequest,
+    WorkerSnapshot,
+    decide_placement,
+    engine_id_from_url,
+    estimate_request_work,
+    fail_open_placement,
+    placement_config_from_namespace,
+)
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import load_function
 
@@ -41,6 +51,8 @@ class SlimeRouter:
 
         # URL -> Active Request Count (load state)
         self.worker_request_counts: dict[str, int] = {}
+        # URL -> Sum of pre-dispatch token-work estimates for in-flight requests
+        self.worker_predicted_work: dict[str, int] = {}
         # URL -> Consecutive Failures
         self.worker_failure_counts: dict[str, int] = {}
         # Quarantined workers excluded from routing pool
@@ -56,6 +68,10 @@ class SlimeRouter:
         self.sticky_idle_secs = getattr(args, "slime_router_sticky_idle_secs", 600.0)
         self.sticky_map: dict[str, list] = {}
         self.sticky_stats = {"hit": 0, "assigned": 0, "remap": 0, "evicted": 0, "no_routing_key": 0}
+        self.placement_config = placement_config_from_namespace(args)
+        if self.placement_config.mode is not PlacementMode.OFF and self.sticky_enabled:
+            raise ValueError("Request-level placement cannot be combined with SlimeRouter group sticky routing")
+        self.placement_sequence = 0
 
         max_connections = getattr(args, "slime_router_max_connections", None)
         if max_connections is None:
@@ -151,13 +167,15 @@ class SlimeRouter:
 
     async def proxy(self, request: Request, path: str):
         """Proxy all other requests to the SGLang router."""
-        # Forward all other paths to SGLang router
         routing_key = request.headers.get(self.sticky_header) if self.sticky_enabled else None
-        worker_url = self._use_url(routing_key)
-        url = f"{worker_url}/{path}"
-
-        # Get request body and headers
         body = await request.body()
+        predicted_work = 0
+        placement_decision = None
+        if path == "generate" and self.placement_config.mode is not PlacementMode.OFF:
+            worker_url, predicted_work, placement_decision = self._use_url_with_placement(routing_key, body)
+        else:
+            worker_url = self._use_url(routing_key)
+        url = f"{worker_url}/{path}"
         headers = dict(request.headers)
 
         try:
@@ -177,6 +195,10 @@ class SlimeRouter:
             try:
                 # Prefer parsing JSON if possible
                 data = json.loads(content)
+                if placement_decision is not None and isinstance(data, dict):
+                    meta_info = data.setdefault("meta_info", {})
+                    if isinstance(meta_info, dict):
+                        meta_info["relax_placement"] = placement_decision.to_record()
                 return JSONResponse(
                     content=data,
                     status_code=response.status_code,
@@ -195,7 +217,7 @@ class SlimeRouter:
                     await response.aclose()
 
         finally:
-            self._finish_url(worker_url)
+            self._finish_url(worker_url, predicted_work=predicted_work)
 
     async def add_worker(self, request: Request):
         """Add a new worker to the router.
@@ -221,6 +243,7 @@ class SlimeRouter:
         # Add if new, keep a simple request count per worker
         if worker_url not in self.worker_request_counts:
             self.worker_request_counts[worker_url] = 0
+            self.worker_predicted_work[worker_url] = 0
             self.worker_failure_counts[worker_url] = 0
             if self.verbose:
                 print(f"[slime-router] Added new worker: {worker_url}")
@@ -289,14 +312,78 @@ class SlimeRouter:
 
     def _use_url(self, routing_key=None):
         """Select a worker URL and account for the new in-flight request."""
-        if self.sticky_enabled and routing_key:
-            url = self._pick_sticky_url(routing_key)
-        else:
-            if self.sticky_enabled:
-                self.sticky_stats["no_routing_key"] += 1
-            url = self._select_least_loaded()
+        url = self._select_baseline_url(routing_key)
         self.worker_request_counts[url] += 1
         return url
+
+    def _select_baseline_url(self, routing_key=None):
+        if self.sticky_enabled and routing_key:
+            return self._pick_sticky_url(routing_key)
+        if self.sticky_enabled:
+            self.sticky_stats["no_routing_key"] += 1
+        return self._select_least_loaded()
+
+    def _placement_candidates(self) -> tuple[WorkerSnapshot, ...]:
+        return tuple(
+            WorkerSnapshot(
+                engine_id=engine_id_from_url(worker_url),
+                active_requests=self.worker_request_counts[worker_url],
+                predicted_work=self.worker_predicted_work.get(worker_url, 0),
+            )
+            for worker_url in self.worker_request_counts
+            if worker_url not in self.dead_workers
+        )
+
+    def _use_url_with_placement(self, routing_key, body):
+        baseline_url = self._select_baseline_url(routing_key)
+        candidates = self._placement_candidates()
+        sequence = self.placement_sequence
+        self.placement_sequence += 1
+        predicted_work = 0
+        request = PlacementRequest(
+            decision_id=f"placement:{sequence}",
+            predicted_work=0,
+            sequence=sequence,
+        )
+        try:
+            payload = json.loads(body) if body else {}
+            logical_prefix_tokens = len(payload.get("input_ids", []))
+            max_new_tokens = int(payload.get("sampling_params", {}).get("max_new_tokens", 0) or 0)
+            predicted_work = estimate_request_work(
+                logical_prefix_tokens=logical_prefix_tokens,
+                max_new_tokens=max_new_tokens,
+            )
+            request = PlacementRequest(
+                decision_id=str(payload.get("rid") or f"placement:{sequence}"),
+                predicted_work=predicted_work,
+                sequence=sequence,
+            )
+            decision = decide_placement(
+                self.placement_config,
+                request,
+                candidates,
+                baseline_engine_id=engine_id_from_url(baseline_url),
+            )
+            urls_by_engine = {engine_id_from_url(worker_url): worker_url for worker_url in self.worker_request_counts}
+            worker_url = urls_by_engine[decision.actual_engine_id]
+        except Exception as exc:
+            decision = fail_open_placement(
+                self.placement_config,
+                request,
+                candidates,
+                baseline_engine_id=engine_id_from_url(baseline_url),
+                reason=type(exc).__name__,
+            )
+            worker_url = baseline_url
+            logger.warning(
+                "[slime-router] Request placement failed open: policy=%s error=%s",
+                self.placement_config.policy.value,
+                type(exc).__name__,
+            )
+
+        self.worker_request_counts[worker_url] += 1
+        self.worker_predicted_work[worker_url] = self.worker_predicted_work.get(worker_url, 0) + predicted_work
+        return worker_url, predicted_work, decision
 
     def _evict_idle_sticky(self):
         """Drop sticky assignments idle longer than ``sticky_idle_secs``.
@@ -313,11 +400,13 @@ class SlimeRouter:
         if stale:
             self.sticky_stats["evicted"] += len(stale)
 
-    def _finish_url(self, url):
+    def _finish_url(self, url, *, predicted_work=0):
         """Mark the request to the given URL as finished."""
         assert url in self.worker_request_counts, f"URL {url} not recognized"
         self.worker_request_counts[url] -= 1
         assert self.worker_request_counts[url] >= 0, f"URL {url} count went negative"
+        self.worker_predicted_work[url] = self.worker_predicted_work.get(url, 0) - predicted_work
+        assert self.worker_predicted_work[url] >= 0, f"URL {url} predicted work went negative"
 
 
 if __name__ == "__main__":

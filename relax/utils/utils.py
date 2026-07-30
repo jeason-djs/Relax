@@ -2,6 +2,7 @@
 
 import os
 import socket
+import time
 from argparse import Namespace
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
@@ -11,6 +12,7 @@ import ray
 import torch
 from tensordict import TensorDict
 
+from relax.engine.rollout.request_observability import export_partition_outcomes, record_request_outcome
 from relax.utils.device import get_ray_accelerator_name
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import load_function
@@ -107,7 +109,49 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
         "raw_reward": raw_rewards,
         "truncated": [1 if sample.status == Sample.Status.TRUNCATED else 0 for sample in samples],
         "sample_indices": [sample.index for sample in samples],
+        "group_indices": [sample.group_index if sample.group_index is not None else -1 for sample in samples],
+        "abort_counts": [int(sample.abort_count) for sample in samples],
+        "request_attempt_sequences": [
+            int(sample.metadata.get("_request_attempt_sequence", 0) or 0) for sample in samples
+        ],
+        "request_attempt_tokens": [
+            int(sample.metadata.get("_last_request_attempt_token", -1)) for sample in samples
+        ],
+        "admission_decision_sequences": [
+            int(sample.metadata.get("_admission_decision_sequence", 0) or 0) for sample in samples
+        ],
+        "admission_decision_physical_rollout_ids": [
+            int(sample.metadata.get("_admission_decision_physical_rollout_id", -1))
+            if sample.metadata.get("_admission_decision_physical_rollout_id") is not None
+            else -1
+            for sample in samples
+        ],
+        "generation_physical_rollout_ids": [
+            int(sample.metadata.get("_generation_physical_rollout_id", -1))
+            if sample.metadata.get("_generation_physical_rollout_id") is not None
+            else -1
+            for sample in samples
+        ],
+        "work_origin_codes": [
+            {"fresh": 0, "old_debt": 1, "surplus": 2}.get(sample.metadata.get("work_origin"), -1)
+            for sample in samples
+        ],
     }
+
+    generation_versions = []
+    for sample in samples:
+        versions = []
+        for version in sample.weight_versions:
+            try:
+                versions.append(int(version))
+            except (TypeError, ValueError):
+                continue
+        generation_versions.append(versions)
+    train_data["generation_start_version"] = [versions[0] if versions else -1 for versions in generation_versions]
+    train_data["generation_end_version"] = [versions[-1] if versions else -1 for versions in generation_versions]
+    train_data["generation_version_span"] = [
+        max(versions) - min(versions) if versions else -1 for versions in generation_versions
+    ]
 
     # loss mask
     # TODO: compress the loss mask
@@ -460,6 +504,7 @@ async def transfer_batch_to_data_system(
     rollout_id: int,
     data_system_client: Any,
     is_last: bool = False,
+    physical_rollout_id: int | None = None,
 ) -> None:
     """Helper function to transfer a batch of samples to the data system
     client.
@@ -486,6 +531,7 @@ async def transfer_batch_to_data_system(
         # Flatten nested groups of samples into a single list
         while isinstance(batch_samples[0], list):
             batch_samples = sum(batch_samples, [])
+        target_partition = f"train_{rollout_id}"
         global CURRENT_ROLLOUT_BATCH
         CURRENT_ROLLOUT_BATCH.extend(batch_samples)
         rollout_batch = convert_samples_to_train_data(args, batch_samples)
@@ -501,11 +547,50 @@ async def transfer_batch_to_data_system(
         total_lengths = rollout_batch.get("total_lengths", None)
         custom_meta = [{"total_lengths": int(tl)} for tl in total_lengths] if total_lengths is not None else None
         await data_system_client.async_put(
-            data=rollout_batch, partition_id=f"train_{rollout_id}", custom_meta=custom_meta, is_last=is_last
+            data=rollout_batch, partition_id=target_partition, custom_meta=custom_meta, is_last=is_last
         )
 
+        for sample in batch_samples:
+            record_request_outcome(sample, "committed", target_partition=target_partition)
+        observability_dir = getattr(args, "rollout_request_observability_dir", None)
+        if observability_dir:
+            export_partition_outcomes(
+                batch_samples,
+                output_dir=observability_dir,
+                physical_rollout_id=physical_rollout_id,
+                target_partition=target_partition,
+                outcome="committed",
+            )
+        if is_last:
+            logger.info(
+                "TASK22_FLOW phase=partition_close physical_rollout_id=%s "
+                "target_partition=%s groups=%s t=%.6f"
+                % (
+                    str(physical_rollout_id if physical_rollout_id is not None else -1),
+                    target_partition,
+                    str(batch_count),
+                    time.time(),
+                )
+            )
         logger.info(f"Batch {batch_count} transferred successfully for rollout_id: {rollout_id}")
     except Exception as e:
+        target_partition = f"train_{rollout_id}"
+        for group_or_sample in batch_samples:
+            if isinstance(group_or_sample, list):
+                for sample in group_or_sample:
+                    record_request_outcome(sample, "commit_failed", target_partition=target_partition)
+            else:
+                record_request_outcome(group_or_sample, "commit_failed", target_partition=target_partition)
+        observability_dir = getattr(args, "rollout_request_observability_dir", None)
+        if observability_dir and batch_samples and not isinstance(batch_samples[0], list):
+            export_partition_outcomes(
+                batch_samples,
+                output_dir=observability_dir,
+                physical_rollout_id=physical_rollout_id,
+                target_partition=target_partition,
+                outcome="commit_failed",
+                error_type=type(e).__name__,
+            )
         logger.error(f"Error transferring batch {batch_count}: {e}")
         raise
 

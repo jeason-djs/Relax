@@ -3,6 +3,7 @@
 import asyncio
 import copy
 import inspect
+import time
 import uuid
 from argparse import Namespace
 from collections.abc import Callable
@@ -28,13 +29,17 @@ from relax.engine.rollout.admission import (
     DebtAwareAdmissionController,
     config_from_namespace,
     plan_next_admission,
+    split_transfer_counts,
 )
 from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
 from relax.engine.rollout.request_observability import (
+    admission_decision_record,
     begin_request_trace,
+    export_admission_ledger,
     export_request_traces,
     fail_request_trace,
     finish_request_trace,
+    record_request_outcome,
     request_observability_enabled,
 )
 from relax.utils.async_utils import run
@@ -164,6 +169,11 @@ class GenerateState(metaclass=SingletonMeta):
             if admission_context is not None and request_observability_enabled(self.args):
                 for sample in group:
                     sample._relax_admission_context = admission_context
+                    sample.metadata["_admission_decision_id"] = admission_context["decision_id"]
+                    sample.metadata["_admission_decision_sequence"] = admission_context["decision_sequence"]
+                    sample.metadata["_admission_decision_physical_rollout_id"] = getattr(
+                        self, "current_rollout_id", -1
+                    )
             task = asyncio.create_task(
                 generate_and_rm_group(
                     self.args,
@@ -501,6 +511,7 @@ async def generate(
         _timing["image_processor"] = _t_image_processor
     if _t_mm_encode is not None:
         _timing["mm_encode"] = _t_mm_encode
+    _timing["complete_ts"] = monotonic()
     sample.metadata["_timing"] = _timing
 
     return sample
@@ -528,7 +539,7 @@ async def generate_and_rm(
     # generate
     async with state.semaphore:
         if state.aborted:
-            sample.status = Sample.Status.ABORTED
+            sample.mark_aborted()
             return sample
 
         with state.dp_rank_context() as _:
@@ -617,6 +628,7 @@ async def generate_and_rm_group(
     # eval requests should not be affected by abort state; only skip for training rollout
     if state.aborted and not evaluation:
         for sample in group:
+            sample.mark_aborted()
             if hasattr(sample, "_relax_admission_context"):
                 del sample._relax_admission_context
         return group
@@ -730,8 +742,6 @@ async def abort(args: Namespace, rollout_id: int) -> tuple[list[list[Sample]], l
         for task in done:
             group = task.result()
             for sample in group:
-                if sample.status == Sample.Status.ABORTED:
-                    sample.abort_count += 1
                 if sample.response and "start_rollout_id" not in sample.metadata:
                     sample.metadata["start_rollout_id"] = rollout_id
             aborted_samples.append(group)
@@ -798,7 +808,9 @@ async def generate_rollout_async(
     admission_controller = DebtAwareAdmissionController(
         admission_config,
         final_backfill=is_final_backfill,
+        physical_rollout_id=rollout_id,
     )
+    state.admission_decision_rows: list[dict[str, Any]] = []
 
     # target_data_size = how many groups this step COMMITS to the transfer queue:
     # current-partition target (rollout_batch_size) + previous-partition backfill
@@ -807,6 +819,21 @@ async def generate_rollout_async(
     target_data_size = num_old_samples if is_final_backfill else args.rollout_batch_size + num_old_samples
     if target_data_size <= 0:
         raise RuntimeError(f"Final rollout backfill requested for rollout_id={rollout_id} without pending deficit")
+    physical_start_abs = time.time()
+    logger.info(
+        "TASK22_FLOW phase=physical_start physical_rollout_id=%s "
+        "previous_partition=train_%s previous_debt_groups=%s current_partition=%s "
+        "current_target_groups=%s work_envelope_groups=%s t=%.6f"
+        % (
+            str(rollout_id),
+            str(rollout_id - 1),
+            str(num_old_samples),
+            "none" if is_final_backfill else f"train_{rollout_id}",
+            str(0 if is_final_backfill else args.rollout_batch_size),
+            str(target_data_size),
+            physical_start_abs,
+        )
+    )
 
     data = []
     do_print = True
@@ -882,6 +909,14 @@ async def generate_rollout_async(
                     eager_admit_groups=(eager_fetch_groups if state.remaining_batch_size < target_data_size else 0),
                 )
 
+            if request_observability_enabled(args):
+                state.admission_decision_rows.append(
+                    admission_decision_record(
+                        admission_decision,
+                        physical_rollout_id=rollout_id,
+                        logical_debt_groups=logical_debt_remaining,
+                    )
+                )
             if admission_config.mode is not AdmissionMode.OFF:
                 logger.info(
                     "PARTITION_ADMISSION rollout_id=%s mode=%s logical_debt=%s release_remaining=%s available=%s "
@@ -916,6 +951,8 @@ async def generate_rollout_async(
             state.submit_generate_tasks(
                 samples,
                 admission_context={
+                    "decision_id": admission_decision.decision_id,
+                    "decision_sequence": admission_decision.decision_sequence,
                     "mode": admission_decision.mode.value,
                     "release_remaining": admission_decision.debt_remaining,
                     "inflight_before": admission_decision.inflight_groups,
@@ -941,6 +978,14 @@ async def generate_rollout_async(
                 available_groups=max(target_data_size - progress_groups, 0),
                 eager_admit_groups=eager_fetch_groups,
             )
+            if request_observability_enabled(args):
+                state.admission_decision_rows.append(
+                    admission_decision_record(
+                        fallback_decision,
+                        physical_rollout_id=rollout_id,
+                        logical_debt_groups=logical_debt_remaining,
+                    )
+                )
             fallback_count = fallback_decision.actual_admit_groups
             _t_get_samples = monotonic()
             ref = data_source.get_samples.remote(fallback_count)
@@ -949,6 +994,8 @@ async def generate_rollout_async(
             state.submit_generate_tasks(
                 samples,
                 admission_context={
+                    "decision_id": fallback_decision.decision_id,
+                    "decision_sequence": fallback_decision.decision_sequence,
                     "mode": fallback_decision.mode.value,
                     "release_remaining": fallback_decision.debt_remaining,
                     "inflight_before": 0,
@@ -982,6 +1029,8 @@ async def generate_rollout_async(
             dynamic_filter_output = call_dynamic_filter(dynamic_filter, args, group)
             if not dynamic_filter_output.keep:
                 metric_gatherer.on_dynamic_filter_drop(reason=dynamic_filter_output.reason)
+                for sample in group:
+                    record_request_outcome(sample, "filtered")
                 state.remaining_batch_size -= 1
                 continue
 
@@ -995,6 +1044,10 @@ async def generate_rollout_async(
             )
             if group_aborted:
                 for sample in group:
+                    record_request_outcome(
+                        sample,
+                        "aborted" if sample.status == Sample.Status.ABORTED else "carried_with_aborted_group",
+                    )
                     if sample.response and "start_rollout_id" not in sample.metadata:
                         sample.metadata["start_rollout_id"] = rollout_id
                 aborted_samples.append(group)
@@ -1004,6 +1057,8 @@ async def generate_rollout_async(
             else:
                 # Over-sampling surplus: target already met. Keep it for the next step
                 # (added back to the buffer after this step) instead of dropping it.
+                for sample in group:
+                    record_request_outcome(sample, "surplus")
                 oversample_surplus.append(group)
 
             if (is_final_backfill and should_commit and not group_aborted) or (
@@ -1027,6 +1082,7 @@ async def generate_rollout_async(
                         rollout_id - 1,
                         data_system_client,
                         is_last=prev_is_last,
+                        physical_rollout_id=rollout_id,
                     )
                 )
                 committed_prev += n
@@ -1048,6 +1104,7 @@ async def generate_rollout_async(
                             rollout_id - 1,
                             data_system_client,
                             is_last=prev_is_last,
+                            physical_rollout_id=rollout_id,
                         )
                     )
                     committed_prev += n_prev
@@ -1069,6 +1126,7 @@ async def generate_rollout_async(
                             rollout_id,
                             data_system_client,
                             is_last=curr_is_last,
+                            physical_rollout_id=rollout_id,
                         )
                     )
                     committed_curr += n
@@ -1090,6 +1148,7 @@ async def generate_rollout_async(
                     rollout_id - 1,
                     data_system_client,
                     is_last=prev_is_last,
+                    physical_rollout_id=rollout_id,
                 )
             )
             committed_prev += n
@@ -1097,23 +1156,42 @@ async def generate_rollout_async(
             batch_to_transfer = []
             logger.info(f"Total yielded: {committed_prev}/{num_old_samples} for step: {rollout_id - 1}")
         else:
-            # Tail flush to the current partition: last only if it completes this step's target.
-            curr_is_last = args.fully_async and (committed_curr + n >= curr_target)
-            transfer_task = asyncio.create_task(
-                transfer_batch_to_data_system(
-                    args,
-                    batch_to_transfer,
-                    n,
-                    rollout_id,
-                    data_system_client,
-                    is_last=curr_is_last,
+            remaining_previous_debt = max(prev_target - committed_prev, 0)
+            n_prev, n_curr = split_transfer_counts(n, remaining_previous_debt)
+            if n_prev:
+                transfer_tasks.append(
+                    asyncio.create_task(
+                        transfer_batch_to_data_system(
+                            args,
+                            batch_to_transfer[:n_prev],
+                            n_prev,
+                            rollout_id - 1,
+                            data_system_client,
+                            is_last=args.fully_async and committed_prev + n_prev >= prev_target,
+                            physical_rollout_id=rollout_id,
+                        )
+                    )
                 )
-            )
-            committed_curr += n
-            transfer_tasks.append(transfer_task)
+                committed_prev += n_prev
+            if n_curr:
+                transfer_tasks.append(
+                    asyncio.create_task(
+                        transfer_batch_to_data_system(
+                            args,
+                            batch_to_transfer[n_prev:],
+                            n_curr,
+                            rollout_id,
+                            data_system_client,
+                            is_last=args.fully_async and committed_curr + n_curr >= curr_target,
+                            physical_rollout_id=rollout_id,
+                        )
+                    )
+                )
+                committed_curr += n_curr
             batch_to_transfer = []
             logger.info(
-                f"Total yielded: {total_transfer_samples - num_old_samples}/{args.rollout_batch_size} for step: {rollout_id}"
+                f"Tail yielded: previous={n_prev}/{remaining_previous_debt} "
+                f"current={n_curr}/{args.rollout_batch_size} for step: {rollout_id}"
             )
 
     logger.info(f"Generator exhausted. Waiting for {len(transfer_tasks)} transfer tasks to complete...")
@@ -1137,12 +1215,34 @@ async def generate_rollout_async(
 
     # there are still some unfinished requests, abort them
     # abort() returns (aborted_samples, completed_protected_samples)
+    abort_start_abs = time.time()
     new_aborted, completed_protected = await abort(args, rollout_id)
+    abort_end_abs = time.time()
+    abort_wall = abort_end_abs - abort_start_abs
+    logger.info(
+        "TASK22_EVENT phase=abort rollout_id=%s t_begin=%.6f t_end=%.6f dur=%.6f"
+        % (str(rollout_id), abort_start_abs, abort_end_abs, abort_wall)
+    )
     aborted_samples.extend(new_aborted)
     aborted_samples.extend(completed_protected)
+    for group in new_aborted:
+        for sample in group:
+            record_request_outcome(
+                sample,
+                "aborted" if sample.status == Sample.Status.ABORTED else "carried_with_aborted_group",
+            )
+    for group in completed_protected:
+        for sample in group:
+            record_request_outcome(sample, "uncommitted_protected")
     if request_observability_enabled(args):
         try:
             request_output_path = export_request_traces(
+                state.request_observability_rows,
+                output_dir=args.rollout_request_observability_dir,
+                physical_rollout_id=rollout_id,
+            )
+            ledger_output_path = export_admission_ledger(
+                state.admission_decision_rows,
                 state.request_observability_rows,
                 output_dir=args.rollout_request_observability_dir,
                 physical_rollout_id=rollout_id,
@@ -1153,13 +1253,14 @@ async def generate_rollout_async(
             resume_request_rows = sum(row.get("attempt_kind") == "resume" for row in state.request_observability_rows)
             logger.info(
                 "ROLLOUT_REQUEST_OBSERVABILITY physical_rollout_id=%s rows=%s "
-                "finished=%s resumes=%s path=%s"
+                "finished=%s resumes=%s path=%s ledger=%s"
                 % (
                     rollout_id,
                     len(state.request_observability_rows),
                     finished_request_rows,
                     resume_request_rows,
                     request_output_path,
+                    ledger_output_path,
                 )
             )
         except Exception as exc:  # noqa: BLE001
@@ -1216,7 +1317,14 @@ async def generate_rollout_async(
             for group in accepted:
                 data.append(group)
             if accepted:
-                await transfer_batch_to_data_system(args, accepted, len(accepted), rollout_id, data_system_client)
+                await transfer_batch_to_data_system(
+                    args,
+                    accepted,
+                    len(accepted),
+                    rollout_id,
+                    data_system_client,
+                    physical_rollout_id=rollout_id,
+                )
             logger.info(f"Transferred {len(accepted)} extra completed groups to training ")
 
     global CURRENT_ROLLOUT_BATCH
@@ -1226,6 +1334,55 @@ async def generate_rollout_async(
         )
         rollout_metrics = dict(timing_metrics)
         rollout_metrics.update(admission_controller.metrics())
+        rollout_metrics["rollout/wsync/abort_wall"] = abort_wall
+        replay_samples = [
+            sample
+            for group in aborted_samples
+            for sample in group
+            if sample.status == Sample.Status.ABORTED
+        ]
+        rollout_metrics["rollout/replay/aborted_sample_count"] = float(len(replay_samples))
+        resume_rows = [row for row in state.request_observability_rows if row.get("attempt_kind") == "resume"]
+        rollout_metrics["rollout/replay/resume_attempt_count"] = float(len(resume_rows))
+
+        def add_distribution(prefix: str, values: list[float]) -> None:
+            if not values:
+                return
+            ordered = sorted(values)
+            rollout_metrics[f"{prefix}_sum"] = float(sum(ordered))
+            rollout_metrics[f"{prefix}_mean"] = float(sum(ordered) / len(ordered))
+            rollout_metrics[f"{prefix}_p50"] = float(ordered[len(ordered) // 2])
+            rollout_metrics[f"{prefix}_p95"] = float(ordered[min(len(ordered) - 1, int(len(ordered) * 0.95))])
+            rollout_metrics[f"{prefix}_max"] = float(ordered[-1])
+
+        add_distribution(
+            "rollout/replay/logical_prefix_tokens",
+            [float(row.get("logical_prefix_tokens", 0) or 0) for row in resume_rows],
+        )
+        add_distribution(
+            "rollout/replay/new_prompt_tokens",
+            [float(row.get("call_new_prompt_tokens", 0) or 0) for row in resume_rows],
+        )
+        add_distribution(
+            "rollout/replay/resume_request_wall",
+            [float(row.get("request_wall", 0.0) or 0.0) for row in resume_rows],
+        )
+        completion_times = [
+            float(sample.metadata["_timing"]["complete_ts"])
+            for group in data
+            for sample in group
+            if isinstance(sample.metadata.get("_timing"), dict)
+            and sample.metadata["_timing"].get("complete_ts") is not None
+        ]
+        if len(completion_times) >= 2:
+            ordered_completion = sorted(completion_times)
+            rollout_metrics["rollout/recoverable_window/spread"] = (
+                ordered_completion[-1] - ordered_completion[0]
+            )
+            rollout_metrics["rollout/recoverable_window/tail_after_p50"] = (
+                ordered_completion[-1] - ordered_completion[len(ordered_completion) // 2]
+            )
+            rollout_metrics["rollout/recoverable_window/committed_samples"] = float(len(ordered_completion))
         if args.partial_rollout and not args.fully_async:
             assert len(CURRENT_ROLLOUT_BATCH) == len(data) * args.n_samples_per_prompt, (
                 f"len(CURRENT_ROLLOUT_BATCH)={len(CURRENT_ROLLOUT_BATCH)}, len(data) * args.n_samples_per_prompt={len(data) * args.n_samples_per_prompt}"
@@ -1246,6 +1403,32 @@ async def generate_rollout_async(
 
     output_metrics = metric_gatherer.collect()
     output_metrics.update(admission_controller.metrics())
+    carry_aborted_groups = sum(
+        any(sample.status == Sample.Status.ABORTED for sample in group) for group in aborted_samples
+    )
+    physical_end_abs = time.time()
+    logger.info(
+        "TASK22_FLOW phase=physical_end physical_rollout_id=%s "
+        "previous_partition=train_%s previous_debt_groups=%s committed_previous_groups=%s "
+        "current_partition=%s committed_current_groups=%s next_debt_groups=%s "
+        "processed_envelope_groups=%s carry_aborted_groups=%s carry_complete_groups=%s "
+        "t_begin=%.6f t_end=%.6f dur=%.6f"
+        % (
+            str(rollout_id),
+            str(rollout_id - 1),
+            str(num_old_samples),
+            str(committed_prev),
+            "none" if is_final_backfill else f"train_{rollout_id}",
+            str(committed_current),
+            str(state.last_step_current_deficit),
+            str(len(data)),
+            str(carry_aborted_groups),
+            str(len(aborted_samples) - carry_aborted_groups),
+            physical_start_abs,
+            physical_end_abs,
+            physical_end_abs - physical_start_abs,
+        )
+    )
     state.reset()
 
     return RolloutFnTrainOutput(samples=data, metrics=output_metrics), aborted_samples

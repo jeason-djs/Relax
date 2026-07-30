@@ -17,6 +17,8 @@ now="$(date '+%Y-%m-%d-%H:%M:%S')"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 REPO="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
 
+export NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-0}"
+export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-eth0}"
 export NUM_GPUS="${NUM_GPUS:-4}"
 if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
     source "${SCRIPT_DIR}/../../entrypoint/local.sh"
@@ -29,13 +31,41 @@ MODEL_DIR="${MODEL_DIR:-${EXP_DIR}}"
 DATA_DIR="${DATA_DIR:-${EXP_DIR}}"
 NUM_ROLLOUT="${NUM_ROLLOUT:-15}"
 PARTITION_ADMISSION_MODE="${PARTITION_ADMISSION_MODE:-off}"
+REQUEST_PLACEMENT_MODE="${REQUEST_PLACEMENT_MODE:-off}"
+REQUEST_PLACEMENT_POLICY="${REQUEST_PLACEMENT_POLICY:-least_predicted_work}"
 REQUEST_OBSERVABILITY_DIR="${REQUEST_OBSERVABILITY_DIR:-}"
+TIMELINE_DUMP_DIR="${TIMELINE_DUMP_DIR:-/tmp/timeline}"
+DRIVER_LOG_PATH="${DRIVER_LOG_PATH:-log/qwen3-4b-task22-p1-${PARTITION_ADMISSION_MODE}-${now}.log}"
+TRAIN_SEED="${TRAIN_SEED:-1234}"
+ROLLOUT_SEED="${ROLLOUT_SEED:-42}"
+MAX_STALENESS="${MAX_STALENESS:-2}"
 
 if [[ "$PARTITION_ADMISSION_MODE" != "off" ]]; then
     : "${PARTITION_ADMISSION_MIN:?Set PARTITION_ADMISSION_MIN for shadow/on}"
     : "${PARTITION_ADMISSION_MAX:?Set PARTITION_ADMISSION_MAX for shadow/on}"
     : "${PARTITION_ADMISSION_SLACK:?Set PARTITION_ADMISSION_SLACK for shadow/on}"
 fi
+if [[ "$REQUEST_PLACEMENT_MODE" != "off" && "$REQUEST_PLACEMENT_MODE" != "shadow" && "$REQUEST_PLACEMENT_MODE" != "on" ]]; then
+    echo "REQUEST_PLACEMENT_MODE must be off, shadow, or on" >&2
+    exit 2
+fi
+if [[ "$REQUEST_PLACEMENT_POLICY" != "round_robin" \
+    && "$REQUEST_PLACEMENT_POLICY" != "least_active_requests" \
+    && "$REQUEST_PLACEMENT_POLICY" != "least_predicted_work" ]]; then
+    echo "Unsupported REQUEST_PLACEMENT_POLICY=$REQUEST_PLACEMENT_POLICY" >&2
+    exit 2
+fi
+if [[ "$REQUEST_PLACEMENT_MODE" != "off" && "${USE_SLIME_ROUTER:-0}" != "1" ]]; then
+    echo "Request placement shadow/on requires USE_SLIME_ROUTER=1" >&2
+    exit 2
+fi
+if [[ "$REQUEST_PLACEMENT_MODE" != "off" && -z "$REQUEST_OBSERVABILITY_DIR" ]]; then
+    echo "Request placement shadow/on requires REQUEST_OBSERVABILITY_DIR" >&2
+    exit 2
+fi
+
+export RELAX_REQUEST_PLACEMENT_MODE="$REQUEST_PLACEMENT_MODE"
+export RELAX_REQUEST_PLACEMENT_POLICY="$REQUEST_PLACEMENT_POLICY"
 
 CKPT_ARGS=(
     --hf-checkpoint "${MODEL_DIR}/Qwen3-4B/"
@@ -57,6 +87,7 @@ ROLLOUT_ARGS=(
     --n-samples-per-prompt 8
     --rollout-max-response-len 8192
     --rollout-temperature 1
+    --rollout-seed "$ROLLOUT_SEED"
     --global-batch-size 64
     --use-fault-tolerance
     --balance-data
@@ -89,6 +120,8 @@ for name in (
     "SGLANG_LOG_SCHEDULER_STATUS_TARGET",
     "SGLANG_LOG_SCHEDULER_STATUS_INTERVAL",
     "RELAX_RID_ONLY_REQUEST_LOGGING",
+    "RELAX_REQUEST_PLACEMENT_MODE",
+    "RELAX_REQUEST_PLACEMENT_POLICY",
     "RAY_DEDUP_LOGS",
 ):
     env_vars[name] = os.environ[name]
@@ -135,6 +168,10 @@ SGLANG_ARGS=(
     --sglang-show-time-cost
 )
 
+if [[ "${USE_SLIME_ROUTER:-0}" == "1" ]]; then
+    SGLANG_ARGS+=(--use-slime-router)
+fi
+
 if [[ -n "$REQUEST_OBSERVABILITY_DIR" ]]; then
     SGLANG_ARGS+=(
         --sglang-log-requests
@@ -147,7 +184,7 @@ fi
 WANDB_ARGS=(
     --use-clearml
     --use-metrics-service
-    --timeline-dump-dir /tmp/timeline
+    --timeline-dump-dir "$TIMELINE_DUMP_DIR"
     --tb-project-name "$PROJECT_NAME"
     --tb-experiment-name "qwen3-4b-task22-p1-${PARTITION_ADMISSION_MODE}-${now}"
 )
@@ -158,15 +195,16 @@ MISC_ARGS=(
     --accumulate-allreduce-grads-in-fp32
     --attention-softmax-in-fp32
     --attention-backend flash
+    --seed "$TRAIN_SEED"
 )
 
-mkdir -p log
+mkdir -p "$(dirname -- "$DRIVER_LOG_PATH")" "$TIMELINE_DUMP_DIR"
 ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
     ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \
     --runtime-env-json="${RUNTIME_ENV_JSON}" \
     -- python3 -m relax.entrypoints.train \
     --resource '{"actor": [1, 2], "rollout": [1, 2]}' \
-    --max-staleness 2 \
+    --max-staleness "$MAX_STALENESS" \
     --num-data-storage-units 1 \
     --num-iters-per-train-update 1 \
     --hybrid \
@@ -178,4 +216,4 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
     "${WANDB_ARGS[@]}" \
     "${PERF_ARGS[@]}" \
     "${SGLANG_ARGS[@]}" \
-    "${MISC_ARGS[@]}" 2>&1 | tee "log/qwen3-4b-task22-p1-${PARTITION_ADMISSION_MODE}-${now}.log"
+    "${MISC_ARGS[@]}" 2>&1 | tee "$DRIVER_LOG_PATH"

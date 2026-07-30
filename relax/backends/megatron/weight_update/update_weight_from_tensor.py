@@ -3,7 +3,7 @@
 from argparse import Namespace
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import nullcontext
-from time import monotonic
+from time import monotonic, time
 from typing import Any
 
 import ray
@@ -26,6 +26,7 @@ from relax.utils.megatron_peft_utils import (
     is_lora_enabled,
     is_lora_merge_mode,
 )
+from relax.utils.timer import timer
 
 from ..sglang import FlattenedTensorBucket, MultiprocessingSerializer
 from .hf_weight_iterator_base import HfWeightIteratorBase
@@ -39,6 +40,17 @@ from .update_weight_from_distributed import (
 
 
 logger = get_logger(__name__)
+
+
+def _task22_event(phase: str, sync_id: int, begin: float, end: float) -> None:
+    logger.info(
+        "TASK22_EVENT phase=%s sync_id=%s t_begin=%.6f t_end=%.6f dur=%.6f",
+        phase,
+        sync_id,
+        begin,
+        end,
+        end - begin,
+    )
 
 
 class UpdateWeightFromTensor:
@@ -200,8 +212,15 @@ class UpdateWeightFromTensor:
 
         rank = dist.get_rank()
         if rank == 0:
-            ray.get([engine.pause_generation.remote() for engine in all_engines])
-            ray.get([engine.flush_cache.remote() for engine in all_engines])
+            begin = time()
+            with timer("wsync_pause"):
+                ray.get([engine.pause_generation.remote() for engine in all_engines])
+            _task22_event("pause", self.weight_version, begin, time())
+
+            begin = time()
+            with timer("wsync_flush"):
+                ray.get([engine.flush_cache.remote() for engine in all_engines])
+            _task22_event("flush", self.weight_version, begin, time())
             if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
                 post_process_weights(
                     restore_weights_before_load=True,
@@ -235,25 +254,29 @@ class UpdateWeightFromTensor:
         # chunk N+1's HF conversion + serialize + gather can proceed in
         # parallel.  We defer ``ray.get`` to the *next* iteration so the
         # two stages overlap.
-        prev_refs: list[ObjectRef] = []
-        prev_long_lived_tensors = None
-        with export_ctx:
-            for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(megatron_local_weights):
-                refs, long_lived_tensors = self._send_hf_params(hf_named_tensors)
-                # Wait for the *previous* chunk's IPC to finish before
-                # releasing its GPU tensors.
+        transfer_begin = time()
+        with timer("wsync_transfer"):
+            prev_refs: list[ObjectRef] = []
+            prev_long_lived_tensors = None
+            with export_ctx:
+                for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(megatron_local_weights):
+                    refs, long_lived_tensors = self._send_hf_params(hf_named_tensors)
+                    # Wait for the *previous* chunk's IPC to finish before
+                    # releasing its GPU tensors.
+                    if prev_refs:
+                        ray.get(prev_refs)
+                    del prev_long_lived_tensors
+                    prev_refs = refs
+                    prev_long_lived_tensors = long_lived_tensors
+                    # Backend-specific per-chunk synchronization is handled in device
+                    # utils so this path stays hardware-agnostic.
+                    device_utils.maybe_backend_barrier_on_weight_chunk(group=get_gloo_group())
+                # Drain the last chunk.
                 if prev_refs:
                     ray.get(prev_refs)
                 del prev_long_lived_tensors
-                prev_refs = refs
-                prev_long_lived_tensors = long_lived_tensors
-                # Backend-specific per-chunk synchronization is handled in device
-                # utils so this path stays hardware-agnostic.
-                device_utils.maybe_backend_barrier_on_weight_chunk(group=get_gloo_group())
-            # Drain the last chunk.
-            if prev_refs:
-                ray.get(prev_refs)
-            del prev_long_lived_tensors
+        if rank == 0:
+            _task22_event("transfer", self.weight_version, transfer_begin, time())
 
         # All ranks must finish sending before rank 0 triggers Marlin repack,
         # otherwise engines in slower gather groups may still be processing
@@ -268,7 +291,10 @@ class UpdateWeightFromTensor:
                     post_process_quantization=True,
                     rollout_engines=all_engines,
                 )
-            ray.get([engine.continue_generation.remote() for engine in all_engines])
+            begin = time()
+            with timer("wsync_continue"):
+                ray.get([engine.continue_generation.remote() for engine in all_engines])
+            _task22_event("continue", self.weight_version, begin, time())
         dist.barrier(group=get_gloo_group())
 
     def _update_weights_adapter_mode(self) -> None:

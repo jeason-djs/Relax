@@ -3,6 +3,22 @@
 from argparse import Namespace
 
 
+OBSERVABILITY_FIELDS = [
+    "sample_indices",
+    "group_indices",
+    "abort_counts",
+    "request_attempt_sequences",
+    "request_attempt_tokens",
+    "admission_decision_sequences",
+    "admission_decision_physical_rollout_ids",
+    "generation_physical_rollout_ids",
+    "work_origin_codes",
+    "generation_start_version",
+    "generation_end_version",
+    "generation_version_span",
+]
+
+
 def _base_rollout_fields(args: Namespace) -> list[str]:
     fields = [
         "tokens",
@@ -12,6 +28,7 @@ def _base_rollout_fields(args: Namespace) -> list[str]:
         "rollout_log_probs",
         "rewards",
         "raw_reward",
+        *OBSERVABILITY_FIELDS,
     ]
     if getattr(args, "use_rollout_routing_replay", False):
         fields.append("rollout_routed_experts")

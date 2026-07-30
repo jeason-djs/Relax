@@ -11,6 +11,7 @@ from relax.engine.rollout.admission import (
     config_from_namespace,
     plan_next_admission,
     previous_partition_release_remaining,
+    split_transfer_counts,
     validate_admission_namespace,
 )
 
@@ -145,6 +146,23 @@ def test_previous_partition_release_accounts_for_transfer_batching() -> None:
         )
         == 0
     )
+
+
+@pytest.mark.parametrize(
+    ("batch_groups", "remaining_previous_debt", "expected"),
+    [
+        (3, 0, (0, 3)),
+        (3, 2, (2, 1)),
+        (3, 3, (3, 0)),
+        (3, 5, (3, 0)),
+    ],
+)
+def test_split_transfer_counts_uses_remaining_previous_debt(
+    batch_groups: int,
+    remaining_previous_debt: int,
+    expected: tuple[int, int],
+) -> None:
+    assert split_transfer_counts(batch_groups, remaining_previous_debt) == expected
 
 
 def test_plan_next_admission_matches_task22_fully_async_partial_false_shape() -> None:

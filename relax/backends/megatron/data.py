@@ -24,6 +24,7 @@ from relax.utils.metrics.metric_utils import compute_rollout_step
 from relax.utils.opd.opd_utils import OPD_ROLLOUT_LOG_SKIP_FIELDS
 from relax.utils.timer import Timer
 from relax.utils.training import train_metric_utils
+from relax.utils.training.data_fields import OBSERVABILITY_FIELDS
 from relax.utils.training.flops_counter import FlopsCounter
 from relax.utils.types import RolloutBatch
 
@@ -917,6 +918,7 @@ def log_rollout_data(
                 ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY,
                 ROLLOUT_MINI_GLOBAL_SAMPLE_COUNTS_KEY,
                 ROLLOUT_MINI_PROMPT_GROUP_COUNTS_KEY,
+                *OBSERVABILITY_FIELDS,
             ]:
                 continue
             if args.use_opd and key in OPD_ROLLOUT_LOG_SKIP_FIELDS:

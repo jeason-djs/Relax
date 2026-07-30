@@ -9,7 +9,7 @@ immediately; it does not introduce another durable queue.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any
 
@@ -44,6 +44,8 @@ class DebtAwareAdmissionConfig:
 class AdmissionDecision:
     """One admission decision and its instantaneous shadow counterfactual."""
 
+    decision_id: str
+    decision_sequence: int
     mode: AdmissionMode
     inflight_groups: int
     debt_remaining: int
@@ -81,6 +83,17 @@ def previous_partition_release_remaining(
         (previous_debt_groups + transfer_batch_groups - 1) // transfer_batch_groups
     ) * transfer_batch_groups
     return max(closing_transfer_target - completed_groups, 0)
+
+
+def split_transfer_counts(batch_groups: int, remaining_previous_debt: int) -> tuple[int, int]:
+    """Split a transfer batch between the previous and current partitions."""
+
+    if batch_groups < 0:
+        raise ValueError("batch_groups must be non-negative")
+    if remaining_previous_debt < 0:
+        raise ValueError("remaining_previous_debt must be non-negative")
+    previous_groups = min(batch_groups, remaining_previous_debt)
+    return previous_groups, batch_groups - previous_groups
 
 
 def config_from_namespace(args: Any) -> tuple[DebtAwareAdmissionConfig, str | None]:
@@ -139,10 +152,17 @@ class DebtAwareAdmissionController:
     behavior.
     """
 
-    def __init__(self, config: DebtAwareAdmissionConfig, *, final_backfill: bool = False) -> None:
+    def __init__(
+        self,
+        config: DebtAwareAdmissionConfig,
+        *,
+        final_backfill: bool = False,
+        physical_rollout_id: int | None = None,
+    ) -> None:
         config.validate()
         self.config = config
         self.final_backfill = final_backfill
+        self.physical_rollout_id = physical_rollout_id
         self._failed_open_reason: str | None = None
         self._decisions = 0
         self._actual_admitted = 0
@@ -186,6 +206,8 @@ class DebtAwareAdmissionController:
             actual_admit = eager_admit_groups
 
         return AdmissionDecision(
+            decision_id="unrecorded",
+            decision_sequence=0,
             mode=self.config.mode,
             inflight_groups=inflight_groups,
             debt_remaining=debt_remaining,
@@ -212,6 +234,11 @@ class DebtAwareAdmissionController:
             eager_admit_groups=eager_admit_groups,
         )
         self._decisions += 1
+        decision = replace(
+            decision,
+            decision_id=f"admission:{self.physical_rollout_id if self.physical_rollout_id is not None else 'na'}:{self._decisions}",
+            decision_sequence=self._decisions,
+        )
         self._actual_admitted += decision.actual_admit_groups
         self._shadow_bounded_admitted += decision.bounded_admit_groups
         self._max_inflight_observed = max(

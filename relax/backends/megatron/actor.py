@@ -39,6 +39,7 @@ from relax.engine.sft.runtime import (
     should_run_sft_eval,
     should_run_sft_predict,
 )
+from relax.engine.rollout.request_observability import build_consumption_records, export_consumption_records
 from relax.utils import device as device_utils
 from relax.utils import tracking_utils
 from relax.utils.async_utils import run
@@ -63,7 +64,7 @@ from relax.utils.rotate_ckpt import rotate_ckpt
 from relax.utils.timer import Timer, inverse_timer, timer, with_defer
 from relax.utils.tracking_utils import init_tracking
 from relax.utils.training import train_dump_utils
-from relax.utils.training.data_fields import build_data_fields
+from relax.utils.training.data_fields import OBSERVABILITY_FIELDS, build_data_fields
 from relax.utils.training.routing_replay import RoutingReplay
 from relax.utils.types import RolloutBatch
 from relax.utils.utils import (
@@ -776,6 +777,8 @@ class MegatronTrainRayActor(TrainRayActor):
             self.sleep()
 
     def train_actor(self, rollout_id: int, rollout_data: RolloutBatch) -> None:
+        self._emit_consumption_observability(rollout_id, rollout_data)
+
         # PPO colocate: ``values`` and ``loss_masks`` reach us via TransferQueue
         # and land on CPU (critic ``.cpu()`` s ``values`` before PUT). Inline
         # GAE + normalize_advantages need GPU tensors — dispatch here so the
@@ -1277,6 +1280,7 @@ class MegatronTrainRayActor(TrainRayActor):
                     "rollout_log_probs",
                     "rewards",
                     "raw_reward",
+                    *OBSERVABILITY_FIELDS,
                 ]
                 data_fields += ["rollout_routed_experts"] if self.args.use_rollout_routing_replay else []
                 if self.args.multimodal_keys is not None:
@@ -1337,6 +1341,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 else:
                     rollout_data[key].append(value)
         rollout_data[ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY] = rollout_mini_local_sample_counts
+        self._emit_consumption_observability(rollout_id, rollout_data)
 
         with inverse_timer("train_wait"), timer("train"):
             if self.args.compute_advantages_and_returns:
@@ -1430,7 +1435,7 @@ class MegatronTrainRayActor(TrainRayActor):
         # Returned flags are for update_weights_fully_async only — hybrid uses
         # the sync update_weights path so we just discard them.
         self._wait_for_previous_eval()
-        self._check_services_health()
+        self._check_services_health(actor_rollout_id=rollout_id)
 
         # Sync weights to rollout via UpdateWeightFromTensor (colocate mode)
         self.update_weights()
@@ -1460,6 +1465,7 @@ class MegatronTrainRayActor(TrainRayActor):
             "rollout_log_probs",
             "rewards",
             "raw_reward",
+            *OBSERVABILITY_FIELDS,
         ]
         # In true on-policy mode, actor_fwd is absent and old_log_probs is
         # recomputed inline from the train forward (see policy_loss_function).
@@ -1508,6 +1514,7 @@ class MegatronTrainRayActor(TrainRayActor):
             else:
                 data_for_log = self.data_iterator[0].get_buffer()
             rollout_data = merge_dict_list(data_for_log)
+            self._emit_consumption_observability(rollout_id, rollout_data)
             log_rollout_data(rollout_id, self.args, rollout_data)
             train_dump_utils.save_debug_train_data(
                 self.args, rollout_id=rollout_id, rollout_data=rollout_data, tokenizer=self.tokenizer
@@ -1516,7 +1523,7 @@ class MegatronTrainRayActor(TrainRayActor):
             # Wait for prior eval before pausing rollout for weight sync.
             self._wait_for_previous_eval()
 
-            rollout_only, actor_fwd_only = self._check_services_health()
+            rollout_only, actor_fwd_only = self._check_services_health(actor_rollout_id=rollout_id)
             self.update_weights_fully_async(rollout_id, rollout_only=rollout_only, actor_fwd_only=actor_fwd_only)
             dist.barrier(group=get_gloo_group())
             self._run_step_evaluation(rollout_id, end_update_weight=True)
@@ -1700,8 +1707,77 @@ class MegatronTrainRayActor(TrainRayActor):
             if post_sync_handles:
                 ray.get(post_sync_handles)
 
+    def _current_rollout_weight_version(self) -> int:
+        weight_updater = getattr(self, "weight_updater", None)
+        if weight_updater is not None:
+            return int(weight_updater.weight_version)
+
+        checkpoint_client = getattr(self, "checkpoint_engine_client", None)
+        backend = getattr(checkpoint_client, "backend", None) if checkpoint_client is not None else None
+        return int(getattr(backend, "weight_version", -1))
+
+    def _emit_consumption_observability(self, rollout_id: int, rollout_data: RolloutBatch) -> None:
+        """Export per-sample consume outcomes without affecting training."""
+
+        output_dir = getattr(self.args, "rollout_request_observability_dir", None)
+        if not output_dir:
+            return
+        try:
+            # One representative per DP replica writes its local sample rows.
+            if (
+                mpu.get_tensor_model_parallel_rank() != 0
+                or not mpu.is_pipeline_last_stage()
+                or mpu.get_context_parallel_rank() != 0
+            ):
+                return
+
+            consume_version = self._current_rollout_weight_version()
+            rows = build_consumption_records(
+                rollout_data,
+                rollout_id=rollout_id,
+                consume_version=consume_version,
+            )
+            if not rows:
+                return
+
+            export_consumption_records(
+                rows,
+                output_dir=output_dir,
+                rollout_id=rollout_id,
+                rank=dist.get_rank(),
+            )
+
+            staleness = sorted(row["actual_staleness"] for row in rows if row["actual_staleness"] is not None)
+            if staleness:
+                tracking_utils.log(
+                    self.args,
+                    {
+                        "rollout/actual_staleness/consume_version": float(consume_version),
+                        "rollout/actual_staleness/count": float(len(staleness)),
+                        "rollout/actual_staleness/avg": float(sum(staleness) / len(staleness)),
+                        "rollout/actual_staleness/p50": float(staleness[len(staleness) // 2]),
+                        "rollout/actual_staleness/p95": float(
+                            staleness[min(len(staleness) - 1, int(len(staleness) * 0.95))]
+                        ),
+                        "rollout/actual_staleness/max": float(staleness[-1]),
+                        "rollout/actual_staleness/min": float(staleness[0]),
+                        "rollout/actual_staleness/negative_count": float(sum(value < 0 for value in staleness)),
+                        "rollout/actual_staleness/invalid_version_count": float(
+                            sum(row["actual_staleness"] is None for row in rows)
+                        ),
+                        "rollout/step": compute_rollout_step(self.args, rollout_id),
+                    },
+                    step_key="rollout/step",
+                )
+        except Exception:
+            logger.warning(
+                "Task22 consumption observability skipped for rollout_id=%s",
+                rollout_id,
+                exc_info=True,
+            )
+
     @timer("wait update_weights_fully_async")
-    def _check_services_health(self) -> tuple[bool, bool]:
+    def _check_services_health(self, actor_rollout_id: int | None = None) -> tuple[bool, bool]:
         """Check rollout and actor_fwd service health before weight update.
 
         Only rank 0 sends HTTP requests to check service availability, then
@@ -1725,8 +1801,18 @@ class MegatronTrainRayActor(TrainRayActor):
             # Check rollout service
             try:
                 rollout_serve_url = get_serve_url("rollout")
+                gate_poll_count = 0
+                gate_begin = time.time()
+                sync_id = self._current_rollout_weight_version() + 1
                 while True:
-                    response = requests.get(f"{rollout_serve_url}/can_do_update_weight_for_async")
+                    gate_poll_count += 1
+                    response = requests.get(
+                        f"{rollout_serve_url}/can_do_update_weight_for_async",
+                        params={
+                            "sync_id": sync_id,
+                            "actor_rollout_id": actor_rollout_id if actor_rollout_id is not None else -1,
+                        },
+                    )
                     response.raise_for_status()
                     res = response.json()
                     if res:
@@ -1735,6 +1821,17 @@ class MegatronTrainRayActor(TrainRayActor):
                         break
                     else:
                         time.sleep(1)
+                gate_end = time.time()
+                Timer().add("gate_first_ready_latency", gate_end - gate_begin)
+                Timer().add("gate_poll_count", float(gate_poll_count))
+                logger.info(
+                    "TASK22_EVENT phase=gate sync_id=%s t_begin=%.6f t_end=%.6f dur=%.6f poll_count=%d",
+                    sync_id,
+                    gate_begin,
+                    gate_end,
+                    gate_end - gate_begin,
+                    gate_poll_count,
+                )
             except Exception as e:
                 logger.warning(
                     f"Error checking rollout service: {e}, maybe caused by rollout server failure. "
