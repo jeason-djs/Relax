@@ -33,6 +33,7 @@ TERMINAL_OUTCOMES = {
 }
 METRIC_STEP_RE = re.compile(r"\b(rollout|step|perf) (\d+):")
 ARTIFACT_ID_RE = re.compile(r"_(\d+)(?:_rank_\d+)?\.jsonl$")
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 FATAL_RE = re.compile(
     r"(?:"
     r"\bFATAL\b|"
@@ -565,6 +566,7 @@ def _completed_metric_steps(driver_log: Path) -> set[int]:
 def _structured_rows(text: str, prefix: str) -> list[dict[str, str]]:
     rows = []
     for line_no, line in enumerate(text.splitlines(), 1):
+        line = ANSI_ESCAPE_RE.sub("", line)
         marker = line.find(prefix)
         if marker < 0:
             continue

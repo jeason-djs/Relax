@@ -21,6 +21,7 @@ from scripts.task22.monitor_admission_run import (
     _read_retained_jsonl,
     _scan,
     _stop_process,
+    _structured_rows,
     _validate_closed_lifecycle,
     _validate_contract,
     _validate_gpu_snapshots,
@@ -28,6 +29,7 @@ from scripts.task22.monitor_admission_run import (
     _validate_physical_flow,
     _validate_sync,
     _validate_timelines,
+    _valid_interval,
     monitor,
 )
 
@@ -1027,6 +1029,17 @@ def test_online_monitor_preserves_complete_generic_traceback_for_exit_diagnosis(
     )
 
     _scan_once(tmp_path)
+
+
+def test_structured_event_interval_ignores_ray_ansi_suffix() -> None:
+    rows = _structured_rows(
+        "TASK22_EVENT phase=pause sync_id=1 "
+        "t_begin=1785483054.045624 t_end=1785483054.053882 dur=0.008258\x1b[0m\n",
+        "TASK22_EVENT",
+    )
+
+    assert len(rows) == 1
+    assert _valid_interval(rows[0])
 
 
 def test_online_monitor_final_reads_valid_unterminated_driver_tail() -> None:
