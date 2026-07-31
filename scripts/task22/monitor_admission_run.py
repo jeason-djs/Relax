@@ -972,7 +972,7 @@ def _validate_gpu_snapshots(
         raise MonitorFailure(f"insufficient_gpu_snapshots:{snapshots}")
     if error is not None or last_timestamp is None:
         return
-    if observed_max_interval > max_snapshot_interval:
+    if final and observed_max_interval > max_snapshot_interval:
         raise MonitorFailure(
             f"gpu_snapshot_gap:observed={observed_max_interval:.3f}:"
             f"max={max_snapshot_interval:.3f}"

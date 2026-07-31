@@ -218,11 +218,17 @@ def _gpu_number(value: str, suffix: str) -> float:
     return number
 
 
-def _parse_gpu_snapshots(path: Path, expected_engines: int) -> tuple[int, list[dict[str, Any]]]:
+def _parse_gpu_snapshots(
+    path: Path,
+    expected_engines: int,
+    *,
+    max_snapshot_interval: float,
+) -> tuple[int, list[dict[str, Any]]]:
     lines = [line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
     expected_gpu_count = expected_engines * 2
     snapshots = 0
     failures: list[dict[str, Any]] = []
+    last_timestamp: float | None = None
     offset = 0
     while offset < len(lines):
         timestamp_line = lines[offset].strip()
@@ -231,10 +237,10 @@ def _parse_gpu_snapshots(path: Path, expected_engines: int) -> tuple[int, list[d
             if match is None:
                 raise ValueError("timestamp does not match ISO-8601 sampler format")
             fraction = (match.group(2) or "0")[:6].ljust(6, "0")
-            datetime.strptime(
+            parsed_timestamp = datetime.strptime(
                 f"{match.group(1)}.{fraction}{match.group(3)}",
                 "%Y-%m-%dT%H:%M:%S.%f%z",
-            )
+            ).timestamp()
         except ValueError as exc:
             failures.append({"line": offset + 1, "error": f"invalid timestamp: {exc}"})
             break
@@ -265,6 +271,28 @@ def _parse_gpu_snapshots(path: Path, expected_engines: int) -> tuple[int, list[d
             offset += 1
         if len(gpu_indices) != expected_gpu_count:
             break
+        if last_timestamp is not None:
+            interval = parsed_timestamp - last_timestamp
+            if interval <= 0:
+                failures.append(
+                    {
+                        "line": offset - expected_gpu_count,
+                        "error": "GPU snapshot timestamps must be strictly increasing",
+                    }
+                )
+                break
+            if interval > max_snapshot_interval:
+                failures.append(
+                    {
+                        "line": offset - expected_gpu_count,
+                        "error": (
+                            f"GPU snapshot gap {interval:.3f}s exceeds "
+                            f"{max_snapshot_interval:.3f}s"
+                        ),
+                    }
+                )
+                break
+        last_timestamp = parsed_timestamp
         snapshots += 1
     if offset != len(lines):
         failures.append({"line": offset + 1, "error": "unexpected trailing GPU sampler output"})
@@ -1406,7 +1434,11 @@ def validate_run(
     validation.check("headline_timeline_files_complete", not timeline_failures, timeline_failures)
 
     try:
-        gpu_snapshots, gpu_failures = _parse_gpu_snapshots(gpu_log, expected_engines)
+        gpu_snapshots, gpu_failures = _parse_gpu_snapshots(
+            gpu_log,
+            expected_engines,
+            max_snapshot_interval=gpu_max_snapshot_interval,
+        )
     except OSError as exc:
         gpu_snapshots, gpu_failures = 0, [{"path": str(gpu_log), "error": str(exc)}]
     validation.check(

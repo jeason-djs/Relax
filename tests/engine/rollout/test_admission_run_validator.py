@@ -702,6 +702,25 @@ def test_admission_run_validator_strictly_parses_timeline_and_gpu_snapshots(tmp_
     assert not result["checks"]["gpu_snapshots_parse_strictly"]
 
 
+def test_admission_run_validator_rejects_excessive_gpu_snapshot_gap(tmp_path) -> None:
+    run_dir = _build_valid_run(tmp_path)
+    (run_dir / "logs" / "nvidia_smi_1s.csv").write_text(
+        "2026-07-30T10:00:00+0800\n"
+        "0, 1024 MiB, 75 %, 10 %, 200 W\n"
+        "1, 1010 MiB, 70 %, 9 %, 195 W\n"
+        "2026-07-30T10:00:04+0800\n"
+        "0, 1030 MiB, 80 %, 12 %, 205 W\n"
+        "1, 1020 MiB, 78 %, 11 %, 202 W\n",
+        encoding="utf-8",
+    )
+
+    result = _validate(run_dir)
+
+    assert result["verdict"] == "FAIL"
+    assert not result["checks"]["gpu_snapshots_parse_strictly"]
+    assert "exceeds 2.000s" in str(result["failures"]["gpu_snapshots_parse_strictly"])
+
+
 def test_admission_run_validator_accepts_noncontiguous_unique_gpu_indices(tmp_path) -> None:
     run_dir = _build_valid_run(tmp_path)
     (run_dir / "logs" / "nvidia_smi_1s.csv").write_text(

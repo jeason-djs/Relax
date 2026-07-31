@@ -1631,6 +1631,17 @@ def test_gpu_snapshots_reject_excessive_internal_sampling_gap(tmp_path) -> None:
         snapshots.extend(f"{index}, 1 MiB, 1 %, 1 %, 1 W" for index in range(4))
     path.write_text("\n".join(snapshots) + "\n")
 
+    _validate_gpu_snapshots(
+        path,
+        expected_engines=2,
+        final=False,
+        evidence_grace=5.0,
+        evidence_due_since={},
+        now_monotonic=0.0,
+        wall_time=datetime.fromisoformat("2026-07-30T10:00:04+08:00").timestamp() + 1,
+        max_snapshot_age=5.0,
+        max_snapshot_interval=2.0,
+    )
     with pytest.raises(MonitorFailure, match="gpu_snapshot_gap"):
         _validate_gpu_snapshots(
             path,
