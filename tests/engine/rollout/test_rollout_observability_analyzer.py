@@ -35,6 +35,18 @@ def _finished_row(rid: str) -> dict:
     }
 
 
+def _aborted_row(rid: str) -> dict:
+    row = _finished_row(rid)
+    row.update(
+        {
+            "outcome": "aborted",
+            "client_status": "request_aborted",
+            "finish_reason": {"type": "abort", "message": "Aborted"},
+        }
+    )
+    return row
+
+
 def _valid_single_engine_log(rids: list[str]) -> str:
     lines = ["(SGLangEngine pid=100) server_args=ServerArgs(base_gpu_id=2, tp_size=1)"]
     for rid in rids:
@@ -297,6 +309,21 @@ def test_rollout_observability_analyzer_rejects_nonterminal_or_invalid_timing_ro
     assert not result["checks"]["client_timestamps_valid"]
 
 
+def test_rollout_observability_analyzer_accepts_aborted_terminal_rows(tmp_path) -> None:
+    request_dir = tmp_path / "requests"
+    request_dir.mkdir()
+    rid = "relax:p1:kfresh:g9:s72:a0:aborted"
+    lifecycle = request_dir / "request_lifecycle_rollout_1.jsonl"
+    lifecycle.write_text(json.dumps(_aborted_row(rid)) + "\n", encoding="utf-8")
+    driver_log = tmp_path / "driver.log"
+    driver_log.write_text(_valid_single_engine_log([rid]), encoding="utf-8")
+
+    result = analyze(driver_log, request_dir, expected_engines=1, require_resume=False)
+
+    assert result["verdict"] == "PASS"
+    assert result["counts"]["nonterminal_rows"] == 0
+
+
 def test_rollout_observability_analyzer_exports_prompt_free_placement_trace(tmp_path) -> None:
     request_dir = tmp_path / "requests"
     request_dir.mkdir()
@@ -416,3 +443,21 @@ def test_placement_trace_uses_latest_scheduler_snapshot_before_dispatch(tmp_path
     assert snapshot["active_requests"] == 1
     assert snapshot["queued_requests"] == 1
     assert snapshot["predicted_work"] == 33
+
+
+def test_rollout_observability_analyzer_exports_aborted_placement_trace(tmp_path) -> None:
+    request_dir = tmp_path / "requests"
+    request_dir.mkdir()
+    rid = "relax:p1:kfresh:g9:s72:a0:aborted-placement"
+    row = _aborted_row(rid)
+    row.update({"physical_rollout_id": 1, "logical_prefix_tokens": 100, "max_new_tokens": 200})
+    lifecycle = request_dir / "request_lifecycle_rollout_1.jsonl"
+    lifecycle.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    driver_log = tmp_path / "driver.log"
+    driver_log.write_text(_valid_single_engine_log([rid]), encoding="utf-8")
+    output_path = tmp_path / "placement_trace.jsonl"
+
+    summary = export_placement_trace(driver_log, request_dir, output_path)
+
+    assert summary["rows"] == 1
+    assert json.loads(output_path.read_text(encoding="utf-8"))["rid"] == rid

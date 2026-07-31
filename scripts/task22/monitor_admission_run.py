@@ -31,6 +31,9 @@ TERMINAL_OUTCOMES = {
     "surplus",
     "uncommitted_protected",
 }
+TERMINAL_CLIENT_STATUS_BY_OUTCOME = {
+    "aborted": "request_aborted",
+}
 METRIC_STEP_RE = re.compile(r"\b(rollout|step|perf) (\d+):")
 ARTIFACT_ID_RE = re.compile(r"_(\d+)(?:_rank_\d+)?\.jsonl$")
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
@@ -1172,7 +1175,8 @@ def _validate_closed_lifecycle(
         rid = row.get("rid")
         if not isinstance(rid, str) or not rid.startswith("relax:"):
             raise MonitorFailure(f"invalid_lifecycle_rid:line={source}")
-        if row.get("client_status") != "finished" or row.get("rid_match") is not True:
+        expected_status = TERMINAL_CLIENT_STATUS_BY_OUTCOME.get(row.get("outcome"), "finished")
+        if row.get("client_status") != expected_status or row.get("rid_match") is not True:
             raise MonitorFailure(f"invalid_lifecycle_terminal_rid:rid={rid}")
         dispatch = _finite_field(row, "dispatch_abs")
         request_end = _finite_field(row, "request_end_abs")

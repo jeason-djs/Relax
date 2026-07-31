@@ -832,6 +832,34 @@ def test_online_monitor_validates_closed_lifecycle_timing_rid_and_engine() -> No
         _validate_closed_lifecycle([row], driver, expected_engines=2)
 
 
+def test_online_monitor_accepts_backend_aborted_terminal_lifecycle() -> None:
+    rid = "relax:p1:kfresh:g9:s72:a0:00000000000b"
+    row = {
+        "rid": rid,
+        "outcome": "aborted",
+        "client_status": "request_aborted",
+        "rid_match": True,
+        "dispatch_abs": 100.0,
+        "request_end_abs": 102.0,
+        "forward_entry_time": 100.1,
+        "prefill_finished_time": 100.4,
+        "queue_time": 0.1,
+    }
+    driver = "\n".join(
+        [
+            "(SGLangEngine pid=10) server_args=ServerArgs(base_gpu_id=2, tp_size=1)",
+            f'(SGLangEngine pid=10) {{"event":"request.received","rid":"{rid}","timestamp":100.2}}',
+            f'(SGLangEngine pid=10) {{"event":"request.finished","rid":"{rid}","timestamp":101.8}}',
+        ]
+    )
+
+    _validate_closed_lifecycle([row], driver, expected_engines=1)
+
+    row["rid_match"] = False
+    with pytest.raises(MonitorFailure, match="invalid_lifecycle_terminal_rid"):
+        _validate_closed_lifecycle([row], driver, expected_engines=1)
+
+
 def test_online_monitor_headline_metrics_are_unique_and_finite() -> None:
     text = "\n".join(
         [

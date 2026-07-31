@@ -37,6 +37,14 @@ FORBIDDEN_FIELDS = {
     "output_ids",
 }
 SERVER_ENVELOPE_TOLERANCE_S = 1.0
+TERMINAL_CLIENT_STATUS_BY_OUTCOME = {
+    "aborted": "request_aborted",
+}
+
+
+def _client_row_is_terminal(row: dict[str, Any]) -> bool:
+    expected_status = TERMINAL_CLIENT_STATUS_BY_OUTCOME.get(row.get("outcome"), "finished")
+    return row.get("client_status") == expected_status
 
 
 def _complete_driver_lines(path: Path) -> list[str]:
@@ -142,7 +150,7 @@ def _placement_trace_rows(
     rows = []
     for row in client_rows:
         rid = str(row.get("rid") or "")
-        if not rid or row.get("client_status") != "finished":
+        if not rid or not _client_row_is_terminal(row):
             continue
         mapped = received_engines.get(rid, set())
         actual_engine_id = row.get("placement_actual_engine_id")
@@ -416,7 +424,7 @@ def analyze(
     nonterminal_rows = [
         {"source": row["_source"], "rid": row.get("rid"), "client_status": row.get("client_status")}
         for row in client_rows
-        if row.get("client_status") != "finished"
+        if not _client_row_is_terminal(row)
     ]
     invalid_client_timestamps = [
         {"source": row["_source"], "rid": row.get("rid"), "error": error}
@@ -426,7 +434,7 @@ def analyze(
     rid_mismatches = [
         row["_source"]
         for row in client_rows
-        if row.get("client_status") == "finished" and row.get("rid_match") is not True
+        if _client_row_is_terminal(row) and row.get("rid_match") is not True
     ]
     engine_pids = sorted(set(engine_to_gpu).intersection(scheduler_rows))
     unique_gpu_ids = sorted({engine_to_gpu[pid] for pid in engine_pids})
@@ -519,7 +527,7 @@ def analyze(
             "running_output_tokens": _summary(running_output_tokens[engine_pid]),
         }
 
-    finished_rows = [row for row in client_rows if row.get("client_status") == "finished"]
+    finished_rows = [row for row in client_rows if _client_row_is_terminal(row)]
     timing_metadata_complete = all(
         row.get("forward_entry_time") is not None
         and row.get("prefill_finished_time") is not None
