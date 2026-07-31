@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from relax.engine.rollout.request_observability import attempt_token_from_id
-from scripts.task22.validate_admission_run import validate_run
+from scripts.task22.validate_admission_run import _parse_gpu_snapshots, validate_run
 
 
 RID = "relax:p0:kfresh:g0:s0:a0:00000000000a"
@@ -300,6 +300,97 @@ def test_admission_run_validator_accepts_complete_evidence(tmp_path) -> None:
     assert result["counts"]["consumption_rows"] == 1
     assert result["checks"]["unique_bootstrap_sync_cycle"]
     assert result["checks"]["runtime_keyed_sync_id_sets_match"]
+
+
+def test_admission_run_validator_accepts_clean_ab_without_heavy_server_or_timeline_logs(
+    tmp_path,
+) -> None:
+    run_dir = _build_valid_run(tmp_path)
+    contract_path = run_dir / "run_contract.json"
+    contract = json.loads(contract_path.read_text())
+    contract.update(
+        {
+            "evidence_profile": "clean_ab_v1",
+            "flashinfer_cuda_arch_list": "12.0a",
+            "monitor_poll_interval_s": 5.0,
+            "monitor_no_progress_timeout_s": 1200.0,
+            "gpu_max_snapshot_age_s": 30.0,
+            "gpu_max_snapshot_interval_s": 30.0,
+            "gpu_sample_interval_s": 5.0,
+            "hard_failure_grace_s": 300.0,
+            "pair_cooldown_s": 60.0,
+            "runtime_env_json": json.dumps(
+                {"env_vars": {"RELAX_RID_ONLY_REQUEST_LOGGING": "1"}},
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        }
+    )
+    contract_path.write_text(json.dumps(contract) + "\n")
+    (run_dir / "timeline" / "timeline_step_0.json").unlink()
+    (run_dir / "timeline").rmdir()
+    (run_dir / "logs" / "nvidia_smi_1s.csv").rename(
+        run_dir / "logs" / "nvidia_smi.csv"
+    )
+    driver_log = run_dir / "driver.log"
+    driver_log.write_text(
+        "\n".join(
+            line
+            for line in driver_log.read_text().splitlines()
+            if '"event": "scheduler.status"' not in line
+        )
+        + "\n"
+    )
+
+    result = validate_run(
+        run_dir,
+        expected_mode="shadow",
+        expected_rollouts=1,
+        expected_samples_per_partition=1,
+        expected_engines=1,
+        max_staleness=2,
+        headline_lo=0,
+        headline_hi=0,
+        require_resume=False,
+        monitor_poll_interval=5.0,
+        monitor_no_progress_timeout=1200.0,
+        gpu_max_snapshot_age=30.0,
+        gpu_max_snapshot_interval=30.0,
+        evidence_profile="clean_ab_v1",
+    )
+
+    assert result["verdict"] == "PASS", result["failures"]
+    assert result["checks"]["clean_evidence_contract_valid"]
+    assert result["checks"]["clean_heavy_evidence_disabled"]
+    assert "request_observability_passes" not in result["checks"]
+    assert "headline_timeline_files_complete" not in result["checks"]
+    assert result["checks"]["client_lifecycle_terminal"]
+    assert result["checks"]["client_rid_roundtrip"]
+    assert result["checks"]["client_lifecycle_timing_valid"]
+
+
+def test_clean_gpu_parser_ignores_only_trailing_incomplete_snapshot(tmp_path) -> None:
+    gpu_log = tmp_path / "nvidia.csv"
+    complete = (
+        "2026-07-30T10:00:00.000000+0800\n"
+        "0, 100 MiB, 10 %, 20 %, 30 W\n"
+        "1, 100 MiB, 10 %, 20 %, 30 W\n"
+    )
+    gpu_log.write_text(
+        complete
+        + "2026-07-30T10:00:05.000000+0800\n"
+        + "0, 100 MiB, 10 %, 20 %, 30 W\n"
+    )
+
+    snapshots, failures = _parse_gpu_snapshots(
+        gpu_log,
+        1,
+        max_snapshot_interval=30.0,
+        allow_incomplete_tail=True,
+    )
+
+    assert snapshots == 1
+    assert failures == []
 
 
 @pytest.mark.parametrize(

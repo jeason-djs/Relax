@@ -1232,7 +1232,7 @@ async def _generate_rollout_async_impl(
             raise first_exception.with_traceback(first_traceback)
 
         for group in completed_groups:
-            if do_print:
+            if do_print and getattr(args, "task22_evidence_profile", "qualification_v1") != "clean_ab_v1":
                 sample = group[0][0] if isinstance(group[0], list) else group[0]
                 logger.info(
                     f"First rollout sample: {[str(sample.prompt) + sample.response]}, label: {str(sample.label)[:100]}, reward: {sample.reward}",
@@ -1413,10 +1413,11 @@ async def _generate_rollout_async_impl(
     if transfer_tasks:
         await asyncio.gather(*transfer_tasks)
 
-    sample = data[-1][0][0] if isinstance(data[-1][0], list) else data[-1][0]
-    logger.info(
-        f"Finish rollout: {[str(sample.prompt) + sample.response]}, label: {str(sample.label)[:100]}, reward: {sample.reward}",
-    )
+    if getattr(args, "task22_evidence_profile", "qualification_v1") != "clean_ab_v1":
+        sample = data[-1][0][0] if isinstance(data[-1][0], list) else data[-1][0]
+        logger.info(
+            f"Finish rollout: {[str(sample.prompt) + sample.response]}, label: {str(sample.label)[:100]}, reward: {sample.reward}",
+        )
 
     rollout_time = timer.end("rollout")
 

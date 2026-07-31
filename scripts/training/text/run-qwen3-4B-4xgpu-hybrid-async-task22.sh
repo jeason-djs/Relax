@@ -42,6 +42,8 @@ REQUEST_PLACEMENT_MODE="${REQUEST_PLACEMENT_MODE:-off}"
 REQUEST_PLACEMENT_POLICY="${REQUEST_PLACEMENT_POLICY:-least_predicted_work}"
 REQUEST_OBSERVABILITY_DIR="${REQUEST_OBSERVABILITY_DIR:-}"
 TIMELINE_DUMP_DIR="${TIMELINE_DUMP_DIR:-/tmp/timeline}"
+TASK22_EVIDENCE_PROFILE="${TASK22_EVIDENCE_PROFILE:-qualification_v1}"
+FLASHINFER_CUDA_ARCH_LIST="${FLASHINFER_CUDA_ARCH_LIST:-12.0a}"
 DRIVER_LOG_PATH="${DRIVER_LOG_PATH:-log/qwen3-4b-task22-p1-${PARTITION_ADMISSION_MODE}-${now}.log}"
 TRAIN_SEED="${TRAIN_SEED:-1234}"
 ROLLOUT_SEED="${ROLLOUT_SEED:-42}"
@@ -70,9 +72,14 @@ if [[ "$REQUEST_PLACEMENT_MODE" != "off" && -z "$REQUEST_OBSERVABILITY_DIR" ]]; 
     echo "Request placement shadow/on requires REQUEST_OBSERVABILITY_DIR" >&2
     exit 2
 fi
+if [[ "$TASK22_EVIDENCE_PROFILE" != "qualification_v1" && "$TASK22_EVIDENCE_PROFILE" != "clean_ab_v1" ]]; then
+    echo "TASK22_EVIDENCE_PROFILE must be qualification_v1 or clean_ab_v1" >&2
+    exit 2
+fi
 
 export RELAX_REQUEST_PLACEMENT_MODE="$REQUEST_PLACEMENT_MODE"
 export RELAX_REQUEST_PLACEMENT_POLICY="$REQUEST_PLACEMENT_POLICY"
+export FLASHINFER_CUDA_ARCH_LIST
 
 CKPT_ARGS=(
     --hf-checkpoint "${MODEL_DIR}/Qwen3-4B/"
@@ -112,10 +119,12 @@ fi
 if [[ -n "$REQUEST_OBSERVABILITY_DIR" ]]; then
     mkdir -p "$REQUEST_OBSERVABILITY_DIR"
     bash "$REPO/scripts/task22/prepare_rollout_observability.sh"
-    export SGLANG_LOG_SCHEDULER_STATUS_TARGET="${SGLANG_LOG_SCHEDULER_STATUS_TARGET:-stdout}"
-    export SGLANG_LOG_SCHEDULER_STATUS_INTERVAL="${SGLANG_LOG_SCHEDULER_STATUS_INTERVAL:-1.0}"
     export RELAX_RID_ONLY_REQUEST_LOGGING=1
     export RAY_DEDUP_LOGS=0
+    if [[ "$TASK22_EVIDENCE_PROFILE" == "qualification_v1" ]]; then
+        export SGLANG_LOG_SCHEDULER_STATUS_TARGET="${SGLANG_LOG_SCHEDULER_STATUS_TARGET:-stdout}"
+        export SGLANG_LOG_SCHEDULER_STATUS_INTERVAL="${SGLANG_LOG_SCHEDULER_STATUS_INTERVAL:-1.0}"
+    fi
     RUNTIME_ENV_JSON="$(
         RUNTIME_ENV_JSON="$RUNTIME_ENV_JSON" "$PYTHON_BIN" -c '
 import json
@@ -124,17 +133,22 @@ import os
 runtime_env = json.loads(os.environ["RUNTIME_ENV_JSON"])
 env_vars = runtime_env.setdefault("env_vars", {})
 for name in (
-    "SGLANG_LOG_SCHEDULER_STATUS_TARGET",
-    "SGLANG_LOG_SCHEDULER_STATUS_INTERVAL",
     "RELAX_RID_ONLY_REQUEST_LOGGING",
     "RELAX_REQUEST_PLACEMENT_MODE",
     "RELAX_REQUEST_PLACEMENT_POLICY",
+    "FLASHINFER_CUDA_ARCH_LIST",
     "RAY_DEDUP_LOGS",
     "TASK22_PYTHON",
     "TASK22_INPUT_MANIFEST",
     "TASK22_INPUT_ROOTS_JSON",
 ):
     env_vars[name] = os.environ[name]
+for name in (
+    "SGLANG_LOG_SCHEDULER_STATUS_TARGET",
+    "SGLANG_LOG_SCHEDULER_STATUS_INTERVAL",
+):
+    if name in os.environ:
+        env_vars[name] = os.environ[name]
 print(json.dumps(runtime_env))
 '
     )"
@@ -182,7 +196,7 @@ if [[ "${USE_SLIME_ROUTER:-0}" == "1" ]]; then
     SGLANG_ARGS+=(--use-slime-router)
 fi
 
-if [[ -n "$REQUEST_OBSERVABILITY_DIR" ]]; then
+if [[ -n "$REQUEST_OBSERVABILITY_DIR" && "$TASK22_EVIDENCE_PROFILE" == "qualification_v1" ]]; then
     SGLANG_ARGS+=(
         --sglang-log-requests
         --sglang-log-requests-level 0
@@ -194,10 +208,13 @@ fi
 WANDB_ARGS=(
     --use-clearml
     --use-metrics-service
-    --timeline-dump-dir "$TIMELINE_DUMP_DIR"
+    --task22-evidence-profile "$TASK22_EVIDENCE_PROFILE"
     --tb-project-name "$PROJECT_NAME"
     --tb-experiment-name "qwen3-4b-task22-p1-${PARTITION_ADMISSION_MODE}-${now}"
 )
+if [[ -n "$TIMELINE_DUMP_DIR" ]]; then
+    WANDB_ARGS+=(--timeline-dump-dir "$TIMELINE_DUMP_DIR")
+fi
 
 MISC_ARGS=(
     --attention-dropout 0.0
@@ -208,7 +225,10 @@ MISC_ARGS=(
     --seed "$TRAIN_SEED"
 )
 
-mkdir -p "$(dirname -- "$DRIVER_LOG_PATH")" "$TIMELINE_DUMP_DIR"
+mkdir -p "$(dirname -- "$DRIVER_LOG_PATH")"
+if [[ -n "$TIMELINE_DUMP_DIR" ]]; then
+    mkdir -p "$TIMELINE_DUMP_DIR"
+fi
 ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
     ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \
     --runtime-env-json="${RUNTIME_ENV_JSON}" \

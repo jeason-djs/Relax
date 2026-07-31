@@ -1980,6 +1980,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "The timeline will be dumped to {timeline_dump_dir}/timeline_step_{{step}}.json"
                 ),
             )
+            parser.add_argument(
+                "--task22-evidence-profile",
+                choices=("qualification_v1", "clean_ab_v1"),
+                default="qualification_v1",
+                help="Task 22 experiment evidence profile.",
+            )
             return parser
 
         def add_debug_arguments(parser):

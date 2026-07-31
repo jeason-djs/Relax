@@ -29,6 +29,7 @@ echo "TASK22_PREFLIGHT mode=$MODE repo=$REPO"
     scripts/task22/compare_admission_pair.py \
     scripts/task22/input_guard.py \
     scripts/task22/enforce_process_deadline.py \
+    scripts/task22/monitor_admission_health.py \
     scripts/task22/monitor_admission_run.py \
     scripts/task22/sample_gpu_state.py \
     scripts/task22/simulate_request_placement.py \
@@ -54,6 +55,7 @@ bash -n \
     tests/engine/router/test_placement.py \
     tests/engine/router/test_router_placement.py \
     tests/engine/rollout/test_admission.py \
+    tests/engine/rollout/test_admission_health_monitor.py \
     tests/engine/rollout/test_sglang_rollout_cleanup.py \
     tests/engine/rollout/test_request_observability.py \
     tests/engine/rollout/test_request_placement_simulator.py \
@@ -143,6 +145,24 @@ if [[ "$gpu_count" != "4" ]]; then
 fi
 
 "$PYTHON_BIN" -c 'import ray, sglang'
+FLASHINFER_CUDA_ARCH_LIST="${FLASHINFER_CUDA_ARCH_LIST:-12.0a}" "$PYTHON_BIN" - <<'PY'
+import os
+
+from flashinfer.jit import core, env
+
+if os.environ["FLASHINFER_CUDA_ARCH_LIST"] != "12.0a":
+    raise SystemExit("Task 22 requires FLASHINFER_CUDA_ARCH_LIST=12.0a")
+if core.current_compilation_context.TARGET_CUDA_ARCHS != {(12, "0a")}:
+    raise SystemExit(
+        "FlashInfer compilation context did not resolve to {(12, '0a')}: "
+        f"{core.current_compilation_context.TARGET_CUDA_ARCHS}"
+    )
+core.check_cuda_arch()
+if env.FLASHINFER_WORKSPACE_DIR.name != "120a":
+    raise SystemExit(
+        f"FlashInfer workspace is not SM120a: {env.FLASHINFER_WORKSPACE_DIR}"
+    )
+PY
 "$PYTHON_BIN" -m pytest -q tests/utils/test_metrics_service.py
 bash scripts/task22/prepare_rollout_observability.sh
 
@@ -158,6 +178,7 @@ DATA_DIR="${DATA_DIR:?Set DATA_DIR for formal preflight}"
 }
 
 echo "TASK22_PREFLIGHT sglang_smoke=PASS"
+echo "TASK22_PREFLIGHT flashinfer_arch=12.0a"
 echo "TASK22_PREFLIGHT ray_declared_gpus=$NUM_GPUS"
 echo "TASK22_PREFLIGHT gpu_count=$gpu_count"
 echo "TASK22_PREFLIGHT verdict=PASS_FORMAL"

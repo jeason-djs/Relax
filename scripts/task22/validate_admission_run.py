@@ -223,6 +223,7 @@ def _parse_gpu_snapshots(
     expected_engines: int,
     *,
     max_snapshot_interval: float,
+    allow_incomplete_tail: bool = False,
 ) -> tuple[int, list[dict[str, Any]]]:
     lines = [line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
     expected_gpu_count = expected_engines * 2
@@ -245,6 +246,9 @@ def _parse_gpu_snapshots(
             failures.append({"line": offset + 1, "error": f"invalid timestamp: {exc}"})
             break
         offset += 1
+        if allow_incomplete_tail and len(lines) - offset < expected_gpu_count:
+            offset = len(lines)
+            break
         gpu_indices = set()
         for _ in range(expected_gpu_count):
             if offset >= len(lines):
@@ -320,18 +324,22 @@ def validate_run(
     training_term_timeout: float = 10.0,
     num_gpus: int = 4,
     cuda_visible_devices: str = "",
+    evidence_profile: str = "qualification_v1",
 ) -> dict[str, Any]:
     validation = Validation()
     driver_log = run_dir / "driver.log"
     observability_dir = run_dir / "observability"
     timeline_dir = run_dir / "timeline"
-    gpu_log = run_dir / "logs" / "nvidia_smi_1s.csv"
+    gpu_log = run_dir / "logs" / (
+        "nvidia_smi.csv" if evidence_profile == "clean_ab_v1" else "nvidia_smi_1s.csv"
+    )
     contract_path = run_dir / "run_contract.json"
 
     validation.check("run_directory_exists", run_dir.is_dir(), str(run_dir))
     validation.check("driver_log_present", driver_log.is_file() and driver_log.stat().st_size > 0, str(driver_log))
     validation.check("observability_directory_present", observability_dir.is_dir(), str(observability_dir))
-    validation.check("timeline_directory_present", timeline_dir.is_dir(), str(timeline_dir))
+    if evidence_profile == "qualification_v1":
+        validation.check("timeline_directory_present", timeline_dir.is_dir(), str(timeline_dir))
     validation.check("gpu_sample_present", gpu_log.is_file() and gpu_log.stat().st_size > 0, str(gpu_log))
     try:
         contract = json.loads(contract_path.read_text(encoding="utf-8"))
@@ -369,6 +377,8 @@ def validate_run(
         "num_gpus": num_gpus,
         "cuda_visible_devices": cuda_visible_devices,
     }
+    if evidence_profile == "clean_ab_v1" or "evidence_profile" in contract:
+        expected_contract["evidence_profile"] = evidence_profile
     validation.check(
         "run_contract_matches_validator_arguments",
         all(contract.get(key) == value for key, value in expected_contract.items()),
@@ -398,6 +408,31 @@ def validate_run(
         contract.get("use_slime_router") is False,
         contract.get("use_slime_router"),
     )
+    if evidence_profile == "clean_ab_v1":
+        runtime_env = {}
+        try:
+            runtime_env = json.loads(str(contract.get("runtime_env_json")))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
+        runtime_env_vars = runtime_env.get("env_vars", {}) if isinstance(runtime_env, dict) else {}
+        validation.check(
+            "clean_evidence_contract_valid",
+            contract.get("evidence_profile") == "clean_ab_v1"
+            and contract.get("flashinfer_cuda_arch_list") == "12.0a"
+            and contract.get("gpu_sample_interval_s") == 5.0
+            and contract.get("hard_failure_grace_s") >= 300.0
+            and contract.get("pair_cooldown_s") >= 0.0
+            and "SGLANG_LOG_SCHEDULER_STATUS_TARGET" not in runtime_env_vars
+            and "SGLANG_LOG_SCHEDULER_STATUS_INTERVAL" not in runtime_env_vars,
+            {
+                "evidence_profile": contract.get("evidence_profile"),
+                "flashinfer_cuda_arch_list": contract.get("flashinfer_cuda_arch_list"),
+                "gpu_sample_interval_s": contract.get("gpu_sample_interval_s"),
+                "hard_failure_grace_s": contract.get("hard_failure_grace_s"),
+                "pair_cooldown_s": contract.get("pair_cooldown_s"),
+                "runtime_env_vars": sorted(runtime_env_vars),
+            },
+        )
     if contract.get("schema_version") == RUN_CONTRACT_SCHEMA_VERSION:
         validation.check(
             "runtime_contract_fields_valid",
@@ -426,7 +461,8 @@ def validate_run(
             and isinstance(contract.get("monitor_term_grace_s"), (int, float))
             and not isinstance(contract.get("monitor_term_grace_s"), bool)
             and float(contract["monitor_term_grace_s"]) >= 0
-            and contract.get("monitor_no_progress_timeout_s") == 600.0,
+            and contract.get("monitor_no_progress_timeout_s")
+            == (1200.0 if evidence_profile == "clean_ab_v1" else 600.0),
         )
         visible_devices = cuda_visible_devices.split(",") if cuda_visible_devices else []
         validation.check(
@@ -552,21 +588,33 @@ def validate_run(
     if not driver_log.is_file() or not observability_dir.is_dir():
         return validation.result(counts={})
     driver_text = _complete_driver_text(driver_log.read_text(encoding="utf-8", errors="replace"))
-
-    try:
-        request_analysis = analyze_requests(
-            driver_log,
-            observability_dir,
-            expected_engines=expected_engines,
-            require_resume=require_resume,
+    if evidence_profile == "clean_ab_v1":
+        validation.check(
+            "clean_heavy_evidence_disabled",
+            not any(timeline_dir.glob("timeline_step_*.json"))
+            and '"event": "scheduler.status"' not in driver_text,
         )
-    except Exception as exc:  # noqa: BLE001
-        request_analysis = {"verdict": "ERROR", "error": f"{type(exc).__name__}: {exc}"}
-    validation.check(
-        "request_observability_passes",
-        request_analysis.get("verdict") == "PASS",
-        request_analysis,
-    )
+
+    if evidence_profile == "clean_ab_v1":
+        request_analysis = {
+            "verdict": "SKIP",
+            "reason": "server scheduler/request logs disabled in clean A/B profile",
+        }
+    else:
+        try:
+            request_analysis = analyze_requests(
+                driver_log,
+                observability_dir,
+                expected_engines=expected_engines,
+                require_resume=require_resume,
+            )
+        except Exception as exc:  # noqa: BLE001
+            request_analysis = {"verdict": "ERROR", "error": f"{type(exc).__name__}: {exc}"}
+        validation.check(
+            "request_observability_passes",
+            request_analysis.get("verdict") == "PASS",
+            request_analysis,
+        )
 
     request_paths, request_rows = _load_glob(
         observability_dir,
@@ -790,6 +838,49 @@ def validate_run(
     request_by_token: dict[int, dict[str, Any]] = {}
     duplicate_attempt_tokens = []
     for row in request_rows:
+        client_status = row.get("client_status")
+        expected_client_status = (
+            "request_aborted" if row.get("outcome") == "aborted" else "finished"
+        )
+        dispatch = row.get("dispatch_abs")
+        request_end = row.get("request_end_abs")
+        forward_entry = row.get("forward_entry_time")
+        prefill_finished = row.get("prefill_finished_time")
+        queue_time = row.get("queue_time")
+        validation.check(
+            "client_lifecycle_terminal",
+            client_status == expected_client_status,
+            {
+                "source": row.get("_source"),
+                "outcome": row.get("outcome"),
+                "client_status": client_status,
+                "expected_client_status": expected_client_status,
+            },
+        )
+        validation.check(
+            "client_rid_roundtrip",
+            isinstance(row.get("rid"), str)
+            and row.get("rid", "").startswith("relax:")
+            and row.get("rid_match") is True,
+            {"source": row.get("_source"), "rid": row.get("rid")},
+        )
+        validation.check(
+            "client_lifecycle_timing_valid",
+            all(
+                _finite_number(value)
+                for value in (
+                    dispatch,
+                    request_end,
+                    forward_entry,
+                    prefill_finished,
+                    queue_time,
+                )
+            )
+            and float(dispatch) <= float(request_end)
+            and float(forward_entry) <= float(prefill_finished)
+            and float(queue_time) >= 0,
+            {"source": row.get("_source")},
+        )
         attempt_id = row.get("attempt_id") or row.get("rid")
         try:
             token = attempt_token_from_id(str(attempt_id))
@@ -1422,22 +1513,24 @@ def validate_run(
             }
         )
 
-    timeline_failures = []
-    for step in headline_steps:
-        path = timeline_dir / f"timeline_step_{step}.json"
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            if not _valid_chrome_timeline(payload):
-                raise ValueError("invalid Chrome complete-event timeline")
-        except (OSError, ValueError, json.JSONDecodeError) as exc:
-            timeline_failures.append({"step": step, "path": str(path), "error": str(exc)})
-    validation.check("headline_timeline_files_complete", not timeline_failures, timeline_failures)
+    if evidence_profile == "qualification_v1":
+        timeline_failures = []
+        for step in headline_steps:
+            path = timeline_dir / f"timeline_step_{step}.json"
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                if not _valid_chrome_timeline(payload):
+                    raise ValueError("invalid Chrome complete-event timeline")
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                timeline_failures.append({"step": step, "path": str(path), "error": str(exc)})
+        validation.check("headline_timeline_files_complete", not timeline_failures, timeline_failures)
 
     try:
         gpu_snapshots, gpu_failures = _parse_gpu_snapshots(
             gpu_log,
             expected_engines,
             max_snapshot_interval=gpu_max_snapshot_interval,
+            allow_incomplete_tail=evidence_profile == "clean_ab_v1",
         )
     except OSError as exc:
         gpu_snapshots, gpu_failures = 0, [{"path": str(gpu_log), "error": str(exc)}]
@@ -1496,6 +1589,11 @@ def main() -> None:
     parser.add_argument("--training-term-timeout", type=float, default=10.0)
     parser.add_argument("--num-gpus", type=int, default=4)
     parser.add_argument("--cuda-visible-devices", default="")
+    parser.add_argument(
+        "--evidence-profile",
+        choices=("qualification_v1", "clean_ab_v1"),
+        default="qualification_v1",
+    )
     parser.add_argument("--require-resume", action="store_true")
     parser.add_argument("--output-json", type=Path)
     args = parser.parse_args()
@@ -1523,6 +1621,7 @@ def main() -> None:
         training_term_timeout=args.training_term_timeout,
         num_gpus=args.num_gpus,
         cuda_visible_devices=args.cuda_visible_devices,
+        evidence_profile=args.evidence_profile,
         require_resume=args.require_resume,
     )
     rendered = json.dumps(result, indent=2, sort_keys=True)

@@ -164,6 +164,7 @@ def _build_fake_repo(tmp_path: Path) -> tuple[Path, Path, dict[str, str]]:
         *PRODUCTION_FINGERPRINTED_FILES,
         "relax/utils/task22_runtime_attestation.py",
         "scripts/task22/enforce_process_deadline.py",
+        "scripts/task22/monitor_admission_health.py",
         "scripts/task22/sample_gpu_state.py",
         "scripts/task22/run_admission_matched_ab.sh",
         "scripts/task22/input_guard.py",
@@ -181,6 +182,9 @@ def _build_fake_repo(tmp_path: Path) -> tuple[Path, Path, dict[str, str]]:
         elif relative_path == "scripts/task22/sample_gpu_state.py":
             path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(GPU_SAMPLER, path)
+        elif relative_path == "scripts/task22/monitor_admission_health.py":
+            path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(REPO_ROOT / relative_path, path)
         elif relative_path == "scripts/task22/enforce_process_deadline.py":
             path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(PROCESS_DEADLINE, path)
@@ -237,8 +241,10 @@ for sync_id in $(seq 1 15); do
   done
 done
 for step in $(seq 5 14); do
-  printf '[{"name":"train","ph":"X","ts":1,"dur":1,"pid":1,"tid":1}]\n' \
-    > "$TIMELINE_DUMP_DIR/timeline_step_${step}.json"
+  if [[ -n "$TIMELINE_DUMP_DIR" ]]; then
+    printf '[{"name":"train","ph":"X","ts":1,"dur":1,"pid":1,"tid":1}]\n' \
+      > "$TIMELINE_DUMP_DIR/timeline_step_${step}.json"
+  fi
   printf 'perf %s: {"perf/step_time": 1.0}\n' "$step" >> "$DRIVER_LOG_PATH"
 done
 printf '%s\n' TASK22_WRAPPER=PASS
@@ -1097,6 +1103,64 @@ def test_runner_default_run_still_executes_complete_pair(tmp_path) -> None:
     assert validation["require_resume"] is True
 
 
+def test_runner_on_first_clean_pair_keeps_only_admission_mode_as_contract_diff(tmp_path) -> None:
+    repo, run_root, env = _build_fake_repo(tmp_path)
+    runner = repo / "scripts/task22/run_admission_matched_ab.sh"
+    completed = subprocess.run(
+        ["bash", str(runner), "--run", "--on-first"],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={
+            **env,
+            "TASK22_AUTHORIZE_ON_RUN": "1",
+            "TASK22_EVIDENCE_PROFILE": "clean_ab_v1",
+            "TASK22_PAIR_COOLDOWN_S": "0",
+        },
+    )
+
+    pair_dir = next(run_root.glob("admission_matched_*_fixture"))
+    assert "order=on_then_shadow" in completed.stdout
+    assert (pair_dir / "on" / "validation.json").is_file()
+    assert (pair_dir / "shadow" / "validation.json").is_file()
+    assert (pair_dir / "PAIR_VALID").read_text().strip() == "PASS"
+    on_contract = json.loads((pair_dir / "on/run_contract.json").read_text())
+    shadow_contract = json.loads((pair_dir / "shadow/run_contract.json").read_text())
+    assert on_contract["evidence_profile"] == "clean_ab_v1"
+    assert on_contract["flashinfer_cuda_arch_list"] == "12.0a"
+    assert on_contract["gpu_sample_interval_s"] == 5
+    assert on_contract["hard_failure_grace_s"] == 300
+    assert on_contract["runtime_env_json"] == shadow_contract["runtime_env_json"]
+    assert (
+        json.loads(on_contract["runtime_env_json"])["env_vars"][
+            "FLASHINFER_CUDA_ARCH_LIST"
+        ]
+        == "12.0a"
+    )
+    assert {
+        key
+        for key in set(on_contract) | set(shadow_contract)
+        if on_contract.get(key) != shadow_contract.get(key)
+    } == {"admission_mode"}
+    assert not any((pair_dir / "on").glob("timeline/timeline_step_*.json"))
+    assert not any((pair_dir / "shadow").glob("timeline/timeline_step_*.json"))
+
+
+def test_runner_on_first_requires_explicit_on_authorization(tmp_path) -> None:
+    repo, run_root, env = _build_fake_repo(tmp_path)
+    denied = subprocess.run(
+        ["bash", str(repo / "scripts/task22/run_admission_matched_ab.sh"), "--run", "--on-first"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={**env, "TASK22_EVIDENCE_PROFILE": "clean_ab_v1"},
+    )
+
+    assert denied.returncode == 4
+    assert "TASK22_AUTHORIZE_ON_RUN=1" in denied.stderr
+    assert not run_root.exists()
+
+
 def test_runner_default_pair_rejects_qualification_contract_drift(tmp_path) -> None:
     repo, run_root, env = _build_fake_repo(tmp_path)
     runner = repo / "scripts/task22/run_admission_matched_ab.sh"
@@ -1195,7 +1259,7 @@ printf '%s\n' TRAINING_COMPLETED > "$REQUEST_OBSERVABILITY_DIR/training_complete
         check=True,
     )
 
-    failed = subprocess.run(
+    completed = subprocess.run(
         ["bash", str(runner), "--run", "--stop-after-shadow"],
         check=False,
         capture_output=True,
@@ -1204,7 +1268,7 @@ printf '%s\n' TRAINING_COMPLETED > "$REQUEST_OBSERVABILITY_DIR/training_complete
         timeout=5,
     )
 
-    assert failed.returncode == 5
+    assert completed.returncode == 5
     pair_dir = next(run_root.glob("admission_matched_*_fixture"))
     assert (pair_dir / "shadow" / "ONLINE_MONITOR_EXIT_CODE").read_text().strip() == "4"
     assert (pair_dir / "shadow" / "EXIT_CODE").read_text().strip() != "0"
@@ -1270,6 +1334,66 @@ printf '%s\n' TRAINING_COMPLETED > "$REQUEST_OBSERVABILITY_DIR/training_complete
     assert (pair_dir / "shadow" / "ONLINE_MONITOR_EXIT_CODE").read_text().strip() != "0"
     assert (pair_dir / "shadow" / "EXIT_CODE").read_text().strip() != "0"
     assert not (pair_dir / "shadow" / "observability" / "training_completed").exists()
+
+
+def test_clean_runner_does_not_stop_training_when_health_monitor_crashes(tmp_path) -> None:
+    repo, run_root, env = _build_fake_repo(tmp_path)
+    runner = repo / "scripts/task22/run_admission_matched_ab.sh"
+    monitor = repo / "scripts/task22/monitor_admission_health.py"
+    wrapper = repo / "scripts/training/text/run-qwen3-4B-4xgpu-hybrid-async-task22.sh"
+    _write(
+        monitor,
+        "#!/usr/bin/env python3\nraise RuntimeError('unexpected monitor crash')\n",
+        executable=True,
+    )
+    _write(
+        wrapper,
+        """#!/usr/bin/env bash
+set -euo pipefail
+sleep 0.2
+printf '%s\n' TRAINING_COMPLETED > "$REQUEST_OBSERVABILITY_DIR/training_completed"
+""",
+        executable=True,
+    )
+    subprocess.run(["git", "-C", str(repo), "add", str(monitor), str(wrapper)], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "-c",
+            "user.name=Task22 Test",
+            "-c",
+            "user.email=task22@example.invalid",
+            "commit",
+            "-qm",
+            "crashing clean monitor fixture",
+        ],
+        check=True,
+    )
+
+    completed = subprocess.run(
+        ["bash", str(runner), "--run", "--stop-after-shadow"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={
+            **env,
+            "TASK22_EVIDENCE_PROFILE": "clean_ab_v1",
+            "TASK22_PAIR_COOLDOWN_S": "0",
+        },
+        timeout=5,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    pair_dir = next(run_root.glob("admission_matched_*_fixture"))
+    shadow = pair_dir / "shadow"
+    assert (shadow / "observability" / "training_completed").is_file()
+    assert (shadow / "EXIT_CODE").read_text().strip() == "0"
+    assert (shadow / "ONLINE_MONITOR_EXIT_CODE").read_text().strip() != "0"
+    assert (shadow / "STATUS").read_text().strip() == "SUCCEEDED"
+    assert "MONITOR_DEGRADED" not in (shadow / "SUPERVISION_STATE").read_text()
+    assert "health monitor degraded" in (shadow / "logs/online_monitor.log").read_text()
 
 
 def test_runner_status_reports_monitor_failure_and_supervised_training_stop(tmp_path) -> None:
