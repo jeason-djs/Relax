@@ -101,7 +101,10 @@ def main(args):
             runtime_env["working_dir"] = working_dir
     if not ray.is_initialized():
         # this is for local ray cluster
-        ray.init(runtime_env=runtime_env)
+        if os.environ.get("TASK22_RAY_JOB_RUNTIME_ENV_APPLIED") == "1":
+            ray.init()
+        else:
+            ray.init(runtime_env=runtime_env)
         logger.info("Ray initialized successfully")
         try:
             serve.start(

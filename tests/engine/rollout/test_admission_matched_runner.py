@@ -135,6 +135,7 @@ def test_real_task22_entrypoint_passes_input_guard_env_in_runtime_env_and_comman
     submitted_runtime_env = json.loads(runtime_arg.split("=", 1)[1])
     assert submitted_runtime_env["env_vars"]["TASK22_INPUT_MANIFEST"] == manifest
     assert submitted_runtime_env["env_vars"]["TASK22_INPUT_ROOTS_JSON"] == roots_json
+    assert "TASK22_RAY_JOB_RUNTIME_ENV_APPLIED=1" in argv
     assert f"TASK22_INPUT_MANIFEST={manifest}" in argv
     assert f"TASK22_INPUT_ROOTS_JSON={roots_json}" in argv
     assert str(os.path.realpath(sys.executable)) in argv
