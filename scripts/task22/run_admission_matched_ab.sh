@@ -298,8 +298,28 @@ fi
 
 export MODEL_DIR DATA_DIR EXP_DIR WORKING_DIR RUNTIME_ENV_JSON TASK22_RUNTIME_ATTESTATION_DIR
 
+run_formal_preflight() {
+    env \
+        -u TASK22_AUTHORIZE_GPU_RUN \
+        -u TASK22_AUTHORIZE_ON_RUN \
+        -u TASK22_EVIDENCE_PROFILE \
+        -u TASK22_PAIR_COOLDOWN_S \
+        -u TASK22_MONITOR_POLL_INTERVAL \
+        -u TASK22_MONITOR_EVIDENCE_GRACE \
+        -u TASK22_MONITOR_NO_PROGRESS_TIMEOUT_S \
+        -u TASK22_GPU_MAX_SNAPSHOT_AGE_S \
+        -u TASK22_GPU_MAX_SNAPSHOT_INTERVAL_S \
+        -u TASK22_GPU_SAMPLE_INTERVAL_S \
+        -u TASK22_HARD_FAILURE_GRACE_S \
+        -u TASK22_MONITOR_TIMEOUT_S \
+        -u TASK22_MONITOR_TERM_GRACE_S \
+        -u TASK22_TRAINING_TERM_TIMEOUT_S \
+        -u TASK22_RUN_STAMP \
+        bash "$PREFLIGHT" --formal
+}
+
 if [[ "$MODE" == "--check" ]]; then
-    bash "$PREFLIGHT" --formal
+    run_formal_preflight
     echo "TASK22_MATCHED_AB verdict=READY"
     echo "TASK22_MATCHED_AB commit=$GIT_COMMIT"
     echo "TASK22_MATCHED_AB pair_dir=$PAIR_DIR"
@@ -553,7 +573,7 @@ DATA_DIR="$INPUT_SNAPSHOT"
 MODEL_INPUT_ROOT="$INPUT_SNAPSHOT/Qwen3-4B"
 DATA_INPUT_FILE="$INPUT_SNAPSHOT/dapo-math-17k/dapo-math-17k.jsonl"
 export MODEL_DIR DATA_DIR
-bash "$PREFLIGHT" --formal
+run_formal_preflight
 
 if [[ -z "$RESUME_ON_DIR" ]]; then
     mkdir -p "$PAIR_DIR"

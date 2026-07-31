@@ -1161,6 +1161,64 @@ def test_runner_on_first_requires_explicit_on_authorization(tmp_path) -> None:
     assert not run_root.exists()
 
 
+def test_runner_isolates_formal_preflight_from_run_authorization_and_profile(tmp_path) -> None:
+    repo, _, env = _build_fake_repo(tmp_path)
+    preflight = repo / "scripts/task22/preflight_admission.sh"
+    _write(
+        preflight,
+        """#!/usr/bin/env bash
+set -euo pipefail
+for name in \
+  TASK22_AUTHORIZE_GPU_RUN \
+  TASK22_AUTHORIZE_ON_RUN \
+  TASK22_EVIDENCE_PROFILE \
+  TASK22_MONITOR_NO_PROGRESS_TIMEOUT_S \
+  TASK22_HARD_FAILURE_GRACE_S; do
+  if [[ -n "${!name+x}" ]]; then
+    printf 'leaked=%s\n' "$name" >&2
+    exit 4
+  fi
+done
+printf '%s\n' TASK22_PREFLIGHT=PASS
+""",
+        executable=True,
+    )
+    subprocess.run(["git", "-C", str(repo), "add", str(preflight)], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "-c",
+            "user.name=Task22 Test",
+            "-c",
+            "user.email=task22@example.invalid",
+            "commit",
+            "-qm",
+            "preflight environment fixture",
+        ],
+        check=True,
+    )
+
+    checked = subprocess.run(
+        ["bash", str(repo / "scripts/task22/run_admission_matched_ab.sh"), "--check"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={
+            **env,
+            "TASK22_AUTHORIZE_ON_RUN": "1",
+            "TASK22_EVIDENCE_PROFILE": "clean_ab_v1",
+            "TASK22_MONITOR_NO_PROGRESS_TIMEOUT_S": "1200",
+            "TASK22_HARD_FAILURE_GRACE_S": "300",
+        },
+    )
+
+    assert checked.returncode == 0, checked.stderr
+    assert "verdict=READY" in checked.stdout
+    assert "leaked=" not in checked.stderr
+
+
 def test_runner_default_pair_rejects_qualification_contract_drift(tmp_path) -> None:
     repo, run_root, env = _build_fake_repo(tmp_path)
     runner = repo / "scripts/task22/run_admission_matched_ab.sh"
