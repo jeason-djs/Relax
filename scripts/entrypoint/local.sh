@@ -43,14 +43,21 @@ set -eo pipefail
 
 # ── process cleanup ─────────────────────────────────────────────────────────
 echo "=== Cleaning up stale processes ==="
-pkill -9 sglang 2>/dev/null || true
-sleep 3
 ray stop --force 2>/dev/null || true
-pkill -9 ray 2>/dev/null || true
-pkill -9 python 2>/dev/null || true
-sleep 3
-pkill -9 ray 2>/dev/null || true
-pkill -9 python 2>/dev/null || true
+
+# Never use process-name-wide pkill here: local.sh is sourced from the training
+# wrapper while qualification monitors and other users' jobs may be Python
+# processes on the same host. A caller may explicitly identify stale PIDs owned
+# by this job (space-separated) for bounded cleanup.
+for _relax_pid in ${RELAX_LOCAL_CLEANUP_PIDS:-}; do
+    case "$_relax_pid" in
+        ''|*[!0-9]*) continue ;;
+    esac
+    if [ "$_relax_pid" -gt 1 ] && [ "$_relax_pid" -ne "$$" ]; then
+        kill -TERM "$_relax_pid" 2>/dev/null || true
+    fi
+done
+unset _relax_pid
 
 set -x
 
@@ -100,8 +107,10 @@ ray start --head \
 # ── set entrypoint mode ────────────────────────────────────────────────────
 export RELAX_ENTRYPOINT_MODE="local"
 
-# Runtime env for single-node (empty, env inherited from Ray cluster)
+# Runtime env for single-node (empty, env inherited from Ray cluster).
+# A qualification runner may pre-freeze this value into its contract.
 # Cap OMP/MKL/OpenBLAS threads (default 24) to avoid CPU oversubscription when colocating multiple Ray actors per node.
+if [ -z "${RUNTIME_ENV_JSON:-}" ]; then
 export RUNTIME_ENV_JSON="{
 \"worker_process_setup_hook\": \"relax.utils.logging_utils.install_asyncio_noise_filter\",
 \"env_vars\": {
@@ -122,5 +131,6 @@ export RUNTIME_ENV_JSON="{
    \"INDEXER_ROPE_NEOX_STYLE\": \"${INDEXER_ROPE_NEOX_STYLE:-0}\"
 }
 }"
+fi
 
 echo "=== Local environment ready ==="

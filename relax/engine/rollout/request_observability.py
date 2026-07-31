@@ -78,6 +78,11 @@ def _atomic_write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
             output_file.flush()
             os.fsync(output_file.fileno())
         os.replace(temporary_name, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     except BaseException:
         try:
             os.unlink(temporary_name)
@@ -285,12 +290,28 @@ def finish_request_trace(
     )
 
 
-def fail_request_trace(row: dict[str, Any], error: BaseException) -> None:
+def fail_request_trace(
+    row: dict[str, Any],
+    error: BaseException,
+    *,
+    client_status: str = "generation_exception",
+) -> None:
     row.update(
         {
             "request_end_abs": time.time(),
-            "client_status": "exception",
+            "client_status": client_status,
             "exception_type": type(error).__name__,
+        }
+    )
+
+
+def abort_request_trace(row: dict[str, Any]) -> None:
+    """Mark a request that returned only because the backend was aborted."""
+
+    row.update(
+        {
+            "request_end_abs": time.time(),
+            "client_status": "request_aborted",
         }
     )
 

@@ -32,6 +32,24 @@ _ctrl: Controller | None = None
 _shutdown_done = False
 
 
+@ray.remote(num_cpus=0)
+def _write_task22_worker_attestation(
+    directory: str,
+    runtime_env_json: str,
+    input_manifest_path: str,
+    input_roots_json: str,
+) -> str:
+    from relax.utils.task22_runtime_attestation import write_attestation
+
+    return write_attestation(
+        directory,
+        "ray_worker",
+        runtime_env_json,
+        input_manifest_path,
+        input_roots_json,
+    )
+
+
 def _hard_exit(code: int):
     """Exit without running Python/native extension destructors."""
     for stream in (sys.stdout, sys.stderr):
@@ -98,6 +116,29 @@ def main(args):
             )
         except RuntimeError:
             pass
+
+    attestation_dir = os.environ.get("TASK22_RUNTIME_ATTESTATION_DIR")
+    if attestation_dir:
+        from relax.utils.task22_runtime_attestation import write_attestation
+
+        runtime_env_json = os.environ["RUNTIME_ENV_JSON"]
+        input_manifest_path = os.environ["TASK22_INPUT_MANIFEST"]
+        input_roots_json = os.environ["TASK22_INPUT_ROOTS_JSON"]
+        write_attestation(
+            attestation_dir,
+            "driver",
+            runtime_env_json,
+            input_manifest_path,
+            input_roots_json,
+        )
+        ray.get(
+            _write_task22_worker_attestation.remote(
+                attestation_dir,
+                runtime_env_json,
+                input_manifest_path,
+                input_roots_json,
+            )
+        )
 
     # init_tracking must run after serve.start() (metrics adapter probes Ray
     # Serve for the /metrics endpoint) and before Controller() (wandb primary

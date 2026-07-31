@@ -25,12 +25,14 @@ except ModuleNotFoundError:
     sys.modules["torch"] = torch_stub
 
 from relax.engine.rollout.request_observability import (
+    abort_request_trace,
     attempt_token_from_id,
     begin_request_trace,
     build_consumption_records,
     close_discarded_abort_outcomes,
     export_partition_outcomes,
     export_request_traces,
+    fail_request_trace,
     finish_request_trace,
     request_observability_enabled,
 )
@@ -76,6 +78,33 @@ def test_non_partial_abort_closes_each_discarded_attempt_outcome() -> None:
 
     assert aborted.metadata["_active_request_trace"]["outcome"] == "aborted"
     assert completed.metadata["_active_request_trace"]["outcome"] == "aborted"
+
+
+def test_abort_outcome_does_not_overwrite_failed_trace_terminal_status() -> None:
+    sample = Sample(status=Sample.Status.ABORTED)
+    trace = {"attempt_id": "failed-attempt", "client_status": "dispatched"}
+    sample.metadata["_active_request_trace"] = trace
+    fail_request_trace(trace, RuntimeError("generation failed"))
+
+    close_discarded_abort_outcomes([[sample]])
+
+    assert trace["client_status"] == "generation_exception"
+    assert trace["exception_type"] == "RuntimeError"
+    assert trace["outcome"] == "aborted"
+
+
+def test_request_trace_distinguishes_cancel_abort_and_generation_failure() -> None:
+    cancelled = {"client_status": "dispatched"}
+    failed = {"client_status": "dispatched"}
+    aborted = {"client_status": "finished"}
+
+    fail_request_trace(cancelled, RuntimeError("cancelled"), client_status="task_cancelled")
+    fail_request_trace(failed, ValueError("failed"))
+    abort_request_trace(aborted)
+
+    assert cancelled["client_status"] == "task_cancelled"
+    assert failed["client_status"] == "generation_exception"
+    assert aborted["client_status"] == "request_aborted"
 
 
 def test_request_observability_is_disabled_without_output_directory() -> None:

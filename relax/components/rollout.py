@@ -441,12 +441,9 @@ class Rollout(Base):
                     if self.config.offload_rollout:
                         await self.rollout_manager.offload.remote()
                 except Exception as e:
-                    error_msg = f"Rollout generation failed at step {local_step}: {type(e).__name__}: {str(e)}"
-                    self._logger.exception(error_msg)
-                    self.healthy.report_error.remote("rollout", error_msg)
-                    if not getattr(self.config, "use_health_check", False):
-                        raise
-                    break
+                    raise RuntimeError(
+                        f"Rollout generation failed at step {local_step}: {type(e).__name__}: {str(e)}"
+                    ) from e
                 self._logger.info(f"Finish rollout {local_step}/{self.config.num_rollout}")
 
                 try:
@@ -502,19 +499,22 @@ class Rollout(Base):
                         break
 
                 await self._maybe_save_data(local_step)
-                self.step += 1
                 if is_final_backfill_step:
                     final_partition_id = f"train_{self.config.num_rollout - 1}"
                     if not await self._async_check_partition_production_complete(final_partition_id):
                         raise RuntimeError(f"Final rollout partition {final_partition_id} is still incomplete")
+                self.step += 1
+                if is_final_backfill_step:
                     self._logger.info("All rollouts finished")
                     break
         except Exception as e:
+            self.status = "FAILED"
             error_msg = f"Rollout failed at step {self.step}: {type(e).__name__}: {str(e)}"
             self._logger.exception(error_msg)
             self.healthy.report_error.remote("rollout", error_msg)
-            if not getattr(self.config, "use_health_check", False):
-                raise
+            # Health checking may schedule recovery, but the current service
+            # task must still fail so Controller.join/run observes the error.
+            raise
 
     async def _maybe_save_data(self, local_step) -> None:
         if self.config.save is None or self.config.save_interval is None:

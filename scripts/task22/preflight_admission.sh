@@ -4,7 +4,13 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 REPO="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
-PYTHON_BIN="${TASK22_PYTHON:-python3}"
+PYTHON_REQUEST="${TASK22_PYTHON:?Set TASK22_PYTHON to an absolute executable launcher}"
+if [[ "$PYTHON_REQUEST" != /* || ! -x "$PYTHON_REQUEST" ]]; then
+    echo "TASK22_PYTHON must be an executable absolute path" >&2
+    exit 4
+fi
+PYTHON_BIN="$PYTHON_REQUEST"
+export TASK22_PYTHON="$PYTHON_REQUEST"
 MODE="local"
 
 if [[ "${1:-}" == "--formal" ]]; then
@@ -21,13 +27,16 @@ echo "TASK22_PREFLIGHT mode=$MODE repo=$REPO"
 "$PYTHON_BIN" -m py_compile \
     scripts/task22/analyze_rollout_observability.py \
     scripts/task22/compare_admission_pair.py \
+    scripts/task22/input_guard.py \
     scripts/task22/monitor_admission_run.py \
     scripts/task22/simulate_request_placement.py \
     scripts/task22/validate_admission_run.py \
+    relax/entrypoints/train.py \
     relax/engine/router/placement.py \
     relax/engine/router/router.py \
     relax/engine/rollout/admission.py \
-    relax/engine/rollout/request_observability.py
+    relax/engine/rollout/request_observability.py \
+    relax/utils/task22_runtime_attestation.py
 
 bash -n \
     scripts/task22/preflight_admission.sh \
@@ -38,28 +47,40 @@ bash -n \
     tests/engine/router/test_placement.py \
     tests/engine/router/test_router_placement.py \
     tests/engine/rollout/test_admission.py \
+    tests/engine/rollout/test_sglang_rollout_cleanup.py \
     tests/engine/rollout/test_request_observability.py \
     tests/engine/rollout/test_request_placement_simulator.py \
     tests/engine/rollout/test_rollout_observability_analyzer.py \
     tests/engine/rollout/test_admission_matched_runner.py \
     tests/engine/rollout/test_admission_online_monitor.py \
+    tests/engine/rollout/test_admission_preflight.py \
     tests/engine/rollout/test_admission_run_validator.py \
     tests/engine/rollout/test_admission_pair_comparator.py \
+    tests/engine/rollout/test_task22_input_guard.py \
+    tests/components/test_rollout_terminal_state.py \
     tests/utils/test_timeline_trace.py
 
-for source_file in \
-    relax/backends/megatron/actor.py \
-    relax/backends/megatron/weight_update/update_weight_from_tensor.py \
-    relax/components/rollout.py \
-    relax/engine/rollout/sglang_rollout.py \
-    relax/utils/utils.py; do
-    current_count="$(grep -E -c 'cuda\.synchronize|dist\.barrier|ray\.get' "$source_file" || true)"
-    baseline_count="$(git show "HEAD:$source_file" | grep -E -c 'cuda\.synchronize|dist\.barrier|ray\.get' || true)"
-    if (( current_count > baseline_count )); then
-        echo "Task 22 changes increase synchronization primitives in $source_file: $baseline_count -> $current_count" >&2
-        exit 4
-    fi
-done
+"$PYTHON_BIN" - <<'PY'
+import json
+import pathlib
+import re
+import sys
+
+manifest_path = pathlib.Path("scripts/task22/approved_sync_baseline.json")
+manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+if manifest.get("schema_version") != 1 or not manifest.get("approved_revision"):
+    raise SystemExit("Invalid versioned Task 22 synchronization baseline manifest")
+pattern = re.compile(manifest["pattern"])
+for source_file, approved_count in manifest["sources"].items():
+    current_count = len(pattern.findall(pathlib.Path(source_file).read_text(encoding="utf-8")))
+    if current_count > approved_count:
+        print(
+            "Task 22 changes increase synchronization primitives in "
+            f"{source_file}: approved baseline {approved_count} -> {current_count}",
+            file=sys.stderr,
+        )
+        raise SystemExit(4)
+PY
 
 echo "TASK22_PREFLIGHT static=PASS"
 
@@ -75,7 +96,7 @@ if [[ "$MODE" == "local" ]]; then
     exit 0
 fi
 
-for command in git ray nvidia-smi timeout sha256sum; do
+for command in cmp git ray nvidia-smi timeout sha256sum; do
     if ! command -v "$command" >/dev/null 2>&1; then
         echo "Required formal-run command is missing: $command" >&2
         exit 4
@@ -89,6 +110,7 @@ if [[ "$gpu_count" != "4" ]]; then
 fi
 
 "$PYTHON_BIN" -c 'import ray, sglang'
+"$PYTHON_BIN" -m pytest -q tests/utils/test_metrics_service.py
 bash scripts/task22/prepare_rollout_observability.sh
 
 MODEL_DIR="${MODEL_DIR:?Set MODEL_DIR for formal preflight}"

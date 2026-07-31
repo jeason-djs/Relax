@@ -8,9 +8,11 @@ from relax.engine.rollout.admission import (
     AdmissionMode,
     DebtAwareAdmissionConfig,
     DebtAwareAdmissionController,
+    UnrecoverableFinalBackfillError,
     config_from_namespace,
     plan_next_admission,
     previous_partition_release_remaining,
+    require_final_backfill_deficit,
     split_transfer_counts,
     validate_admission_namespace,
 )
@@ -116,6 +118,20 @@ def test_admission_final_backfill_never_submits_past_available_debt() -> None:
     decision = _decide(controller, inflight=1, debt=3, available=2, eager=14)
 
     assert decision.actual_admit_groups == 2
+
+
+def test_process_restart_fails_closed_when_final_backfill_deficit_is_lost() -> None:
+    # The durable completion flag says train_7 is incomplete, while a restarted
+    # rollout process has lost GenerateState.last_step_current_deficit.
+    with pytest.raises(
+        UnrecoverableFinalBackfillError,
+        match=r"durable partition train_7 is incomplete.*in-memory deficit was lost",
+    ):
+        require_final_backfill_deficit(rollout_id=8, deficit_groups=0)
+
+
+def test_final_backfill_accepts_preserved_in_memory_deficit() -> None:
+    assert require_final_backfill_deficit(rollout_id=8, deficit_groups=3) == 3
 
 
 def test_admission_fail_open_preserves_eager_count_and_records_reason() -> None:

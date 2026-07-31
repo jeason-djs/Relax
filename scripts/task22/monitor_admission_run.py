@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import ast
 import csv
+import hashlib
 import json
 import math
 import os
@@ -14,9 +15,12 @@ import shlex
 import signal
 import time
 from collections import Counter
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+from relax.utils.task22_runtime_attestation import attestation_matches_contract
 
 
 TERMINAL_OUTCOMES = {
@@ -59,6 +63,10 @@ ENGINE_PID_RE = re.compile(r"\(SGLangEngine pid=(\d+)\)")
 BASE_GPU_RE = re.compile(r"\bbase_gpu_id=(\d+)")
 SERVER_EVENT_RE = re.compile(r"(\{.*\})\s*$")
 SERVER_ENVELOPE_TOLERANCE_S = 1.0
+MAX_RETAINED_DRIVER_BYTES = 32 * 1024 * 1024
+MAX_RETAINED_JSONL_ROWS = 1_000_000
+GPU_COVERAGE_TOLERANCE_S = 2.0
+DEFAULT_GPU_MAX_SNAPSHOT_INTERVAL_S = 2.0
 REQUIRED_ROLLOUT_METRICS = {
     "rollout/raw_reward",
     "rollout/response_lengths",
@@ -120,7 +128,12 @@ ONLINE_STRICT_CHECKS = {
     "request_attempt_ids_unique",
     "request_placement_is_off",
     "run_contract_matches_validator_arguments",
+    "run_contract_schema_is_current_v5",
     "run_contract_valid",
+    "runtime_attestations_match_contract",
+    "runtime_attestations_parseable",
+    "runtime_contract_content_hashes_valid",
+    "runtime_contract_fields_valid",
     "runtime_keyed_sync_id_sets_match",
     "slime_router_is_disabled",
     "timeline_event_intervals_valid",
@@ -159,6 +172,9 @@ FINAL_ONLY_STRICT_CHECKS = {
     "gate_ready_partition_is_candidate",
     "gpu_sample_present",
     "gpu_sampling_has_multiple_snapshots",
+    "input_manifest_attestations_parseable",
+    "input_manifest_before_after_match_contract",
+    "input_manifest_three_point_attestation_consistent",
     "observability_directory_present",
     "outcome_file_decision_physical_ids_match",
     "partition_close_flow_complete",
@@ -174,6 +190,7 @@ FINAL_ONLY_STRICT_CHECKS = {
     "request_file_physical_ids_match",
     "request_observability_passes",
     "run_directory_exists",
+    "runtime_attestation_roles_complete",
     "timeline_directory_present",
 }
 STRICT_CHECK_COVERAGE = {
@@ -186,11 +203,41 @@ class MonitorFailure(RuntimeError):
     pass
 
 
+@dataclass
+class FileCursor:
+    identity: tuple[int, int] | None = None
+    offset: int = 0
+    epoch: int = 0
+    partial: bytes = b""
+    ctime_ns: int = 0
+
+
+@dataclass
+class MonitorScanState:
+    """Incrementally retained evidence; epochs make every replay observable."""
+
+    driver_text: str = ""
+    driver_cursor: FileCursor = field(default_factory=FileCursor)
+    driver_bytes: int = 0
+    jsonl_cursors: dict[str, FileCursor] = field(default_factory=dict)
+    jsonl_rows: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    semantic_revision: int = 0
+    timeline_fingerprints: dict[int, str] = field(default_factory=dict)
+
+
 def _append_event(path: Path, event: str, **fields: Any) -> None:
     payload = {"timestamp": time.time(), "event": event, **fields}
     with path.open("a", encoding="utf-8") as output:
         output.write(json.dumps(payload, sort_keys=True) + "\n")
         output.flush()
+
+
+def _safe_append_event(path: Path, event: str, **fields: Any) -> bool:
+    try:
+        _append_event(path, event, **fields)
+    except OSError:
+        return False
+    return True
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -210,16 +257,193 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
-def _complete_driver_text(text: str) -> str:
+def _read_incremental_bytes(path: Path, cursor: FileCursor, *, final: bool) -> list[tuple[int, int, bytes]]:
+    """Read only new complete records, starting a new epoch after replacement/truncation."""
+
+    with path.open("rb") as source:
+        before = os.fstat(source.fileno())
+        identity = (before.st_dev, before.st_ino)
+        reset = cursor.identity is not None and (
+            identity != cursor.identity
+            or before.st_size < cursor.offset
+            # Detect truncate+rewrite-to-the-same-size between polls. ctime is
+            # not semantic progress; it only establishes a replay epoch when
+            # the opened file is otherwise exactly at the committed cursor.
+            or (
+                identity == cursor.identity
+                and before.st_size == cursor.offset
+                and before.st_ctime_ns != cursor.ctime_ns
+            )
+        )
+        if cursor.identity is None:
+            cursor.identity = identity
+        elif reset:
+            cursor.identity = identity
+            cursor.offset = 0
+            cursor.partial = b""
+            cursor.epoch += 1
+
+        start = cursor.offset
+        source.seek(start)
+        # Bound the read to the size observed on this opened descriptor.
+        # Bytes appended concurrently remain for the next poll instead of
+        # advancing the cursor beyond the metadata snapshot and looking like
+        # a same-size rewrite on that poll.
+        chunk = source.read(max(before.st_size - start, 0))
+        after = os.fstat(source.fileno())
+    cursor.offset = start + len(chunk)
+    cursor.ctime_ns = after.st_ctime_ns
+    data = cursor.partial + chunk
+    base_offset = start - len(cursor.partial)
+    if final:
+        complete, cursor.partial = data, b""
+    else:
+        newline = data.rfind(b"\n")
+        if newline < 0:
+            cursor.partial = data
+            return []
+        complete, cursor.partial = data[: newline + 1], data[newline + 1 :]
+
+    records: list[tuple[int, int, bytes]] = []
+    relative = 0
+    for raw in complete.splitlines(keepends=True):
+        payload = raw.rstrip(b"\r\n")
+        if payload.strip():
+            records.append((cursor.epoch, base_offset + relative, payload))
+        relative += len(raw)
+    return records
+
+
+def _read_retained_jsonl(
+    path: Path,
+    *,
+    final: bool,
+    state: MonitorScanState | None,
+    evidence_grace: float,
+    evidence_due_since: dict[str, float],
+    now_monotonic: float,
+) -> list[dict[str, Any]]:
+    if state is None:
+        return _read_jsonl(path)
+    key = str(path)
+    retained = state.jsonl_rows.setdefault(key, [])
+    cursor = state.jsonl_cursors.setdefault(key, FileCursor())
+    current: list[dict[str, Any]] = []
+    bad_offset: int | None = None
+    try:
+        records = _read_incremental_bytes(path, cursor, final=final)
+        for epoch, offset, raw in records:
+            bad_offset = offset
+            row = json.loads(raw.decode("utf-8"))
+            if not isinstance(row, dict):
+                raise MonitorFailure(f"non_object_jsonl:{path.name}:epoch={epoch}:offset={offset}")
+            row["_epoch"] = epoch
+            row["_offset"] = offset
+            row["_line_no"] = len(retained) + len(current) + 1
+            current.append(row)
+            bad_offset = None
+    except (UnicodeDecodeError, json.JSONDecodeError, MonitorFailure) as exc:
+        if current:
+            retained.extend(current)
+            state.semantic_revision += len(current)
+        if bad_offset is not None:
+            cursor.offset = bad_offset
+            cursor.partial = b""
+        reason = (
+            str(exc)
+            if isinstance(exc, MonitorFailure)
+            else f"malformed_jsonl:{path.name}:epoch={cursor.epoch}:offset={cursor.offset}:{exc}"
+        )
+        _defer_or_raise(
+            False,
+            key=f"jsonl:{key}",
+            reason=reason,
+            final=final,
+            evidence_grace=evidence_grace,
+            evidence_due_since=evidence_due_since,
+            now_monotonic=now_monotonic,
+        )
+        return retained
+    if current:
+        retained.extend(current)
+        state.semantic_revision += len(current)
+    if len(retained) > MAX_RETAINED_JSONL_ROWS:
+        raise MonitorFailure(f"jsonl_memory_limit:{path.name}:{len(retained)}")
+    if cursor.partial:
+        _defer_or_raise(
+            False,
+            key=f"jsonl:{key}",
+            reason=(
+                f"malformed_jsonl:{path.name}:epoch={cursor.epoch}:"
+                f"offset={cursor.offset - len(cursor.partial)}:incomplete_record"
+            ),
+            final=final,
+            evidence_grace=evidence_grace,
+            evidence_due_since=evidence_due_since,
+            now_monotonic=now_monotonic,
+        )
+        return retained
+    evidence_due_since.pop(f"jsonl:{key}", None)
+    return retained
+
+
+def _complete_driver_text(text: str, *, final: bool = False) -> str:
     """Discard the trailing fragment while another process may still append it."""
-    if text and not text.endswith(("\n", "\r")):
+    if not final and text and not text.endswith(("\n", "\r")):
         text = text.rsplit("\n", 1)[0] + ("\n" if "\n" in text else "")
     return text
 
 
-def _process_exists(pid: int) -> bool:
+def _process_start_identity(pid: int) -> str | None:
+    """Return an immutable per-process start identity (Linux procfs)."""
+
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except OSError:
+        # On non-procfs platforms, use the kernel start-time rendering. It is
+        # still tied to this PID incarnation and is only used for comparison.
+        try:
+            import subprocess
+
+            value = subprocess.run(
+                ["ps", "-o", "lstart=", "-p", str(pid)],
+                check=False,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+        except OSError:
+            return None
+        return value or None
+    # comm may contain spaces and ')'; fields after its final ')' start at #3.
+    suffix = stat.rsplit(")", 1)[1].split()
+    return suffix[19] if len(suffix) > 19 else None
+
+
+def _evidence_progress_token(run_dir: Path, state: MonitorScanState) -> tuple[Any, ...]:
+    # Deliberately excludes mtime/size. Only newly parsed complete evidence can
+    # reset the no-progress or post-exit stability clocks.
+    return (state.semantic_revision,)
+
+
+def _process_exists(pid: int, expected_identity: str | None = None) -> bool:
     try:
         os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        exists = True
+    else:
+        exists = True
+    if exists and expected_identity is not None:
+        return _process_start_identity(pid) == expected_identity
+    return exists
+
+
+def _process_group_exists(process_group_id: int | None) -> bool:
+    if process_group_id is None:
+        return False
+    try:
+        os.killpg(process_group_id, 0)
     except ProcessLookupError:
         return False
     except PermissionError:
@@ -227,19 +451,102 @@ def _process_exists(pid: int) -> bool:
     return True
 
 
-def _stop_process(pid: int, process_group_id: int | None) -> None:
+def _stop_process(
+    pid: int,
+    process_group_id: int | None,
+    *,
+    expected_identity: str | None = None,
+    term_timeout: float = 10.0,
+    poll_interval: float = 0.1,
+) -> None:
+    leader_exists = _process_exists(pid)
+    if (
+        leader_exists
+        and expected_identity is not None
+        and _process_start_identity(pid) != expected_identity
+    ):
+        raise MonitorFailure(f"pid_identity_mismatch:pid={pid}")
+
+    def target_exists() -> bool:
+        try:
+            if process_group_id is not None:
+                os.killpg(process_group_id, 0)
+                return True
+            return _process_exists(pid, expected_identity)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+
     try:
         if process_group_id is not None:
-            actual_group = os.getpgid(pid)
-            if actual_group != process_group_id or actual_group != pid:
-                raise MonitorFailure(
-                    f"unsafe_process_group:pid={pid}:expected={process_group_id}:actual={actual_group}"
-                )
+            try:
+                actual_group = os.getpgid(pid)
+            except ProcessLookupError:
+                actual_group = None
+            if actual_group is not None:
+                if actual_group != process_group_id or actual_group != pid:
+                    raise MonitorFailure(
+                        f"unsafe_process_group:pid={pid}:expected={process_group_id}:actual={actual_group}"
+                    )
+            elif not _process_group_exists(process_group_id):
+                return
             os.killpg(process_group_id, signal.SIGTERM)
         else:
             os.kill(pid, signal.SIGTERM)
     except ProcessLookupError:
         return
+    deadline = time.monotonic() + max(term_timeout, 0.0)
+    while target_exists() and time.monotonic() < deadline:
+        time.sleep(min(poll_interval, max(deadline - time.monotonic(), 0.0)))
+    if not target_exists():
+        return
+    # Re-verify the leader incarnation immediately before escalation. If the
+    # leader is gone, the still-existing group itself prevents PGID reuse.
+    if expected_identity is not None and _process_exists(pid):
+        if _process_start_identity(pid) != expected_identity:
+            raise MonitorFailure(f"pid_identity_mismatch_before_kill:pid={pid}")
+        if process_group_id is not None and os.getpgid(pid) != process_group_id:
+            raise MonitorFailure(f"process_group_changed_before_kill:pid={pid}")
+    try:
+        if process_group_id is not None:
+            os.killpg(process_group_id, signal.SIGKILL)
+        else:
+            if expected_identity is not None and _process_start_identity(pid) != expected_identity:
+                raise MonitorFailure(f"pid_identity_mismatch:pid={pid}")
+            os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+
+
+def _read_incremental_driver(path: Path, state: MonitorScanState, *, final: bool) -> str:
+    if not path.is_file():
+        return state.driver_text
+    records = _read_incremental_bytes(path, state.driver_cursor, final=final)
+    if not records:
+        return state.driver_text
+    decoded = []
+    for _, _, raw in records:
+        decoded.append(raw.decode("utf-8", errors="replace") + "\n")
+    addition = "".join(decoded)
+    state.driver_bytes += len(addition.encode("utf-8"))
+    if state.driver_bytes > MAX_RETAINED_DRIVER_BYTES:
+        raise MonitorFailure(f"driver_memory_limit:{state.driver_bytes}")
+    state.driver_text += addition
+    state.semantic_revision += sum(
+        1
+        for line in decoded
+        if (
+            "TASK22_EVENT " in line
+            or "TASK22_FLOW " in line
+            or METRIC_STEP_RE.search(line)
+            or (
+                ENGINE_PID_RE.search(line)
+                and (BASE_GPU_RE.search(line) or SERVER_EVENT_RE.search(line))
+            )
+        )
+    )
+    return state.driver_text
 
 
 def _completed_metric_steps(driver_log: Path) -> set[int]:
@@ -347,6 +654,7 @@ def _validate_contract(
     admission_slack: int,
     headline_lo: int,
     headline_hi: int,
+    final: bool = False,
 ) -> None:
     contract = _load_contract(run_dir / "run_contract.json")
     expected = {
@@ -370,6 +678,40 @@ def _validate_contract(
     }
     if mismatches:
         raise MonitorFailure(f"run_contract_mismatch:{mismatches}")
+    if contract.get("schema_version", 0) < 3:
+        return
+    working_dir = contract.get("working_dir")
+    runtime_hash = contract.get("runtime_env_json_sha256")
+    if (
+        not isinstance(working_dir, str)
+        or not Path(working_dir).is_absolute()
+        or not isinstance(runtime_hash, str)
+        or len(runtime_hash) != 64
+    ):
+        raise MonitorFailure("invalid_runtime_contract_fields")
+    attestation_dir = Path(
+        os.environ.get(
+            "TASK22_RUNTIME_ATTESTATION_DIR",
+            str(run_dir / "runtime_attestation"),
+        )
+    )
+    roles = Counter()
+    for path in sorted(attestation_dir.glob("runtime_attestation_*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise MonitorFailure(f"invalid_runtime_attestation:{path.name}:{exc}") from exc
+        if not isinstance(payload, dict):
+            raise MonitorFailure(f"invalid_runtime_attestation:{path.name}:not_object")
+        if not attestation_matches_contract(payload, contract):
+            raise MonitorFailure(
+                "runtime_attestation_contract_mismatch:"
+                f"{path.name}:submitted_working_dir={working_dir}:"
+                f"runtime_working_dir={payload.get('working_dir')}"
+            )
+        roles[payload.get("role")] += 1
+    if final and (roles["driver"] != 1 or roles["ray_worker"] < 1):
+        raise MonitorFailure(f"incomplete_runtime_attestation_roles:{dict(roles)}")
 
 
 def _parse_metric_rows(text: str, pattern: re.Pattern[str]) -> dict[int, list[dict[str, Any]]]:
@@ -425,27 +767,63 @@ def _gpu_number(value: str, suffix: str) -> float:
     return number
 
 
-def _gpu_snapshot_status(path: Path, expected_gpu_count: int) -> tuple[int, str | None]:
+def _gpu_snapshot_status(
+    path: Path, expected_gpu_count: int
+) -> tuple[int, float | None, float | None, float, str | None]:
     if not path.is_file():
-        return 0, "missing GPU sampler output"
+        return 0, None, None, 0.0, "missing GPU sampler output"
     lines = [line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
     snapshots = 0
+    first_timestamp = None
+    last_timestamp = None
+    max_interval = 0.0
     offset = 0
     while offset < len(lines):
         match = GPU_TIMESTAMP_RE.fullmatch(lines[offset].strip())
         if match is None:
-            return snapshots, f"line={offset + 1}:invalid timestamp"
+            return (
+                snapshots,
+                first_timestamp,
+                last_timestamp,
+                max_interval,
+                f"line={offset + 1}:invalid timestamp",
+            )
         fraction = (match.group(2) or "0")[:6].ljust(6, "0")
         try:
-            datetime.strptime(
+            parsed_timestamp = datetime.strptime(
                 f"{match.group(1)}.{fraction}{match.group(3)}",
                 "%Y-%m-%dT%H:%M:%S.%f%z",
-            )
+            ).timestamp()
         except ValueError as exc:
-            return snapshots, f"line={offset + 1}:invalid timestamp:{exc}"
+            return (
+                snapshots,
+                first_timestamp,
+                last_timestamp,
+                max_interval,
+                f"line={offset + 1}:invalid timestamp:{exc}",
+            )
+        if last_timestamp is not None:
+            interval = parsed_timestamp - last_timestamp
+            if interval <= 0:
+                return (
+                    snapshots,
+                    first_timestamp,
+                    last_timestamp,
+                    max_interval,
+                    f"line={offset + 1}:timestamps not strictly increasing",
+                )
+            max_interval = max(max_interval, interval)
+        first_timestamp = parsed_timestamp if first_timestamp is None else first_timestamp
+        last_timestamp = parsed_timestamp
         offset += 1
         if len(lines) - offset < expected_gpu_count:
-            return snapshots, f"line={offset + 1}:incomplete GPU snapshot"
+            return (
+                snapshots,
+                first_timestamp,
+                last_timestamp,
+                max_interval,
+                f"line={offset + 1}:incomplete GPU snapshot",
+            )
         indices = set()
         for _ in range(expected_gpu_count):
             try:
@@ -465,12 +843,24 @@ def _gpu_snapshot_status(path: Path, expected_gpu_count: int) -> tuple[int, str 
                     raise ValueError("utilization outside [0,100]")
                 indices.add(index)
             except (ValueError, csv.Error) as exc:
-                return snapshots, f"line={offset + 1}:{exc}"
+                return (
+                    snapshots,
+                    first_timestamp,
+                    last_timestamp,
+                    max_interval,
+                    f"line={offset + 1}:{exc}",
+                )
             offset += 1
         if len(indices) != expected_gpu_count:
-            return snapshots, f"snapshot={snapshots}:GPU count={len(indices)}"
+            return (
+                snapshots,
+                first_timestamp,
+                last_timestamp,
+                max_interval,
+                f"snapshot={snapshots}:GPU count={len(indices)}",
+            )
         snapshots += 1
-    return snapshots, None
+    return snapshots, first_timestamp, last_timestamp, max_interval, None
 
 
 def _validate_gpu_snapshots(
@@ -481,8 +871,15 @@ def _validate_gpu_snapshots(
     evidence_grace: float,
     evidence_due_since: dict[str, float],
     now_monotonic: float,
+    run_started_at: float | None = None,
+    run_ended_at: float | None = None,
+    wall_time: float | None = None,
+    max_snapshot_age: float | None = None,
+    max_snapshot_interval: float = DEFAULT_GPU_MAX_SNAPSHOT_INTERVAL_S,
 ) -> None:
-    snapshots, error = _gpu_snapshot_status(path, expected_engines * 2)
+    snapshots, first_timestamp, last_timestamp, observed_max_interval, error = _gpu_snapshot_status(
+        path, expected_engines * 2
+    )
     _defer_or_raise(
         error is None,
         key="gpu_snapshot",
@@ -494,6 +891,35 @@ def _validate_gpu_snapshots(
     )
     if final and snapshots < 2:
         raise MonitorFailure(f"insufficient_gpu_snapshots:{snapshots}")
+    if error is not None or last_timestamp is None:
+        return
+    if observed_max_interval > max_snapshot_interval:
+        raise MonitorFailure(
+            f"gpu_snapshot_gap:observed={observed_max_interval:.3f}:"
+            f"max={max_snapshot_interval:.3f}"
+        )
+    if (
+        run_started_at is not None
+        and first_timestamp is not None
+        and first_timestamp > run_started_at + GPU_COVERAGE_TOLERANCE_S
+    ):
+        raise MonitorFailure(
+            f"gpu_coverage_starts_late:first={first_timestamp}:run={run_started_at}"
+        )
+    if run_ended_at is not None and last_timestamp < run_ended_at - GPU_COVERAGE_TOLERANCE_S:
+        raise MonitorFailure(
+            f"gpu_coverage_ends_early:last={last_timestamp}:run={run_ended_at}"
+        )
+    if (
+        not final
+        and wall_time is not None
+        and max_snapshot_age is not None
+        and wall_time - last_timestamp > max_snapshot_age
+    ):
+        raise MonitorFailure(
+            f"stale_gpu_snapshot:age={wall_time - last_timestamp:.3f}:"
+            f"max={max_snapshot_age:.3f}"
+        )
 
 
 def _valid_timeline(payload: Any) -> bool:
@@ -532,15 +958,27 @@ def _validate_timelines(
     evidence_grace: float,
     evidence_due_since: dict[int, float],
     now_monotonic: float,
+    driver_text: str | None = None,
+    scan_state: MonitorScanState | None = None,
 ) -> None:
-    completed = _completed_metric_steps(driver_log)
+    if driver_text is None:
+        completed = _completed_metric_steps(driver_log)
+    else:
+        categories_by_step: dict[int, set[str]] = {}
+        for match in METRIC_STEP_RE.finditer(driver_text):
+            category = "train" if match.group(1) == "step" else match.group(1)
+            categories_by_step.setdefault(int(match.group(2)), set()).add(category)
+        completed = {
+            step
+            for step, categories in categories_by_step.items()
+            if {"rollout", "train", "perf"} <= categories
+        }
     for step in range(headline_lo, headline_hi + 1):
         # Async steps may log out of order. A timeline becomes due only once
         # rollout, train, and perf metrics for that same step have all arrived.
         due = final or step in completed
         path = timeline_dir / f"timeline_step_{step}.json"
         if not due:
-            evidence_due_since.pop(step, None)
             continue
         if not path.is_file():
             if final:
@@ -549,13 +987,37 @@ def _validate_timelines(
             if now_monotonic - first_due >= evidence_grace:
                 raise MonitorFailure(f"missing_headline_timeline:step={step}")
             continue
-        evidence_due_since.pop(step, None)
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
+            raw = path.read_bytes()
+            payload = json.loads(raw)
         except (OSError, json.JSONDecodeError) as exc:
-            raise MonitorFailure(f"invalid_headline_timeline:step={step}:{exc}") from exc
+            _defer_or_raise(
+                False,
+                key=step,
+                reason=f"invalid_headline_timeline:step={step}:{exc}",
+                final=final,
+                evidence_grace=evidence_grace,
+                evidence_due_since=evidence_due_since,
+                now_monotonic=now_monotonic,
+            )
+            continue
         if not _valid_timeline(payload):
-            raise MonitorFailure(f"invalid_headline_timeline:step={step}:format")
+            _defer_or_raise(
+                False,
+                key=step,
+                reason=f"invalid_headline_timeline:step={step}:format",
+                final=final,
+                evidence_grace=evidence_grace,
+                evidence_due_since=evidence_due_since,
+                now_monotonic=now_monotonic,
+            )
+            continue
+        evidence_due_since.pop(step, None)
+        if scan_state is not None:
+            fingerprint = hashlib.sha256(raw).hexdigest()
+            if scan_state.timeline_fingerprints.get(step) != fingerprint:
+                scan_state.timeline_fingerprints[step] = fingerprint
+                scan_state.semantic_revision += 1
 
 
 def _require_unique(rows: list[dict[str, Any]], key: str, label: str) -> None:
@@ -902,20 +1364,13 @@ def _scan(
     timeline_evidence_due_since: dict[int, float] | None = None,
     strict_evidence_due_since: dict[str, float] | None = None,
     now_monotonic: float | None = None,
+    scan_state: MonitorScanState | None = None,
+    run_started_at: float | None = None,
+    run_ended_at: float | None = None,
+    wall_time: float | None = None,
+    gpu_max_snapshot_age: float | None = None,
+    gpu_max_snapshot_interval: float = DEFAULT_GPU_MAX_SNAPSHOT_INTERVAL_S,
 ) -> None:
-    if (admission_min, admission_max, admission_slack) != (4, 8, 2):
-        raise MonitorFailure(
-            f"invalid_4_8_2_contract:{admission_min}:{admission_max}:{admission_slack}"
-        )
-    if expected_samples_per_partition != 64:
-        raise MonitorFailure(
-            f"invalid_partition_contract:{expected_samples_per_partition}:expected=64"
-        )
-    if max_staleness != 2:
-        raise MonitorFailure(f"invalid_staleness_contract:{max_staleness}:expected=2")
-    if expected_engines != 2:
-        raise MonitorFailure(f"invalid_engine_contract:{expected_engines}:expected=2")
-
     _validate_contract(
         run_dir,
         expected_mode=expected_mode,
@@ -928,14 +1383,21 @@ def _scan(
         admission_slack=admission_slack,
         headline_lo=headline_lo,
         headline_hi=headline_hi,
+        final=final,
     )
 
     driver_log = run_dir / "driver.log"
-    driver_text = (
-        _complete_driver_text(driver_log.read_text(encoding="utf-8", errors="replace"))
-        if driver_log.is_file()
-        else ""
-    )
+    if scan_state is None:
+        driver_text = (
+            _complete_driver_text(
+                driver_log.read_text(encoding="utf-8", errors="replace"),
+                final=final,
+            )
+            if driver_log.is_file()
+            else ""
+        )
+    else:
+        driver_text = _read_incremental_driver(driver_log, scan_state, final=final)
     fatal = FATAL_RE.search(driver_text)
     if fatal:
         raise MonitorFailure(f"fatal_driver_log:{fatal.group(0).strip()}")
@@ -1005,7 +1467,14 @@ def _scan(
                 and not (final or artifact_id in completed_physical)
             ):
                 continue
-            rows = _read_jsonl(path)
+            rows = _read_retained_jsonl(
+                path,
+                final=final,
+                state=scan_state,
+                evidence_grace=evidence_grace,
+                evidence_due_since=strict_due_since,
+                now_monotonic=scan_monotonic,
+            )
             if path.name.startswith("request_lifecycle_rollout_"):
                 if any(row.get("physical_rollout_id") != artifact_id for row in rows):
                     raise MonitorFailure(f"request_file_physical_id_mismatch:{path.name}")
@@ -1261,6 +1730,11 @@ def _scan(
         evidence_grace=evidence_grace,
         evidence_due_since=strict_due_since,
         now_monotonic=scan_monotonic,
+        run_started_at=run_started_at,
+        run_ended_at=run_ended_at,
+        wall_time=wall_time,
+        max_snapshot_age=gpu_max_snapshot_age,
+        max_snapshot_interval=gpu_max_snapshot_interval,
     )
 
     due_since = timeline_evidence_due_since if timeline_evidence_due_since is not None else {}
@@ -1273,6 +1747,8 @@ def _scan(
         evidence_grace=evidence_grace,
         evidence_due_since=due_since,
         now_monotonic=scan_monotonic,
+        driver_text=driver_text,
+        scan_state=scan_state,
     )
 
 
@@ -1293,15 +1769,94 @@ def monitor(
     headline_hi: int,
     poll_interval: float,
     evidence_grace: float,
+    pid_start_identity: str | None = None,
+    no_progress_timeout: float = 300.0,
+    post_exit_grace: float | None = None,
+    term_timeout: float = 10.0,
+    sampler_pid: int | None = None,
+    sampler_start_identity: str | None = None,
+    run_started_at: float | None = None,
+    gpu_max_snapshot_age: float = 5.0,
+    gpu_max_snapshot_interval: float = DEFAULT_GPU_MAX_SNAPSHOT_INTERVAL_S,
 ) -> int:
+    if (admission_min, admission_max, admission_slack) != (4, 8, 2):
+        raise MonitorFailure(
+            f"invalid_4_8_2_contract:{admission_min}:{admission_max}:{admission_slack}"
+        )
+    if expected_samples_per_partition != 64:
+        raise MonitorFailure(
+            f"invalid_partition_contract:{expected_samples_per_partition}:expected=64"
+        )
+    if max_staleness != 2:
+        raise MonitorFailure(f"invalid_staleness_contract:{max_staleness}:expected=2")
+    if expected_engines != 2:
+        raise MonitorFailure(f"invalid_engine_contract:{expected_engines}:expected=2")
+
     event_log = run_dir / "online_monitor.jsonl"
     reported_lifecycle: set[tuple[str, int]] = set()
     timeline_evidence_due_since: dict[int, float] = {}
     strict_evidence_due_since: dict[str, float] = {}
-    _append_event(event_log, "monitor_started", pid=pid)
+    scan_state = MonitorScanState()
+    expected_identity = pid_start_identity or _process_start_identity(pid)
+    expected_sampler_identity = (
+        sampler_start_identity
+        or (_process_start_identity(sampler_pid) if sampler_pid is not None else None)
+    )
+    stable_grace = evidence_grace if post_exit_grace is None else post_exit_grace
+    last_progress_at = time.monotonic()
+    last_progress_token: tuple[Any, ...] | None = None
+    exit_stable_since: float | None = None
+    exit_quiet_scans = 0
+    run_ended_at: float | None = None
+    _safe_append_event(
+        event_log,
+        "monitor_started",
+        pid=pid,
+        pid_start_identity=expected_identity,
+        sampler_pid=sampler_pid,
+        sampler_start_identity=expected_sampler_identity,
+    )
     while True:
-        running = _process_exists(pid)
+        now = time.monotonic()
+        pid_present = _process_exists(pid)
+        identity = _process_start_identity(pid) if pid_present else None
+        identity_changed = (
+            pid_present
+            and expected_identity is not None
+            and identity != expected_identity
+        )
+        group_present = pid_present or (
+            _process_group_exists(process_group_id)
+            if process_group_id is not None
+            else False
+        )
+        running = group_present and not identity_changed
+        sampler_running = (
+            True
+            if sampler_pid is None
+            else _process_exists(sampler_pid, expected_sampler_identity)
+        )
+        progress_token = _evidence_progress_token(run_dir, scan_state)
+        if progress_token != last_progress_token:
+            last_progress_token = progress_token
+            last_progress_at = now
+            if exit_stable_since is not None:
+                exit_stable_since = now
+        if running:
+            exit_stable_since = None
+            exit_quiet_scans = 0
+            run_ended_at = None
+        elif exit_stable_since is None:
+            exit_stable_since = now
+            run_ended_at = time.time()
         try:
+            if identity_changed:
+                raise MonitorFailure(
+                    f"pid_identity_changed:pid={pid}:expected={expected_identity}:actual={identity}"
+                )
+            if not sampler_running:
+                raise MonitorFailure(f"gpu_sampler_not_running:pid={sampler_pid}")
+            revision_before_scan = scan_state.semantic_revision
             _scan(
                 run_dir,
                 expected_mode=expected_mode,
@@ -1314,26 +1869,102 @@ def monitor(
                 admission_slack=admission_slack,
                 headline_lo=headline_lo,
                 headline_hi=headline_hi,
-                final=not running,
+                final=False,
                 reported_lifecycle=reported_lifecycle,
                 event_log=event_log,
                 evidence_grace=evidence_grace,
                 timeline_evidence_due_since=timeline_evidence_due_since,
                 strict_evidence_due_since=strict_evidence_due_since,
+                now_monotonic=now,
+                scan_state=scan_state,
+                run_started_at=run_started_at,
+                run_ended_at=run_ended_at,
+                wall_time=time.time(),
+                gpu_max_snapshot_age=gpu_max_snapshot_age,
+                gpu_max_snapshot_interval=gpu_max_snapshot_interval,
             )
+            # Scan before enforcing the deadline so a complete semantic record
+            # already on disk at the boundary gets counted.
+            scanned_token = _evidence_progress_token(run_dir, scan_state)
+            if scanned_token != last_progress_token:
+                last_progress_token = scanned_token
+                last_progress_at = now
+                if exit_stable_since is not None:
+                    exit_stable_since = now
+            semantic_progress = scan_state.semantic_revision != revision_before_scan
+            final = False
+            if not running:
+                if semantic_progress:
+                    exit_quiet_scans = 0
+                else:
+                    exit_quiet_scans += 1
+                    if exit_quiet_scans >= 1 and now - exit_stable_since >= stable_grace:
+                        final_revision = scan_state.semantic_revision
+                        _scan(
+                            run_dir,
+                            expected_mode=expected_mode,
+                            expected_rollouts=expected_rollouts,
+                            expected_samples_per_partition=expected_samples_per_partition,
+                            expected_engines=expected_engines,
+                            max_staleness=max_staleness,
+                            admission_min=admission_min,
+                            admission_max=admission_max,
+                            admission_slack=admission_slack,
+                            headline_lo=headline_lo,
+                            headline_hi=headline_hi,
+                            final=True,
+                            reported_lifecycle=reported_lifecycle,
+                            event_log=event_log,
+                            evidence_grace=evidence_grace,
+                            timeline_evidence_due_since=timeline_evidence_due_since,
+                            strict_evidence_due_since=strict_evidence_due_since,
+                            now_monotonic=now,
+                            scan_state=scan_state,
+                            run_started_at=run_started_at,
+                            run_ended_at=run_ended_at,
+                            wall_time=time.time(),
+                            gpu_max_snapshot_age=gpu_max_snapshot_age,
+                            gpu_max_snapshot_interval=gpu_max_snapshot_interval,
+                        )
+                        if scan_state.semantic_revision != final_revision:
+                            last_progress_token = _evidence_progress_token(run_dir, scan_state)
+                            last_progress_at = now
+                            exit_stable_since = now
+                            exit_quiet_scans = 0
+                        else:
+                            final = True
+            if running and now - last_progress_at >= no_progress_timeout:
+                raise MonitorFailure(f"no_evidence_progress:{no_progress_timeout:g}s")
         except (MonitorFailure, OSError) as exc:
             reason = str(exc)
-            _append_event(event_log, "monitor_failed", reason=reason)
+            audit_written = _safe_append_event(event_log, "monitor_failed", reason=reason)
             if running:
                 try:
-                    _stop_process(pid, process_group_id)
+                    _stop_process(
+                        pid,
+                        process_group_id,
+                        expected_identity=expected_identity,
+                        term_timeout=term_timeout,
+                        poll_interval=min(poll_interval, 0.1),
+                    )
                 except MonitorFailure as stop_exc:
-                    _append_event(event_log, "training_stop_rejected", pid=pid, reason=str(stop_exc))
+                    _safe_append_event(
+                        event_log,
+                        "training_stop_rejected",
+                        pid=pid,
+                        reason=str(stop_exc),
+                    )
                 else:
-                    _append_event(event_log, "training_stop_requested", pid=pid, reason=reason)
+                    _safe_append_event(
+                        event_log,
+                        "training_stop_requested",
+                        pid=pid,
+                        reason=reason,
+                        failure_audit_written=audit_written,
+                    )
             return 4
-        if not running:
-            _append_event(event_log, "monitor_passed")
+        if final:
+            _safe_append_event(event_log, "monitor_passed")
             return 0
         time.sleep(poll_interval)
 
@@ -1355,6 +1986,19 @@ def main() -> None:
     parser.add_argument("--headline-hi", type=int, required=True)
     parser.add_argument("--poll-interval", type=float, default=1.0)
     parser.add_argument("--evidence-grace", type=float, default=5.0)
+    parser.add_argument("--pid-start-identity")
+    parser.add_argument("--sampler-pid", type=int)
+    parser.add_argument("--sampler-start-identity")
+    parser.add_argument("--run-started-at", type=float)
+    parser.add_argument("--gpu-max-snapshot-age", type=float, default=5.0)
+    parser.add_argument(
+        "--gpu-max-snapshot-interval",
+        type=float,
+        default=DEFAULT_GPU_MAX_SNAPSHOT_INTERVAL_S,
+    )
+    parser.add_argument("--no-progress-timeout", type=float, default=300.0)
+    parser.add_argument("--post-exit-grace", type=float)
+    parser.add_argument("--term-timeout", type=float, default=10.0)
     args = parser.parse_args()
     if args.pid <= 0:
         parser.error("--pid must be positive")
@@ -1362,6 +2006,18 @@ def main() -> None:
         parser.error("--poll-interval must be positive")
     if args.evidence_grace < 5.0:
         parser.error("--evidence-grace must be at least 5 seconds")
+    if args.no_progress_timeout <= 0:
+        parser.error("--no-progress-timeout must be positive")
+    if args.post_exit_grace is not None and args.post_exit_grace < 0:
+        parser.error("--post-exit-grace must be non-negative")
+    if args.term_timeout < 0:
+        parser.error("--term-timeout must be non-negative")
+    if args.sampler_pid is not None and args.sampler_pid <= 0:
+        parser.error("--sampler-pid must be positive")
+    if args.gpu_max_snapshot_age <= 0:
+        parser.error("--gpu-max-snapshot-age must be positive")
+    if args.gpu_max_snapshot_interval <= 0:
+        parser.error("--gpu-max-snapshot-interval must be positive")
     if args.headline_lo < 0 or args.headline_hi < args.headline_lo:
         parser.error("invalid headline range")
     if (
@@ -1393,6 +2049,15 @@ def main() -> None:
             headline_hi=args.headline_hi,
             poll_interval=args.poll_interval,
             evidence_grace=args.evidence_grace,
+            pid_start_identity=args.pid_start_identity,
+            no_progress_timeout=args.no_progress_timeout,
+            post_exit_grace=args.post_exit_grace,
+            term_timeout=args.term_timeout,
+            sampler_pid=args.sampler_pid,
+            sampler_start_identity=args.sampler_start_identity,
+            run_started_at=args.run_started_at,
+            gpu_max_snapshot_age=args.gpu_max_snapshot_age,
+            gpu_max_snapshot_interval=args.gpu_max_snapshot_interval,
         )
     )
 

@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from relax.engine.rollout.request_observability import attempt_token_from_id
+from relax.utils.task22_runtime_attestation import attestation_matches_contract
 from scripts.task22.analyze_rollout_observability import analyze as analyze_requests
 
 
@@ -50,6 +51,7 @@ ATTEMPT_OUTCOMES = {
 SYNC_EVENT_PHASES = {"gate", "pause", "flush", "transfer", "continue"}
 EVENT_PHASES = SYNC_EVENT_PHASES | {"abort"}
 FLOW_PHASES = {"gate_blocked", "gate_ready", "physical_start", "physical_end", "partition_close"}
+RUN_CONTRACT_SCHEMA_VERSION = 5
 
 
 class Validation:
@@ -302,6 +304,14 @@ def validate_run(
         validation.check("run_contract_valid", False, {"path": str(contract_path), "error": str(exc)})
     else:
         validation.check("run_contract_valid", True)
+    validation.check(
+        "run_contract_schema_is_current_v5",
+        contract.get("schema_version") == RUN_CONTRACT_SCHEMA_VERSION,
+        {
+            "expected": RUN_CONTRACT_SCHEMA_VERSION,
+            "actual": contract.get("schema_version"),
+        },
+    )
     expected_contract = {
         "admission_mode": expected_mode,
         "num_rollout": expected_rollouts,
@@ -340,6 +350,94 @@ def validate_run(
         contract.get("use_slime_router") is False,
         contract.get("use_slime_router"),
     )
+    if contract.get("schema_version") == RUN_CONTRACT_SCHEMA_VERSION:
+        validation.check(
+            "runtime_contract_fields_valid",
+            isinstance(contract.get("working_dir"), str)
+            and Path(contract["working_dir"]).is_absolute()
+            and isinstance(contract.get("runtime_env_json_sha256"), str)
+            and len(contract["runtime_env_json_sha256"]) == 64,
+        )
+        if contract.get("schema_version") == RUN_CONTRACT_SCHEMA_VERSION:
+            content_hashes_valid = all(
+                isinstance(contract.get(name), str) and len(contract[name]) == 64
+                for name in ("working_dir_content_sha256", "input_manifest_sha256")
+            )
+            validation.check("runtime_contract_content_hashes_valid", content_hashes_valid)
+            phase_hashes = {}
+            for phase in ("before", "after"):
+                path = run_dir / f"input_manifest_{phase}.json"
+                try:
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                    phase_hashes[phase] = payload["manifest_sha256"]
+                except (OSError, KeyError, TypeError, json.JSONDecodeError) as exc:
+                    validation.check(
+                        "input_manifest_attestations_parseable",
+                        False,
+                        {"path": str(path), "error": str(exc)},
+                    )
+                else:
+                    validation.check("input_manifest_attestations_parseable", True)
+            validation.check(
+                "input_manifest_before_after_match_contract",
+                phase_hashes.get("before")
+                == phase_hashes.get("after")
+                == contract.get("input_manifest_sha256"),
+                {
+                    "before": phase_hashes.get("before"),
+                    "training_contract": contract.get("input_manifest_sha256"),
+                    "after": phase_hashes.get("after"),
+                },
+            )
+        attestation_dir = run_dir / "runtime_attestation"
+        attestation_paths = sorted(attestation_dir.glob("runtime_attestation_*.json"))
+        attestations = []
+        for path in attestation_paths:
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(payload, dict):
+                    raise ValueError("attestation must be a JSON object")
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                validation.check(
+                    "runtime_attestations_parseable",
+                    False,
+                    {"path": str(path), "error": str(exc)},
+                )
+                continue
+            attestations.append(payload)
+            validation.check("runtime_attestations_parseable", True)
+            validation.check(
+                "runtime_attestations_match_contract",
+                attestation_matches_contract(payload, contract),
+                {
+                    "path": str(path),
+                    "role": payload.get("role"),
+                    "submitted_working_dir": contract.get("working_dir"),
+                    "runtime_working_dir": payload.get("working_dir"),
+                },
+            )
+        roles = Counter(item.get("role") for item in attestations)
+        validation.check(
+            "runtime_attestation_roles_complete",
+            roles["driver"] == 1 and roles["ray_worker"] >= 1,
+            dict(roles),
+        )
+        if contract.get("schema_version") == RUN_CONTRACT_SCHEMA_VERSION:
+            runtime_input_hashes = {
+                item.get("input_manifest", {}).get("sha256") for item in attestations
+            }
+            validation.check(
+                "input_manifest_three_point_attestation_consistent",
+                runtime_input_hashes == {contract.get("input_manifest_sha256")}
+                and phase_hashes.get("before")
+                == phase_hashes.get("after")
+                == contract.get("input_manifest_sha256"),
+                {
+                    "before": phase_hashes.get("before"),
+                    "runtime": sorted(value for value in runtime_input_hashes if value),
+                    "after": phase_hashes.get("after"),
+                },
+            )
 
     exit_code_path = run_dir / "EXIT_CODE"
     try:

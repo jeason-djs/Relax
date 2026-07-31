@@ -197,26 +197,50 @@ def _build_valid_run(tmp_path: Path) -> Path:
     _jsonl(observability / "consumption_ledger_rollout_0_rank_0.jsonl", [_consume_row()])
     (run_dir / "driver.log").write_text("\n".join(_driver_lines()) + "\n", encoding="utf-8")
     (run_dir / "EXIT_CODE").write_text("0\n", encoding="utf-8")
-    (run_dir / "run_contract.json").write_text(
-        json.dumps(
-            {
-                "admission_mode": "shadow",
-                "num_rollout": 1,
-                "expected_samples_per_partition": 1,
-                "expected_engines": 1,
-                "max_staleness": 2,
-                "headline_lo": 0,
-                "headline_hi": 0,
-                "admission_min": 4,
-                "admission_max": 8,
-                "admission_slack": 2,
-                "request_placement_mode": "off",
-                "use_slime_router": False,
-            }
+    digest = "a" * 64
+    contract = {
+        "schema_version": 5,
+        "admission_mode": "shadow",
+        "num_rollout": 1,
+        "expected_samples_per_partition": 1,
+        "expected_engines": 1,
+        "max_staleness": 2,
+        "headline_lo": 0,
+        "headline_hi": 0,
+        "admission_min": 4,
+        "admission_max": 8,
+        "admission_slack": 2,
+        "request_placement_mode": "off",
+        "use_slime_router": False,
+        "working_dir": str(run_dir.resolve()),
+        "working_dir_content_sha256": digest,
+        "runtime_env_json_sha256": digest,
+        "input_manifest_sha256": digest,
+        "training_python": {},
+        "sglang_source_sha256": {},
+    }
+    (run_dir / "run_contract.json").write_text(json.dumps(contract) + "\n", encoding="utf-8")
+    for phase in ("before", "after"):
+        (run_dir / f"input_manifest_{phase}.json").write_text(
+            json.dumps({"manifest_sha256": digest}) + "\n",
+            encoding="utf-8",
         )
-        + "\n",
-        encoding="utf-8",
-    )
+    attestation_dir = run_dir / "runtime_attestation"
+    attestation_dir.mkdir()
+    for role in ("driver", "ray_worker"):
+        attestation = {
+            "role": role,
+            "working_dir": contract["working_dir"],
+            "working_dir_content_sha256": digest,
+            "runtime_env_json_sha256": digest,
+            "python": {},
+            "sglang_source_sha256": {},
+            "input_manifest": {"sha256": digest},
+        }
+        (attestation_dir / f"runtime_attestation_{role}.json").write_text(
+            json.dumps(attestation) + "\n",
+            encoding="utf-8",
+        )
     (timeline / "timeline_step_0.json").write_text(
         '[{"name":"train","ph":"X","ts":1000,"dur":10,"pid":1,"tid":2}]\n',
         encoding="utf-8",
@@ -255,6 +279,32 @@ def test_admission_run_validator_accepts_complete_evidence(tmp_path) -> None:
     assert result["counts"]["consumption_rows"] == 1
     assert result["checks"]["unique_bootstrap_sync_cycle"]
     assert result["checks"]["runtime_keyed_sync_id_sets_match"]
+
+
+def test_admission_run_validator_accepts_ray_unpack_path_with_matching_content_hash(tmp_path) -> None:
+    run_dir = _build_valid_run(tmp_path)
+    for path in (run_dir / "runtime_attestation").glob("runtime_attestation_*.json"):
+        attestation = json.loads(path.read_text(encoding="utf-8"))
+        attestation["working_dir"] = f"/tmp/ray/session/{path.stem}"
+        path.write_text(json.dumps(attestation) + "\n", encoding="utf-8")
+
+    result = _validate(run_dir)
+
+    assert result["verdict"] == "PASS", result["failures"]
+
+
+def test_admission_run_validator_rejects_ray_unpack_content_hash_drift(tmp_path) -> None:
+    run_dir = _build_valid_run(tmp_path)
+    path = run_dir / "runtime_attestation/runtime_attestation_ray_worker.json"
+    attestation = json.loads(path.read_text(encoding="utf-8"))
+    attestation["working_dir"] = "/tmp/ray/session/working_dir"
+    attestation["working_dir_content_sha256"] = "b" * 64
+    path.write_text(json.dumps(attestation) + "\n", encoding="utf-8")
+
+    result = _validate(run_dir)
+
+    assert result["verdict"] == "FAIL"
+    assert not result["checks"]["runtime_attestations_match_contract"]
 
 
 def test_admission_run_validator_rejects_missing_admission_ledger(tmp_path) -> None:
@@ -488,6 +538,32 @@ def test_admission_run_validator_rejects_contract_drift(tmp_path) -> None:
     assert not result["checks"]["admission_contract_is_4_8_2"]
     assert not result["checks"]["request_placement_is_off"]
     assert not result["checks"]["slime_router_is_disabled"]
+
+
+def test_admission_run_validator_rejects_downgraded_contract_schema(tmp_path) -> None:
+    run_dir = _build_valid_run(tmp_path)
+    contract_path = run_dir / "run_contract.json"
+    contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    contract["schema_version"] = 4
+    contract_path.write_text(json.dumps(contract), encoding="utf-8")
+
+    result = _validate(run_dir)
+
+    assert result["verdict"] == "FAIL"
+    assert not result["checks"]["run_contract_schema_is_current_v5"]
+
+
+def test_admission_run_validator_rejects_missing_contract_schema(tmp_path) -> None:
+    run_dir = _build_valid_run(tmp_path)
+    contract_path = run_dir / "run_contract.json"
+    contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    del contract["schema_version"]
+    contract_path.write_text(json.dumps(contract), encoding="utf-8")
+
+    result = _validate(run_dir)
+
+    assert result["verdict"] == "FAIL"
+    assert not result["checks"]["run_contract_schema_is_current_v5"]
 
 
 def test_admission_run_validator_recomputes_bounded_admission(tmp_path) -> None:

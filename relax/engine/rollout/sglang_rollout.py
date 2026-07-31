@@ -29,10 +29,12 @@ from relax.engine.rollout.admission import (
     DebtAwareAdmissionController,
     config_from_namespace,
     plan_next_admission,
+    require_final_backfill_deficit,
     split_transfer_counts,
 )
 from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
 from relax.engine.rollout.request_observability import (
+    abort_request_trace,
     admission_decision_record,
     begin_request_trace,
     close_discarded_abort_outcomes,
@@ -183,6 +185,10 @@ class GenerateState(metaclass=SingletonMeta):
                     evaluation=False,
                 )
             )
+            # Keep the submitted samples reachable even when the coroutine
+            # finishes exceptionally: Task.result() then raises and cannot
+            # return the group needed to close its observability records.
+            task._relax_sample_group = group
             # If any sample in the group has been aborted >= partial_rollout_max_aborted_count,
             # mark this task as protected so it won't be aborted again.
             if max_aborted_count is not None and any(sample.abort_count >= max_aborted_count for sample in group):
@@ -401,7 +407,13 @@ async def generate(
         output = await post(url, payload, headers=headers)
     except BaseException as request_error:
         if request_trace is not None:
-            fail_request_trace(request_trace, request_error)
+            fail_request_trace(
+                request_trace,
+                request_error,
+                client_status=(
+                    "task_cancelled" if isinstance(request_error, asyncio.CancelledError) else "generation_exception"
+                ),
+            )
         raise
     _t_generate = monotonic() - _t_generate_start
     if request_trace is not None:
@@ -505,6 +517,8 @@ async def generate(
         )
 
     sample.update_from_meta_info(args, output["meta_info"])
+    if request_trace is not None and sample.status == Sample.Status.ABORTED:
+        abort_request_trace(request_trace)
     _t_post_generate = monotonic() - _t_post_generate_start
 
     _timing: dict[str, float] = {"generate": _t_generate, "post_generate": _t_post_generate}
@@ -680,12 +694,106 @@ async def generate_and_rm_group(
     return group
 
 
+async def _abort_generation_workers(args: Namespace) -> None:
+    if parse(sglang_router.__version__) <= parse("0.2.1") or args.use_slime_router:
+        response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/list_workers")
+        urls = response["urls"]
+    else:
+        response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/workers")
+        urls = [worker["url"] for worker in response["workers"]]
+
+    logger.info(f"Abort request for {urls}")
+    abort_results = await asyncio.gather(
+        *(post(f"{url}/abort_request", {"abort_all": True}) for url in urls),
+        return_exceptions=True,
+    )
+    for url, result in zip(urls, abort_results, strict=False):
+        if isinstance(result, BaseException):
+            logger.warning(f"Failed to abort worker at {url}: {result}")
+
+
+def _close_failed_generation_task_traces(tasks: set[asyncio.Task[Any]]) -> None:
+    for task in tasks:
+        group = getattr(task, "_relax_sample_group", ())
+        for sample in group:
+            metadata = getattr(sample, "metadata", None)
+            if not isinstance(metadata, dict):
+                continue
+            row = metadata.get("_active_request_trace")
+            if not isinstance(row, dict):
+                continue
+            if row.get("client_status") == "dispatched":
+                fail_request_trace(
+                    row,
+                    asyncio.CancelledError(),
+                    client_status="task_cancelled",
+                )
+            record_request_outcome(sample, str(row.get("client_status") or "generation_exception"))
+
+
+async def _gather_generation_tasks(
+    tasks: set[asyncio.Task[Any]],
+) -> tuple[list[list[Sample]], list[tuple[BaseException, Any]]]:
+    """Consume every task while preserving terminal request status and errors."""
+
+    ordered_tasks = list(tasks)
+    if not ordered_tasks:
+        return [], []
+    results = await asyncio.gather(*ordered_tasks, return_exceptions=True)
+    groups: list[list[Sample]] = []
+    errors: list[tuple[BaseException, Any]] = []
+    for task, result in zip(ordered_tasks, results, strict=True):
+        if isinstance(result, BaseException):
+            errors.append((result, result.__traceback__))
+            group = getattr(task, "_relax_sample_group", ())
+            for sample in group:
+                row = getattr(sample, "metadata", {}).get("_active_request_trace")
+                # generate() normally closes this first. This fallback handles
+                # wrapper failures without overwriting an already-aborted trace.
+                if isinstance(row, dict) and row.get("client_status") == "dispatched":
+                    fail_request_trace(row, result, client_status="generation_exception")
+                    record_request_outcome(sample, "generation_exception")
+            continue
+        groups.append(result)
+    return groups, errors
+
+
+async def _cleanup_failed_generation_tasks(
+    args: Namespace,
+    state: GenerateState,
+    *,
+    tasks: set[asyncio.Task[Any]],
+) -> None:
+    """Abort backend work, cancel every local task, and consume all results."""
+
+    try:
+        await _abort_generation_workers(args)
+    except BaseException as cleanup_error:
+        logger.warning(f"Failed to abort generation workers during exception cleanup: {cleanup_error}")
+
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    _close_failed_generation_task_traces(tasks)
+    state.pendings.difference_update(tasks)
+    state.protected_pendings.difference_update(tasks)
+
+
 async def abort(args: Namespace, rollout_id: int) -> tuple[list[list[Sample]], list[list[Sample]]]:
     aborted_samples = []
     completed_protected_samples = []
+    first_exception: BaseException | None = None
+    first_traceback = None
 
     state = GenerateState(args)
     assert not state.aborted
+
+    def remember_first(errors: list[tuple[BaseException, Any]]) -> None:
+        nonlocal first_exception, first_traceback
+        if first_exception is None and errors:
+            first_exception, first_traceback = errors[0]
 
     # Wait for any in-progress eval to finish before aborting.
     # Aborting during eval would send abort_all to SGLang workers and kill eval requests.
@@ -704,48 +812,43 @@ async def abort(args: Namespace, rollout_id: int) -> tuple[list[list[Sample]], l
             f"Waiting for {len(state.protected_pendings)} protected tasks "
             f"(abort_count >= partial_rollout_max_aborted_count) to complete before aborting others."
         )
-        while state.protected_pendings:
-            done, state.protected_pendings = await asyncio.wait(
-                state.protected_pendings, return_when=asyncio.FIRST_COMPLETED
-            )
-            for task in done:
-                group = task.result()
-                completed_protected_samples.append(group)
+        protected_tasks = set(state.protected_pendings)
+        protected_groups, protected_errors = await _gather_generation_tasks(protected_tasks)
+        completed_protected_samples.extend(protected_groups)
+        remember_first(protected_errors)
+        state.protected_pendings.difference_update(protected_tasks)
 
         logger.info(f"All {len(completed_protected_samples)} protected tasks completed.")
 
     # Step 2: Now abort the remaining (non-protected) pending tasks.
     state.aborted = True
 
-    if parse(sglang_router.__version__) <= parse("0.2.1") or args.use_slime_router:
-        response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/list_workers")
-        urls = response["urls"]
-    else:
-        response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/workers")
-        urls = [worker["url"] for worker in response["workers"]]
-
-    logger.info(f"Abort request for {urls}")
-    abort_tasks = [post(f"{url}/abort_request", {"abort_all": True}) for url in urls]
-    abort_results = await asyncio.gather(*abort_tasks, return_exceptions=True)
-    for url, result in zip(urls, abort_results, strict=False):
-        if isinstance(result, BaseException):
-            logger.warning(f"Failed to abort worker at {url}: {result}")
+    try:
+        await _abort_generation_workers(args)
+    except BaseException as abort_error:
+        remember_first([(abort_error, abort_error.__traceback__)])
 
     # make sure all the pending tasks are finished
     count = 0
-    while state.pendings:
-        done, state.pendings = await asyncio.wait(state.pendings, return_when=asyncio.FIRST_COMPLETED)
+    pending_tasks = set(state.pendings)
+    pending_groups, pending_errors = await _gather_generation_tasks(pending_tasks)
+    remember_first(pending_errors)
+    state.pendings.difference_update(pending_tasks)
 
-        if not args.partial_rollout:
-            # Non-partial mode intentionally discards work interrupted by the
-            # step boundary, but observability still requires every dispatched
-            # attempt to receive a terminal business outcome.
-            close_discarded_abort_outcomes([task.result() for task in done])
-            continue
-
-        # for partial rollout, collect the partial samples into the data buffer
-        for task in done:
-            group = task.result()
+    if not args.partial_rollout:
+        # Non-partial mode intentionally discards work interrupted by the step
+        # boundary. This only closes the business outcome; terminal exception
+        # traces remain generation_exception rather than becoming aborted.
+        discarded_groups = list(pending_groups)
+        discarded_groups.extend(
+            getattr(task, "_relax_sample_group", ())
+            for task in pending_tasks
+            if task.cancelled() or (task.done() and task.exception() is not None)
+        )
+        close_discarded_abort_outcomes(discarded_groups)
+    else:
+        # For partial rollout, collect every successfully harvested group.
+        for group in pending_groups:
             for sample in group:
                 if sample.response and "start_rollout_id" not in sample.metadata:
                     sample.metadata["start_rollout_id"] = rollout_id
@@ -755,11 +858,104 @@ async def abort(args: Namespace, rollout_id: int) -> tuple[list[list[Sample]], l
     if args.partial_rollout:
         logger.info(f"Collected {count} partial samples into the data buffer")
 
+    if first_exception is not None:
+        raise first_exception.with_traceback(first_traceback)
+
     return aborted_samples, completed_protected_samples
+
+
+class _RolloutLifecycle:
+    def __init__(self) -> None:
+        self.pbar: Any = None
+        self.transfer_tasks: list[asyncio.Task[Any]] = []
+
+
+async def _cleanup_failed_rollout_lifecycle(
+    args: Namespace,
+    state: GenerateState,
+    lifecycle: _RolloutLifecycle,
+) -> None:
+    generation_tasks = set(state.pendings) | set(state.protected_pendings)
+    await _cleanup_failed_generation_tasks(args, state, tasks=generation_tasks)
+    for task in lifecycle.transfer_tasks:
+        if not task.done():
+            task.cancel()
+    if lifecycle.transfer_tasks:
+        await asyncio.gather(*lifecycle.transfer_tasks, return_exceptions=True)
 
 
 async def generate_rollout_async(
     args: Namespace, rollout_id: int, data_source: Callable[[int], list[list[Sample]]], data_system_client: Any
+) -> tuple[RolloutFnTrainOutput, list[list[Sample]]]:
+    """Run profiling, generation, and transfer as one failure-cleanup lifecycle."""
+
+    state = GenerateState(args)
+    lifecycle = _RolloutLifecycle()
+    result: tuple[RolloutFnTrainOutput, list[list[Sample]]] | None = None
+    first_exception: BaseException | None = None
+    first_traceback = None
+    failure_cleanup_done = False
+    profile_cleanup_needed = False
+
+    try:
+        profile_cleanup_needed = True
+        await start_sglang_profile(args, rollout_id)
+        result = await _generate_rollout_async_impl(
+            args,
+            rollout_id,
+            data_source,
+            data_system_client,
+            lifecycle,
+        )
+    except BaseException as exc:
+        first_exception = exc
+        first_traceback = exc.__traceback__
+
+    if first_exception is not None:
+        try:
+            await _cleanup_failed_rollout_lifecycle(args, state, lifecycle)
+        except BaseException as cleanup_error:
+            logger.warning(f"Failed to clean up rollout tasks after exception: {cleanup_error}")
+        failure_cleanup_done = True
+
+    if profile_cleanup_needed:
+        try:
+            await stop_sglang_profile(args, rollout_id)
+        except BaseException as cleanup_error:
+            if first_exception is None:
+                first_exception = cleanup_error
+                first_traceback = cleanup_error.__traceback__
+            else:
+                logger.warning(f"Failed to stop SGLang profile during exception cleanup: {cleanup_error}")
+
+    if lifecycle.pbar is not None:
+        try:
+            lifecycle.pbar.close()
+        except BaseException as cleanup_error:
+            if first_exception is None:
+                first_exception = cleanup_error
+                first_traceback = cleanup_error.__traceback__
+            else:
+                logger.warning(f"Failed to close rollout progress bar during exception cleanup: {cleanup_error}")
+
+    if first_exception is not None and not failure_cleanup_done:
+        try:
+            await _cleanup_failed_rollout_lifecycle(args, state, lifecycle)
+        except BaseException as cleanup_error:
+            logger.warning(f"Failed to clean up rollout tasks after lifecycle exception: {cleanup_error}")
+
+    if first_exception is not None:
+        raise first_exception.with_traceback(first_traceback)
+    assert result is not None
+    return result
+
+
+async def _generate_rollout_async_impl(
+    args: Namespace,
+    rollout_id: int,
+    data_source: Callable[[int], list[list[Sample]]],
+    data_system_client: Any,
+    lifecycle: _RolloutLifecycle,
 ) -> tuple[RolloutFnTrainOutput, list[list[Sample]]]:
     """An example to implement the generate_rollout function for an rule based
     rm rollout generation.
@@ -783,8 +979,13 @@ async def generate_rollout_async(
     state.current_rollout_id = rollout_id
     state.request_observability_rows: list[dict[str, Any]] = []
 
-    # Start SGLang profiling if enabled
-    await start_sglang_profile(args, rollout_id)
+    # A process restart loses this volatile counter. Validate before starting
+    # profiling or other work so an incomplete durable final partition fails
+    # closed without leaking resources.
+    num_old_samples = state.last_step_current_deficit if args.fully_async else 0
+    is_final_backfill = args.fully_async and rollout_id >= args.num_rollout
+    if is_final_backfill:
+        require_final_backfill_deficit(rollout_id=rollout_id, deficit_groups=num_old_samples)
 
     # instantiate data filters
     dynamic_filter = (
@@ -797,9 +998,6 @@ async def generate_rollout_async(
     # (rollout_batch_size - committed_current), NOT the buffer carryover size. Known up
     # front (no longer derived from how much get_samples returned), so target_data_size
     # is fixed here instead of being mutated mid-loop.
-    num_old_samples = state.last_step_current_deficit if args.fully_async else 0
-
-    is_final_backfill = args.fully_async and rollout_id >= args.num_rollout
     admission_config, admission_config_error = config_from_namespace(args)
     if admission_config_error is not None:
         logger.warning(
@@ -822,8 +1020,6 @@ async def generate_rollout_async(
     # (num_old_samples). The final backfill step is special: there is no
     # train_{rollout_id} partition, so it only closes train_{rollout_id-1}.
     target_data_size = num_old_samples if is_final_backfill else args.rollout_batch_size + num_old_samples
-    if target_data_size <= 0:
-        raise RuntimeError(f"Final rollout backfill requested for rollout_id={rollout_id} without pending deficit")
     physical_start_abs = time.time()
     logger.info(
         "TASK22_FLOW phase=physical_start physical_rollout_id=%s "
@@ -843,7 +1039,8 @@ async def generate_rollout_async(
     data = []
     do_print = True
     pbar = tqdm(total=target_data_size * args.n_samples_per_prompt, desc=f"Rollout {rollout_id} generation")
-    transfer_tasks = []
+    lifecycle.pbar = pbar
+    transfer_tasks = lifecycle.transfer_tasks
     batch_to_transfer = []
     aborted_samples = []
     # Completed groups beyond target_data_size (over-sampling surplus). Carried back to
@@ -1020,9 +1217,21 @@ async def generate_rollout_async(
         done, remaining = await asyncio.wait(all_pendings, return_when=asyncio.FIRST_COMPLETED)
         state.pendings = state.pendings & remaining
         state.protected_pendings = state.protected_pendings & remaining
+        completed_groups: list[list[Sample]] = []
+        first_exception: BaseException | None = None
+        first_traceback = None
         for task in done:
-            group: list[Sample] = task.result()
+            try:
+                completed_groups.append(task.result())
+            except BaseException as task_error:
+                if first_exception is None:
+                    first_exception = task_error
+                    first_traceback = task_error.__traceback__
 
+        if first_exception is not None:
+            raise first_exception.with_traceback(first_traceback)
+
+        for group in completed_groups:
             if do_print:
                 sample = group[0][0] if isinstance(group[0], list) else group[0]
                 logger.info(
@@ -1203,10 +1412,6 @@ async def generate_rollout_async(
     # Wait for all transfer tasks to complete
     if transfer_tasks:
         await asyncio.gather(*transfer_tasks)
-    pbar.close()
-
-    # Stop SGLang profiling if enabled (no-op if num_steps was set — SGLang auto-stops)
-    await stop_sglang_profile(args, rollout_id)
 
     sample = data[-1][0][0] if isinstance(data[-1][0], list) else data[-1][0]
     logger.info(

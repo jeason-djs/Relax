@@ -5,6 +5,7 @@
 import json
 import os
 import tempfile
+import threading
 from typing import Any, Dict, List
 
 from relax.utils.timer import TimelineEvent
@@ -30,6 +31,10 @@ class TimelineTraceAdapter:
         self._all_events: List[Dict[str, Any]] = []
         self._max_dump = max_dump
         self._dumped_steps: set[int] = set()
+        self._reserved_steps: set[int] = set()
+        # Reserve quota and copy a coherent snapshot under this lock. File I/O
+        # is deliberately performed after releasing it.
+        self._lock = threading.RLock()
 
         if self.enabled:
             # Ensure the directory exists
@@ -48,9 +53,9 @@ class TimelineTraceAdapter:
         if not self.enabled:
             return
 
-        for event in events:
-            trace_event = event.to_trace_event()
-            self._all_events.append(trace_event)
+        trace_events = [event.to_trace_event() for event in events]
+        with self._lock:
+            self._all_events.extend(trace_events)
 
     def add_event_dicts(self, event_dicts: List[Dict[str, Any]]):
         """Add already-serialized event dictionaries.
@@ -61,7 +66,8 @@ class TimelineTraceAdapter:
         if not self.enabled:
             return
 
-        self._all_events.extend(event_dicts)
+        with self._lock:
+            self._all_events.extend(event_dicts)
 
     def dump(self, step: int) -> bool:
         """Dump all collected events to a JSON file.
@@ -74,40 +80,56 @@ class TimelineTraceAdapter:
         if not self.enabled:
             return False
 
-        if not self._all_events:
-            return False
+        with self._lock:
+            if not self._all_events:
+                return False
 
-        # The quota is per unique step. Re-reporting a step may refresh its
-        # file, but must not consume another slot and starve later steps.
-        if step not in self._dumped_steps and len(self._dumped_steps) >= self._max_dump:
-            return False
+            # The quota is per unique step. Re-reporting a step may refresh its
+            # file, but must not consume another slot and starve later steps.
+            if step in self._reserved_steps:
+                return False
+            occupied_steps = self._dumped_steps | self._reserved_steps
+            if step not in occupied_steps and len(occupied_steps) >= self._max_dump:
+                return False
 
-        # Sort events by timestamp
-        sorted_events = sorted(self._all_events, key=lambda e: e.get("ts", 0))
+            # Copy under the lock so a dump is one coherent memory snapshot.
+            sorted_events = sorted(self._all_events, key=lambda e: e.get("ts", 0))
+            self._reserved_steps.add(step)
 
         filename = f"timeline_step_{step}.json"
         filepath = os.path.join(self.dump_dir, filename)
-
-        fd, temporary_path = tempfile.mkstemp(
-            prefix=f".{filename}.",
-            suffix=".tmp",
-            dir=self.dump_dir,
-        )
+        temporary_path = ""
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as output:
-                json.dump(sorted_events, output)
-                output.write("\n")
-                output.flush()
-                os.fsync(output.fileno())
-            os.replace(temporary_path, filepath)
-        except BaseException:
+            fd, temporary_path = tempfile.mkstemp(
+                prefix=f".{filename}.", suffix=".tmp", dir=self.dump_dir
+            )
             try:
-                os.unlink(temporary_path)
-            except FileNotFoundError:
-                pass
+                with os.fdopen(fd, "w", encoding="utf-8") as output:
+                    json.dump(sorted_events, output)
+                    output.write("\n")
+                    output.flush()
+                    os.fsync(output.fileno())
+                os.replace(temporary_path, filepath)
+                directory_fd = os.open(self.dump_dir, os.O_RDONLY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            except BaseException:
+                if temporary_path:
+                    try:
+                        os.unlink(temporary_path)
+                    except FileNotFoundError:
+                        pass
+                raise
+        except BaseException:
+            with self._lock:
+                self._reserved_steps.discard(step)
             raise
-
-        self._dumped_steps.add(step)
+        else:
+            with self._lock:
+                self._reserved_steps.remove(step)
+                self._dumped_steps.add(step)
 
         # DO NOT CLEAR
         # self._all_events.clear()
@@ -119,8 +141,10 @@ class TimelineTraceAdapter:
 
     def clear(self):
         """Clear all stored events without dumping."""
-        self._all_events.clear()
+        with self._lock:
+            self._all_events.clear()
 
     def get_event_count(self) -> int:
         """Get the number of events currently stored."""
-        return len(self._all_events)
+        with self._lock:
+            return len(self._all_events)

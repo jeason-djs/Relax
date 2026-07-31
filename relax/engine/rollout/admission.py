@@ -22,6 +22,22 @@ class AdmissionMode(str, Enum):
     ON = "on"
 
 
+class UnrecoverableFinalBackfillError(RuntimeError):
+    """The durable partition is incomplete but volatile debt state is gone."""
+
+
+def require_final_backfill_deficit(*, rollout_id: int, deficit_groups: int) -> int:
+    """Fail closed when a restarted process cannot reconstruct backfill debt."""
+
+    if deficit_groups <= 0:
+        raise UnrecoverableFinalBackfillError(
+            "Unrecoverable final backfill: durable partition "
+            f"train_{rollout_id - 1} is incomplete, but the in-memory deficit was lost "
+            "and the data-system API cannot reconstruct the missing group count"
+        )
+    return deficit_groups
+
+
 @dataclass(frozen=True)
 class DebtAwareAdmissionConfig:
     """Bounded admission policy for one physical rollout."""

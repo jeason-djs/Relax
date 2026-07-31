@@ -3,6 +3,7 @@
 set -euo pipefail
 
 REPO="${REPO:-$(git -C "$(dirname -- "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)}"
+PYTHON_BIN="${TASK22_PYTHON:-python3}"
 PATCH="${RELAX_SGLANG_OBSERVABILITY_PATCH:-$REPO/scripts/task22/sglang_rollout_observability.patch}"
 RID_ONLY_PATCH="$REPO/scripts/task22/sglang_rid_only_request_logging.patch"
 SMOKE_TEST="${RELAX_SGLANG_OBSERVABILITY_SMOKE:-$REPO/scripts/task22/smoke_rollout_observability.py}"
@@ -13,7 +14,7 @@ if [ ! -r "$PATCH" ] || [ ! -r "$RID_ONLY_PATCH" ] || [ ! -r "$SMOKE_TEST" ]; th
 fi
 
 SGLANG_IMPORT_ROOT="$(
-    python3 -c \
+    "$PYTHON_BIN" -c \
         'from pathlib import Path; from sglang.srt.utils import scheduler_status_logger; print(Path(scheduler_status_logger.__file__).resolve().parents[3])'
 )"
 TIMING_FILE="$SGLANG_IMPORT_ROOT/sglang/srt/observability/req_time_stats.py"
@@ -43,5 +44,5 @@ else
     exit 4
 fi
 
-python3 "$SMOKE_TEST"
+"$PYTHON_BIN" "$SMOKE_TEST"
 echo "RELAX_ROLLOUT_OBSERVABILITY_PREFLIGHT=PASS"

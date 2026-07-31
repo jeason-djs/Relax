@@ -2,13 +2,14 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 """Basic tests for the Metrics Service components."""
 
+import asyncio
 import unittest
 from unittest.mock import Mock, patch
 
 # MetricsBuffer is defined inside metrics.py, we need to import it correctly
 from relax.utils.metrics.client import MetricsClient
 from relax.utils.metrics.metrics_service_adapter import MetricsServiceAdapter
-from relax.utils.metrics.service import MetricsBuffer
+from relax.utils.metrics.service import MetricsBuffer, MetricsService, ReportStepRequest
 from relax.utils.misc import create_namespace
 
 
@@ -67,6 +68,83 @@ class TestMetricsBuffer(unittest.TestCase):
 
         self.buffer.clear_step(2)
         self.assertFalse(self.buffer.has_metrics_for_step(2))
+
+    def test_reporting_snapshot_rolls_back_without_losing_concurrent_metrics(self):
+        self.buffer.add_metric(step=1, metric_name="before", metric_value=1)
+        snapshot = self.buffer.reserve_metrics_for_step(1)
+        self.assertIsNotNone(snapshot)
+
+        self.buffer.add_metric(step=1, metric_name="during", metric_value=2)
+        self.buffer.rollback_metrics_for_step(1, snapshot)
+
+        self.assertEqual(
+            [metric["name"] for metric in self.buffer.get_metrics_for_step(1)],
+            ["before", "during"],
+        )
+
+    def test_reporting_snapshot_is_single_writer_and_commit_keeps_new_metrics(self):
+        self.buffer.add_metric(step=1, metric_name="reported", metric_value=1)
+        snapshot = self.buffer.reserve_metrics_for_step(1)
+        self.assertIsNotNone(snapshot)
+        self.assertIsNone(self.buffer.reserve_metrics_for_step(1))
+
+        self.buffer.add_metric(step=1, metric_name="next", metric_value=2)
+        self.buffer.commit_metrics_for_step(1, snapshot)
+
+        self.assertEqual(
+            [metric["name"] for metric in self.buffer.get_metrics_for_step(1)],
+            ["next"],
+        )
+
+
+class TestMetricsServiceReporting(unittest.TestCase):
+    def test_required_sink_failure_is_retryable_and_not_reported_as_success(self):
+        service_class = MetricsService.func_or_class
+        service = service_class.__new__(service_class)
+        service.metrics_buffer = MetricsBuffer()
+        service.metrics_buffer.add_metric(3, "loss", 0.5)
+        service._use_wandb = False
+        tensorboard = Mock()
+        tensorboard.log.side_effect = OSError("injected sink failure")
+        service._adapters = {"tensorboard": tensorboard}
+        service._timeline_adapter = None
+
+        failed = asyncio.run(service.report_step(ReportStepRequest(step=3)))
+
+        self.assertEqual(failed["status"], "error")
+        self.assertTrue(service.metrics_buffer.has_metrics_for_step(3))
+
+        tensorboard.log.side_effect = None
+        succeeded = asyncio.run(service.report_step(ReportStepRequest(step=3)))
+
+        self.assertEqual(succeeded["status"], "success")
+        self.assertFalse(service.metrics_buffer.has_metrics_for_step(3))
+        self.assertEqual(tensorboard.log.call_count, 2)
+
+    def test_retry_only_writes_failed_sink_and_commits_after_all_ack(self):
+        service_class = MetricsService.func_or_class
+        service = service_class.__new__(service_class)
+        service.metrics_buffer = MetricsBuffer()
+        service.metrics_buffer.add_metric(4, "loss", 0.25)
+        service._use_wandb = False
+        tensorboard = Mock()
+        clearml = Mock()
+        clearml.log.side_effect = [OSError("first attempt fails"), None]
+        service._adapters = {"tensorboard": tensorboard, "clearml": clearml}
+        service._timeline_adapter = None
+
+        failed = asyncio.run(service.report_step(ReportStepRequest(step=4)))
+        self.assertEqual(failed["status"], "error")
+        self.assertTrue(service.metrics_buffer.has_metrics_for_step(4))
+        self.assertEqual(tensorboard.log.call_count, 1)
+        self.assertEqual(clearml.log.call_count, 1)
+
+        succeeded = asyncio.run(service.report_step(ReportStepRequest(step=4)))
+
+        self.assertEqual(succeeded["status"], "success")
+        self.assertFalse(service.metrics_buffer.has_metrics_for_step(4))
+        self.assertEqual(tensorboard.log.call_count, 1)
+        self.assertEqual(clearml.log.call_count, 2)
 
 
 class TestMetricsClient(unittest.TestCase):

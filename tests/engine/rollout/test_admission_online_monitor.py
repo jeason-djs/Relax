@@ -2,13 +2,23 @@
 
 import ast
 import json
+import os
+import signal
+from datetime import datetime
 from pathlib import Path
 
 import pytest
 
 from scripts.task22.monitor_admission_run import (
     STRICT_CHECK_COVERAGE,
+    FileCursor,
     MonitorFailure,
+    MonitorScanState,
+    _complete_driver_text,
+    _evidence_progress_token,
+    _process_exists,
+    _read_incremental_bytes,
+    _read_retained_jsonl,
     _scan,
     _stop_process,
     _validate_closed_lifecycle,
@@ -18,6 +28,7 @@ from scripts.task22.monitor_admission_run import (
     _validate_physical_flow,
     _validate_sync,
     _validate_timelines,
+    monitor,
 )
 
 
@@ -87,6 +98,82 @@ def _write_physical_flow(run_dir, rollout_ids=(0,)) -> None:
             ]
         )
     (run_dir / "driver.log").write_text("\n".join(lines) + "\n")
+
+
+def test_online_monitor_uses_content_hash_not_ray_unpack_path(tmp_path) -> None:
+    digest = "a" * 64
+    contract = {
+        "schema_version": 5,
+        "admission_mode": "shadow",
+        "num_rollout": 1,
+        "expected_samples_per_partition": 64,
+        "expected_engines": 2,
+        "max_staleness": 2,
+        "headline_lo": 5,
+        "headline_hi": 6,
+        "admission_min": 4,
+        "admission_max": 8,
+        "admission_slack": 2,
+        "request_placement_mode": "off",
+        "use_slime_router": False,
+        "working_dir": "/source/repo",
+        "working_dir_content_sha256": digest,
+        "runtime_env_json_sha256": digest,
+        "input_manifest_sha256": digest,
+        "training_python": {},
+        "sglang_source_sha256": {},
+    }
+    (tmp_path / "run_contract.json").write_text(json.dumps(contract) + "\n")
+    attestation_dir = tmp_path / "runtime_attestation"
+    attestation_dir.mkdir()
+    for role in ("driver", "ray_worker"):
+        attestation = {
+            "role": role,
+            "working_dir": f"/tmp/ray/session/{role}",
+            "working_dir_content_sha256": digest,
+            "runtime_env_json_sha256": digest,
+            "python": {},
+            "sglang_source_sha256": {},
+            "input_manifest": {"sha256": digest},
+        }
+        (attestation_dir / f"runtime_attestation_{role}.json").write_text(
+            json.dumps(attestation) + "\n"
+        )
+
+    _validate_contract(
+        tmp_path,
+        expected_mode="shadow",
+        expected_rollouts=1,
+        expected_samples_per_partition=64,
+        expected_engines=2,
+        max_staleness=2,
+        admission_min=4,
+        admission_max=8,
+        admission_slack=2,
+        headline_lo=5,
+        headline_hi=6,
+        final=True,
+    )
+
+    worker_path = attestation_dir / "runtime_attestation_ray_worker.json"
+    worker = json.loads(worker_path.read_text())
+    worker["working_dir_content_sha256"] = "b" * 64
+    worker_path.write_text(json.dumps(worker) + "\n")
+    with pytest.raises(MonitorFailure, match="runtime_attestation_contract_mismatch"):
+        _validate_contract(
+            tmp_path,
+            expected_mode="shadow",
+            expected_rollouts=1,
+            expected_samples_per_partition=64,
+            expected_engines=2,
+            max_staleness=2,
+            admission_min=4,
+            admission_max=8,
+            admission_slack=2,
+            headline_lo=5,
+            headline_hi=6,
+            final=True,
+        )
 
 
 def test_online_monitor_rejects_malformed_jsonl(tmp_path) -> None:
@@ -461,6 +548,113 @@ def test_process_group_stop_rejects_unrelated_group(monkeypatch) -> None:
     assert not killed
 
 
+def test_process_group_stop_escalates_to_kill_after_bounded_term(monkeypatch) -> None:
+    signals = []
+    monkeypatch.setattr("os.getpgid", lambda pid: pid)
+    monkeypatch.setattr("os.killpg", lambda pgid, sig: signals.append(sig))
+    monkeypatch.setattr(
+        "scripts.task22.monitor_admission_run._process_start_identity",
+        lambda pid: "start-1",
+    )
+
+    _stop_process(
+        123,
+        123,
+        expected_identity="start-1",
+        term_timeout=0,
+        poll_interval=0.001,
+    )
+
+    assert signals[0] == signal.SIGTERM
+    assert signals[-1] == signal.SIGKILL
+
+
+def test_monitor_kills_even_when_failure_audit_cannot_be_written(tmp_path, monkeypatch) -> None:
+    stopped = []
+
+    def fail_scan(*args, **kwargs):
+        raise MonitorFailure("fixture failure")
+
+    monkeypatch.setattr("scripts.task22.monitor_admission_run._scan", fail_scan)
+    monkeypatch.setattr("scripts.task22.monitor_admission_run._process_exists", lambda pid: True)
+    monkeypatch.setattr(
+        "scripts.task22.monitor_admission_run._process_start_identity",
+        lambda pid: "start-1",
+    )
+    monkeypatch.setattr(
+        "scripts.task22.monitor_admission_run._append_event",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("disk full")),
+    )
+    monkeypatch.setattr(
+        "scripts.task22.monitor_admission_run._stop_process",
+        lambda *args, **kwargs: stopped.append(args[0]),
+    )
+
+    rc = monitor(
+        tmp_path,
+        pid=123,
+        process_group_id=123,
+        expected_mode="shadow",
+        expected_rollouts=1,
+        expected_samples_per_partition=64,
+        expected_engines=2,
+        max_staleness=2,
+        admission_min=4,
+        admission_max=8,
+        admission_slack=2,
+        headline_lo=5,
+        headline_hi=6,
+        poll_interval=0.01,
+        evidence_grace=5.0,
+        pid_start_identity="start-1",
+    )
+
+    assert rc == 4
+    assert stopped == [123]
+
+
+def test_monitor_fails_closed_when_running_evidence_makes_no_progress(tmp_path, monkeypatch) -> None:
+    times = iter((0.0, 0.0, 2.0))
+    stopped = []
+    monkeypatch.setattr("scripts.task22.monitor_admission_run.time.monotonic", lambda: next(times))
+    monkeypatch.setattr("scripts.task22.monitor_admission_run.time.sleep", lambda delay: None)
+    monkeypatch.setattr("scripts.task22.monitor_admission_run._scan", lambda *args, **kwargs: None)
+    monkeypatch.setattr("scripts.task22.monitor_admission_run._process_exists", lambda pid: True)
+    monkeypatch.setattr(
+        "scripts.task22.monitor_admission_run._process_start_identity",
+        lambda pid: "start-1",
+    )
+    monkeypatch.setattr(
+        "scripts.task22.monitor_admission_run._stop_process",
+        lambda *args, **kwargs: stopped.append(args[0]),
+    )
+
+    rc = monitor(
+        tmp_path,
+        pid=123,
+        process_group_id=123,
+        expected_mode="shadow",
+        expected_rollouts=1,
+        expected_samples_per_partition=64,
+        expected_engines=2,
+        max_staleness=2,
+        admission_min=4,
+        admission_max=8,
+        admission_slack=2,
+        headline_lo=5,
+        headline_hi=6,
+        poll_interval=0.01,
+        evidence_grace=5.0,
+        pid_start_identity="start-1",
+        no_progress_timeout=1.0,
+    )
+
+    assert rc == 4
+    assert stopped == [123]
+    rows = [json.loads(line) for line in (tmp_path / "online_monitor.jsonl").read_text().splitlines()]
+    assert any(row.get("reason") == "no_evidence_progress:1s" for row in rows)
+
+
 def test_strict_check_coverage_mapping_has_no_validator_omissions() -> None:
     validator_path = (
         Path(__file__).resolve().parents[3] / "scripts" / "task22" / "validate_admission_run.py"
@@ -717,6 +911,117 @@ def test_online_monitor_ignores_trailing_incomplete_driver_line(tmp_path) -> Non
     _scan_once(tmp_path)
 
 
+def test_online_monitor_final_reads_valid_unterminated_driver_tail() -> None:
+    assert _complete_driver_text("healthy\nFATAL", final=False) == "healthy\n"
+    assert _complete_driver_text("healthy\nFATAL", final=True) == "healthy\nFATAL"
+
+
+def test_online_monitor_retains_driver_evidence_across_truncation(tmp_path) -> None:
+    _prepare_monitor_inputs(tmp_path)
+    state = MonitorScanState()
+    driver = tmp_path / "driver.log"
+    driver.write_text("healthy first segment\n")
+    kwargs = {
+        "expected_mode": "shadow",
+        "expected_rollouts": 1,
+        "expected_samples_per_partition": 64,
+        "expected_engines": 2,
+        "max_staleness": 2,
+        "admission_min": 4,
+        "admission_max": 8,
+        "admission_slack": 2,
+        "headline_lo": 5,
+        "headline_hi": 6,
+        "final": False,
+        "reported_lifecycle": set(),
+        "event_log": tmp_path / "online_monitor.jsonl",
+        "scan_state": state,
+    }
+    _scan(tmp_path, **kwargs)
+    driver.write_text("FATAL after rotation\n")
+
+    with pytest.raises(MonitorFailure, match="fatal_driver_log"):
+        _scan(tmp_path, **kwargs)
+    assert "healthy first segment" in state.driver_text
+
+
+def test_consumption_half_write_uses_grace_and_keeps_previous_rows(tmp_path) -> None:
+    path = tmp_path / "consumption_ledger_rollout_0_rank_0.jsonl"
+    row = {"record_type": "consume_outcome", "attempt_token": 1}
+    path.write_text(json.dumps(row) + "\n")
+    state = MonitorScanState()
+    due = {}
+    first = _read_retained_jsonl(
+        path,
+        final=False,
+        state=state,
+        evidence_grace=5.0,
+        evidence_due_since=due,
+        now_monotonic=10.0,
+    )
+    path.write_text(json.dumps(row) + '\n{"record_type":')
+
+    retained = _read_retained_jsonl(
+        path,
+        final=False,
+        state=state,
+        evidence_grace=5.0,
+        evidence_due_since=due,
+        now_monotonic=11.0,
+    )
+    assert retained == first
+    with pytest.raises(MonitorFailure, match="malformed_jsonl"):
+        _read_retained_jsonl(
+            path,
+            final=False,
+            state=state,
+            evidence_grace=5.0,
+            evidence_due_since=due,
+            now_monotonic=16.0,
+        )
+
+
+def test_timeline_half_write_uses_grace(tmp_path) -> None:
+    driver = tmp_path / "driver.log"
+    driver.write_text("rollout 5: {}\nstep 5: {}\nperf 5: {}\n")
+    timeline = tmp_path / "timeline"
+    timeline.mkdir()
+    (timeline / "timeline_step_5.json").write_text('[{"name":')
+    due = {}
+
+    _validate_timelines(
+        driver,
+        timeline,
+        headline_lo=5,
+        headline_hi=5,
+        final=False,
+        evidence_grace=5.0,
+        evidence_due_since=due,
+        now_monotonic=10.0,
+    )
+    with pytest.raises(MonitorFailure, match="invalid_headline_timeline"):
+        _validate_timelines(
+            driver,
+            timeline,
+            headline_lo=5,
+            headline_hi=5,
+            final=False,
+            evidence_grace=5.0,
+            evidence_due_since=due,
+            now_monotonic=15.0,
+        )
+
+
+def test_process_identity_mismatch_is_not_considered_same_process(monkeypatch) -> None:
+    monkeypatch.setattr("os.kill", lambda pid, sig: None)
+    monkeypatch.setattr(
+        "scripts.task22.monitor_admission_run._process_start_identity",
+        lambda pid: "new-start",
+    )
+
+    assert not _process_exists(123, "old-start")
+
+
 def test_online_monitor_ledger_only_set_uses_grace_and_final_is_strict(tmp_path) -> None:
     _prepare_monitor_inputs(tmp_path)
     observability = tmp_path / "observability"
@@ -819,3 +1124,310 @@ def test_online_monitor_gpu_indices_need_only_be_unique_nonnegative(tmp_path) ->
         evidence_due_since={},
         now_monotonic=0.0,
     )
+
+
+def test_retained_jsonl_same_record_after_truncate_is_a_visible_replay(tmp_path) -> None:
+    path = tmp_path / "admission_ledger_rollout_0.jsonl"
+    row = {"record_type": "admission_decision", "decision_id": "same"}
+    encoded = json.dumps(row) + "\n"
+    path.write_text(encoded)
+    state = MonitorScanState()
+    kwargs = {
+        "final": False,
+        "state": state,
+        "evidence_grace": 5.0,
+        "evidence_due_since": {},
+    }
+
+    first = _read_retained_jsonl(path, now_monotonic=1.0, **kwargs)
+    path.write_text(encoded)
+    replayed = _read_retained_jsonl(path, now_monotonic=2.0, **kwargs)
+
+    assert len(first) == 2  # the retained list is updated in place
+    assert len(replayed) == 2
+    assert [item["_epoch"] for item in replayed] == [0, 1]
+    with pytest.raises(MonitorFailure, match="duplicate_decision_id"):
+        from scripts.task22.monitor_admission_run import _require_unique
+
+        _require_unique(replayed, "decision_id", "duplicate_decision_id")
+
+
+def test_mtime_only_change_is_not_semantic_progress(tmp_path) -> None:
+    state = MonitorScanState()
+    artifact = tmp_path / "observability" / "rows.jsonl"
+    artifact.parent.mkdir()
+    artifact.write_text("")
+    before = _evidence_progress_token(tmp_path, state)
+
+    os.utime(artifact, None)
+
+    assert _evidence_progress_token(tmp_path, state) == before
+
+
+def test_complete_nonsemantic_driver_noise_is_not_progress(tmp_path) -> None:
+    state = MonitorScanState()
+    driver = tmp_path / "driver.log"
+    driver.write_text("ordinary library chatter\n")
+    before = _evidence_progress_token(tmp_path, state)
+
+    from scripts.task22.monitor_admission_run import _read_incremental_driver
+
+    _read_incremental_driver(driver, state, final=False)
+
+    assert _evidence_progress_token(tmp_path, state) == before
+
+
+def test_incremental_jsonl_poll_does_not_replay_unchanged_bytes(tmp_path) -> None:
+    path = tmp_path / "rows.jsonl"
+    path.write_text('{"value": 1}\n')
+    state = MonitorScanState()
+    kwargs = {
+        "final": False,
+        "state": state,
+        "evidence_grace": 5.0,
+        "evidence_due_since": {},
+    }
+
+    rows = _read_retained_jsonl(path, now_monotonic=1.0, **kwargs)
+    offset = state.jsonl_cursors[str(path)].offset
+    revision = state.semantic_revision
+    again = _read_retained_jsonl(path, now_monotonic=2.0, **kwargs)
+
+    assert again == rows
+    assert state.jsonl_cursors[str(path)].offset == offset
+    assert state.semantic_revision == revision
+
+
+def test_incremental_reader_does_not_treat_concurrent_append_as_new_epoch(
+    tmp_path, monkeypatch
+) -> None:
+    path = tmp_path / "rows.jsonl"
+    first = b'{"value": 1}\n'
+    appended = b'{"value": 2}\n'
+    path.write_bytes(first)
+    cursor = FileCursor()
+    real_fstat = os.fstat
+    calls = 0
+
+    def append_after_first_fstat(fd):
+        nonlocal calls
+        calls += 1
+        observed = real_fstat(fd)
+        if calls == 1:
+            with path.open("ab") as output:
+                output.write(appended)
+        return observed
+
+    monkeypatch.setattr("scripts.task22.monitor_admission_run.os.fstat", append_after_first_fstat)
+
+    first_poll = _read_incremental_bytes(path, cursor, final=False)
+    assert [raw for _, _, raw in first_poll] == [first.rstrip()]
+    assert cursor.offset == len(first)
+    assert cursor.epoch == 0
+
+    second_poll = _read_incremental_bytes(path, cursor, final=False)
+    assert [raw for _, _, raw in second_poll] == [appended.rstrip()]
+    assert cursor.offset == len(first) + len(appended)
+    assert cursor.epoch == 0
+
+
+def test_complete_malformed_jsonl_remains_due_across_incremental_polls(tmp_path) -> None:
+    path = tmp_path / "rows.jsonl"
+    path.write_text('{"broken":}\n')
+    state = MonitorScanState()
+    due = {}
+
+    _read_retained_jsonl(
+        path,
+        final=False,
+        state=state,
+        evidence_grace=5.0,
+        evidence_due_since=due,
+        now_monotonic=10.0,
+    )
+    with pytest.raises(MonitorFailure, match="malformed_jsonl"):
+        _read_retained_jsonl(
+            path,
+            final=False,
+            state=state,
+            evidence_grace=5.0,
+            evidence_due_since=due,
+            now_monotonic=15.0,
+        )
+
+
+def test_monitor_waits_for_process_group_and_then_stable_final_scan(tmp_path, monkeypatch) -> None:
+    scans = []
+    groups = iter((True, False))
+    times = iter((0.0, 0.0, 1.0))
+    monkeypatch.setattr("scripts.task22.monitor_admission_run.time.monotonic", lambda: next(times))
+    monkeypatch.setattr("scripts.task22.monitor_admission_run.time.sleep", lambda _: None)
+    monkeypatch.setattr("scripts.task22.monitor_admission_run._process_exists", lambda *args: False)
+    monkeypatch.setattr(
+        "scripts.task22.monitor_admission_run._process_group_exists",
+        lambda pgid: next(groups),
+    )
+    monkeypatch.setattr(
+        "scripts.task22.monitor_admission_run._scan",
+        lambda *args, **kwargs: scans.append(kwargs["final"]),
+    )
+
+    rc = monitor(
+        tmp_path,
+        pid=123,
+        process_group_id=123,
+        expected_mode="shadow",
+        expected_rollouts=1,
+        expected_samples_per_partition=64,
+        expected_engines=2,
+        max_staleness=2,
+        admission_min=4,
+        admission_max=8,
+        admission_slack=2,
+        headline_lo=5,
+        headline_hi=6,
+        poll_interval=0.01,
+        evidence_grace=5.0,
+        pid_start_identity="start-1",
+        post_exit_grace=0,
+    )
+
+    assert rc == 0
+    assert scans == [False, False, True]
+
+
+def test_monitor_restarts_post_exit_grace_when_non_final_scan_finds_evidence(tmp_path, monkeypatch) -> None:
+    scans = []
+    times = iter((0.0, 0.0, 1.0))
+    monkeypatch.setattr("scripts.task22.monitor_admission_run.time.monotonic", lambda: next(times))
+    monkeypatch.setattr("scripts.task22.monitor_admission_run.time.sleep", lambda _: None)
+    monkeypatch.setattr("scripts.task22.monitor_admission_run._process_exists", lambda *args: False)
+
+    def scan(*args, **kwargs):
+        scans.append(kwargs["final"])
+        if len(scans) == 1:
+            kwargs["scan_state"].semantic_revision += 1
+
+    monkeypatch.setattr("scripts.task22.monitor_admission_run._scan", scan)
+
+    rc = monitor(
+        tmp_path,
+        pid=123,
+        process_group_id=None,
+        expected_mode="shadow",
+        expected_rollouts=1,
+        expected_samples_per_partition=64,
+        expected_engines=2,
+        max_staleness=2,
+        admission_min=4,
+        admission_max=8,
+        admission_slack=2,
+        headline_lo=5,
+        headline_hi=6,
+        poll_interval=0.01,
+        evidence_grace=5.0,
+        pid_start_identity="start-1",
+        post_exit_grace=0,
+    )
+
+    assert rc == 0
+    assert scans == [False, False, True]
+
+
+def test_monitor_fails_closed_when_gpu_sampler_identity_disappears(tmp_path, monkeypatch) -> None:
+    stopped = []
+    monkeypatch.setattr(
+        "scripts.task22.monitor_admission_run._process_exists",
+        lambda pid, expected_identity=None: pid == 123,
+    )
+    monkeypatch.setattr(
+        "scripts.task22.monitor_admission_run._process_start_identity",
+        lambda pid: "training-start" if pid == 123 else None,
+    )
+    monkeypatch.setattr(
+        "scripts.task22.monitor_admission_run._stop_process",
+        lambda *args, **kwargs: stopped.append(args[0]),
+    )
+
+    rc = monitor(
+        tmp_path,
+        pid=123,
+        process_group_id=123,
+        expected_mode="shadow",
+        expected_rollouts=1,
+        expected_samples_per_partition=64,
+        expected_engines=2,
+        max_staleness=2,
+        admission_min=4,
+        admission_max=8,
+        admission_slack=2,
+        headline_lo=5,
+        headline_hi=6,
+        poll_interval=0.01,
+        evidence_grace=5.0,
+        pid_start_identity="training-start",
+        sampler_pid=456,
+        sampler_start_identity="sampler-start",
+    )
+
+    assert rc == 4
+    assert stopped == [123]
+
+
+def test_gpu_snapshots_must_be_fresh_and_cover_run_interval(tmp_path) -> None:
+    path = tmp_path / "nvidia.csv"
+    path.write_text(
+        "2026-07-30T10:00:00+0800\n"
+        "0, 1 MiB, 1 %, 1 %, 1 W\n"
+        "1, 1 MiB, 1 %, 1 %, 1 W\n"
+        "2, 1 MiB, 1 %, 1 %, 1 W\n"
+        "3, 1 MiB, 1 %, 1 %, 1 W\n"
+        "2026-07-30T10:00:01+0800\n"
+        "0, 1 MiB, 1 %, 1 %, 1 W\n"
+        "1, 1 MiB, 1 %, 1 %, 1 W\n"
+        "2, 1 MiB, 1 %, 1 %, 1 W\n"
+        "3, 1 MiB, 1 %, 1 %, 1 W\n"
+    )
+    timestamp = datetime.fromisoformat("2026-07-30T10:00:01+08:00").timestamp()
+
+    with pytest.raises(MonitorFailure, match="stale_gpu_snapshot"):
+        _validate_gpu_snapshots(
+            path,
+            expected_engines=2,
+            final=False,
+            evidence_grace=5.0,
+            evidence_due_since={},
+            now_monotonic=0.0,
+            wall_time=timestamp + 6,
+            max_snapshot_age=5.0,
+        )
+    with pytest.raises(MonitorFailure, match="gpu_coverage_ends_early"):
+        _validate_gpu_snapshots(
+            path,
+            expected_engines=2,
+            final=True,
+            evidence_grace=5.0,
+            evidence_due_since={},
+            now_monotonic=0.0,
+            run_ended_at=timestamp + 4,
+        )
+
+
+def test_gpu_snapshots_reject_excessive_internal_sampling_gap(tmp_path) -> None:
+    path = tmp_path / "nvidia.csv"
+    snapshots = []
+    for timestamp in ("2026-07-30T10:00:00+0800", "2026-07-30T10:00:04+0800"):
+        snapshots.append(timestamp)
+        snapshots.extend(f"{index}, 1 MiB, 1 %, 1 %, 1 W" for index in range(4))
+    path.write_text("\n".join(snapshots) + "\n")
+
+    with pytest.raises(MonitorFailure, match="gpu_snapshot_gap"):
+        _validate_gpu_snapshots(
+            path,
+            expected_engines=2,
+            final=True,
+            evidence_grace=5.0,
+            evidence_due_since={},
+            now_monotonic=0.0,
+            max_snapshot_interval=2.0,
+        )

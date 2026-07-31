@@ -1,0 +1,12 @@
+{
+  "approved_revision": "task22-p1-admission-v1",
+  "pattern": "cuda\\.synchronize|dist\\.barrier|ray\\.get",
+  "schema_version": 1,
+  "sources": {
+    "relax/backends/megatron/actor.py": 24,
+    "relax/backends/megatron/weight_update/update_weight_from_tensor.py": 29,
+    "relax/components/rollout.py": 0,
+    "relax/engine/rollout/sglang_rollout.py": 3,
+    "relax/utils/utils.py": 0
+  }
+}

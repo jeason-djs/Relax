@@ -16,6 +16,13 @@ set -x
 now="$(date '+%Y-%m-%d-%H:%M:%S')"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 REPO="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
+PYTHON_REQUEST="${TASK22_PYTHON:?Set TASK22_PYTHON to an absolute executable launcher}"
+if [[ "$PYTHON_REQUEST" != /* || ! -x "$PYTHON_REQUEST" ]]; then
+    echo "TASK22_PYTHON must be an executable absolute path" >&2
+    exit 2
+fi
+PYTHON_BIN="$PYTHON_REQUEST"
+export TASK22_PYTHON="$PYTHON_REQUEST"
 
 export NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-0}"
 export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-eth0}"
@@ -110,7 +117,7 @@ if [[ -n "$REQUEST_OBSERVABILITY_DIR" ]]; then
     export RELAX_RID_ONLY_REQUEST_LOGGING=1
     export RAY_DEDUP_LOGS=0
     RUNTIME_ENV_JSON="$(
-        RUNTIME_ENV_JSON="$RUNTIME_ENV_JSON" python3 -c '
+        RUNTIME_ENV_JSON="$RUNTIME_ENV_JSON" "$PYTHON_BIN" -c '
 import json
 import os
 
@@ -123,6 +130,9 @@ for name in (
     "RELAX_REQUEST_PLACEMENT_MODE",
     "RELAX_REQUEST_PLACEMENT_POLICY",
     "RAY_DEDUP_LOGS",
+    "TASK22_PYTHON",
+    "TASK22_INPUT_MANIFEST",
+    "TASK22_INPUT_ROOTS_JSON",
 ):
     env_vars[name] = os.environ[name]
 print(json.dumps(runtime_env))
@@ -202,7 +212,11 @@ mkdir -p "$(dirname -- "$DRIVER_LOG_PATH")" "$TIMELINE_DUMP_DIR"
 ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
     ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \
     --runtime-env-json="${RUNTIME_ENV_JSON}" \
-    -- python3 -m relax.entrypoints.train \
+    -- env RUNTIME_ENV_JSON="$RUNTIME_ENV_JSON" \
+    TASK22_RUNTIME_ATTESTATION_DIR="${TASK22_RUNTIME_ATTESTATION_DIR:-}" \
+    TASK22_INPUT_MANIFEST="$TASK22_INPUT_MANIFEST" \
+    TASK22_INPUT_ROOTS_JSON="$TASK22_INPUT_ROOTS_JSON" \
+    "$PYTHON_BIN" -m relax.entrypoints.train \
     --resource '{"actor": [1, 2], "rollout": [1, 2]}' \
     --max-staleness "$MAX_STALENESS" \
     --num-data-storage-units 1 \

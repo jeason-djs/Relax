@@ -59,6 +59,9 @@ class MetricsBuffer:
 
     def __init__(self):
         self._buffer = defaultdict(list)
+        self._reporting: Dict[int, List[Dict[str, Any]]] = {}
+        self._reporting_active: set[int] = set()
+        self._sink_acks: Dict[int, set[str]] = {}
         self._lock = threading.Lock()
 
     def add_metric(self, step: int, metric_name: str, metric_value: Any, tags: Optional[Dict[str, str]] = None):
@@ -67,16 +70,78 @@ class MetricsBuffer:
 
     def get_metrics_for_step(self, step: int) -> List[Dict[str, Any]]:
         with self._lock:
-            return self._buffer.get(step, [])
+            # Callers iterate after the lock is released; never expose the
+            # mutable list that concurrent log requests append to.
+            return list(self._buffer.get(step, ()))
+
+    def reserve_metrics_for_step(self, step: int) -> Optional[List[Dict[str, Any]]]:
+        """Move pending metrics into one retryable reporting snapshot."""
+
+        with self._lock:
+            if step in self._reporting_active:
+                return None
+            snapshot = self._reporting.get(step)
+            if snapshot is None:
+                snapshot = list(self._buffer.pop(step, ()))
+                self._reporting[step] = snapshot
+                self._sink_acks[step] = set()
+            self._reporting_active.add(step)
+            return snapshot
+
+    def commit_metrics_for_step(self, step: int, snapshot: List[Dict[str, Any]]) -> None:
+        with self._lock:
+            if self._reporting.get(step) is not snapshot:
+                raise RuntimeError(f"Metrics reporting snapshot changed for step {step}")
+            self._reporting.pop(step, None)
+            self._reporting_active.discard(step)
+            self._sink_acks.pop(step, None)
+
+    def acknowledge_sink(self, step: int, snapshot: List[Dict[str, Any]], sink: str) -> None:
+        with self._lock:
+            if self._reporting.get(step) is not snapshot or step not in self._reporting_active:
+                raise RuntimeError(f"Metrics reporting snapshot changed for step {step}")
+            self._sink_acks[step].add(sink)
+
+    def acknowledged_sinks(self, step: int, snapshot: List[Dict[str, Any]]) -> set[str]:
+        with self._lock:
+            if self._reporting.get(step) is not snapshot:
+                raise RuntimeError(f"Metrics reporting snapshot changed for step {step}")
+            return set(self._sink_acks[step])
+
+    def release_metrics_for_retry(self, step: int, snapshot: List[Dict[str, Any]]) -> None:
+        """Keep the snapshot and per-sink acknowledgements for a later retry."""
+
+        with self._lock:
+            if self._reporting.get(step) is not snapshot:
+                raise RuntimeError(f"Metrics reporting snapshot changed for step {step}")
+            self._reporting_active.discard(step)
+
+    def rollback_metrics_for_step(self, step: int, snapshot: List[Dict[str, Any]]) -> None:
+        with self._lock:
+            if not snapshot:
+                return
+            if self._reporting.get(step) is not snapshot:
+                raise RuntimeError(f"Metrics reporting snapshot changed for step {step}")
+            pending = self._buffer.pop(step, [])
+            self._buffer[step] = [*snapshot, *pending]
+            del self._reporting[step]
+            self._reporting_active.discard(step)
+            self._sink_acks.pop(step, None)
+
+    def size(self) -> int:
+        with self._lock:
+            return len(set(self._buffer) | set(self._reporting))
 
     def clear_step(self, step: int):
         with self._lock:
-            if step in self._buffer:
-                del self._buffer[step]
+            self._buffer.pop(step, None)
+            self._reporting.pop(step, None)
+            self._reporting_active.discard(step)
+            self._sink_acks.pop(step, None)
 
     def has_metrics_for_step(self, step: int) -> bool:
         with self._lock:
-            return step in self._buffer and len(self._buffer[step]) > 0
+            return bool(self._buffer.get(step) or self._reporting.get(step))
 
 
 def is_timeline_event(metric_value: Any) -> bool:
@@ -246,11 +311,19 @@ class MetricsService:
 
     @app.post("/report_step")
     async def report_step(self, request: ReportStepRequest) -> Dict[str, Any]:
+        metrics: Optional[List[Dict[str, Any]]] = None
         try:
             step = request.step
-            metrics = self.metrics_buffer.get_metrics_for_step(step)
+            metrics = self.metrics_buffer.reserve_metrics_for_step(step)
+            if metrics is None:
+                return {
+                    "status": "error",
+                    "message": f"Metrics for step {step} are already being reported",
+                }
 
             report_results = {}
+            failed_sinks = []
+            acknowledged_sinks = self.metrics_buffer.acknowledged_sinks(step, metrics)
 
             # Handle regular metrics reporting
             if metrics:
@@ -260,58 +333,82 @@ class MetricsService:
                     metric_value = metric["value"]
                     metrics_dict[metric_name] = metric_value
 
-                if self._use_wandb:
+                if self._use_wandb and "wandb" not in acknowledged_sinks:
                     try:
                         wandb.log(metrics_dict, step=step)
+                        self.metrics_buffer.acknowledge_sink(step, metrics, "wandb")
                         report_results["wandb"] = "success"
                         logger.debug(f"Reported {len(metrics_dict)} metrics to W&B for step {step}")
                     except Exception as e:
                         report_results["wandb"] = f"error: {e}"
+                        failed_sinks.append("wandb")
                         logger.exception(f"Failed to report to W&B: {e}")
 
-                if "tensorboard" in self._adapters:
+                if "tensorboard" in self._adapters and "tensorboard" not in acknowledged_sinks:
                     try:
                         self._adapters["tensorboard"].log(data=metrics_dict, step=step)
+                        self.metrics_buffer.acknowledge_sink(step, metrics, "tensorboard")
                         report_results["tensorboard"] = "success"
                         logger.debug(f"Reported {len(metrics_dict)} metrics to TensorBoard for step {step}")
                     except Exception as e:
                         report_results["tensorboard"] = f"error: {e}"
+                        failed_sinks.append("tensorboard")
                         logger.exception(f"Failed to report to TensorBoard: {e}")
 
-                if "clearml" in self._adapters:
+                if "clearml" in self._adapters and "clearml" not in acknowledged_sinks:
                     try:
                         self._adapters["clearml"].log(data=metrics_dict, step=step)
+                        self.metrics_buffer.acknowledge_sink(step, metrics, "clearml")
                         report_results["clearml"] = "success"
                         logger.debug(f"Reported {len(metrics_dict)} metrics to ClearML for step {step}")
                     except Exception as e:
                         report_results["clearml"] = f"error: {e}"
+                        failed_sinks.append("clearml")
                         logger.exception(f"Failed to report to ClearML: {e}")
 
-                if "apprise" in self._adapters:
+                if "apprise" in self._adapters and "apprise" not in acknowledged_sinks:
                     try:
                         self._adapters["apprise"].log(data=metrics_dict, step=step)
+                        self.metrics_buffer.acknowledge_sink(step, metrics, "apprise")
                         report_results["apprise"] = "success"
                         logger.debug(f"Reported {len(metrics_dict)} metrics to Apprise for step {step}")
                     except Exception as e:
                         report_results["apprise"] = f"error: {e}"
+                        failed_sinks.append("apprise")
                         logger.exception(f"Failed to report to Apprise: {e}")
 
             # Handle timeline events dumping
             # Timeline events are accumulated directly in the adapter, dump on step report
-            if self._timeline_adapter and self._timeline_adapter.get_event_count() > 0:
+            if (
+                self._timeline_adapter
+                and "timeline" not in acknowledged_sinks
+                and self._timeline_adapter.get_event_count() > 0
+            ):
                 try:
                     event_count = self._timeline_adapter.get_event_count()
                     if self._timeline_adapter.dump(step):
+                        self.metrics_buffer.acknowledge_sink(step, metrics, "timeline")
                         report_results["timeline"] = f"dumped {event_count} events"
                         logger.info(f"Dumped {event_count} timeline events for step {step}")
                     else:
                         report_results["timeline"] = "not_dumped"
+                        failed_sinks.append("timeline")
                         logger.warning(f"Timeline events were not dumped for step {step}")
                 except Exception as e:
                     report_results["timeline"] = f"error: {e}"
+                    failed_sinks.append("timeline")
                     logger.exception(f"Failed to dump timeline: {e}")
 
-            self.metrics_buffer.clear_step(step)
+            if failed_sinks:
+                self.metrics_buffer.release_metrics_for_retry(step, metrics)
+                metrics = None
+                return {
+                    "status": "error",
+                    "message": f"Required sinks failed for step {step}: {', '.join(failed_sinks)}",
+                    "results": report_results,
+                }
+
+            self.metrics_buffer.commit_metrics_for_step(step, metrics)
             logger.info(f"Reported {len(metrics)} metrics for step {step}")
             return {
                 "status": "success",
@@ -320,6 +417,11 @@ class MetricsService:
             }
 
         except Exception as e:
+            if metrics is not None:
+                try:
+                    self.metrics_buffer.release_metrics_for_retry(request.step, metrics)
+                except Exception:
+                    logger.exception(f"Failed to retain metrics for step {request.step}")
             logger.error(f"Failed to report step {request.step}: {e}")
             return {"status": "error", "message": str(e)}
 
@@ -374,5 +476,5 @@ class MetricsService:
             "service": "metrics",
             "adapters_configured": list(self._adapters.keys()),
             "use_wandb": self._use_wandb,
-            "buffer_size": len(self.metrics_buffer._buffer),
+            "buffer_size": self.metrics_buffer.size(),
         }
