@@ -1249,6 +1249,7 @@ def test_retained_jsonl_same_record_after_truncate_is_a_visible_replay(tmp_path)
 
     first = _read_retained_jsonl(path, now_monotonic=1.0, **kwargs)
     path.write_text(encoded)
+    state.jsonl_cursors[str(path)].ctime_ns = -1
     replayed = _read_retained_jsonl(path, now_monotonic=2.0, **kwargs)
 
     assert len(first) == 2  # the retained list is updated in place

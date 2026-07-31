@@ -118,6 +118,9 @@ def _walk(root: Path) -> list[dict[str, Any]]:
                 opened_after = os.fstat(fd)
                 if _stable_identity(opened_before) != _stable_identity(opened_after):
                     raise ValueError(f"file changed while hashing: {root / child_relative}")
+                named_after = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                if _stable_identity(opened_after) != _stable_identity(named_after):
+                    raise ValueError(f"file changed while scanning: {root / child_relative}")
                 records.append(
                     {
                         "path": child_relative,

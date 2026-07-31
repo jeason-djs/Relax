@@ -52,7 +52,7 @@ def _rollout(*, completion_results):
     rollout.eval_handler = None
     rollout._stop_event = asyncio.Event()
     rollout._peer_barrier = None
-    rollout._logger = MagicMock()
+    rollout._logger_instance = MagicMock()
     rollout.rollout_manager = SimpleNamespace(generate=_AsyncRemote())
     rollout.data_system_client = SimpleNamespace(async_get_partition_list=_AsyncRemote([]))
     rollout.healthy = SimpleNamespace(report_error=_SyncRemote(), update_heartbeat=_SyncRemote())

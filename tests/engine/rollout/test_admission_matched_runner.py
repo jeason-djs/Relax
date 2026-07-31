@@ -371,6 +371,7 @@ for raw_path in sys.argv[1:]:
         "TASK22_AUTHORIZE_GPU_RUN": "1",
         "MODEL_DIR": str(tmp_path / "model"),
         "DATA_DIR": str(tmp_path / "data"),
+        "EXP_DIR": str(tmp_path / "model"),
         "RUN_ROOT": str(run_root),
         "TASK22_RUN_STAMP": "fixture",
         "RUN_TIMEOUT_S": "5400",
