@@ -98,7 +98,7 @@ def create_rollout_manager(args, pg, data_source=None, runtime_env=None):
             node_id=head_node_id,
             soft=False,  # Hard constraint: must run on the specified node
         ),
-    ).remote(args, pg, data_source=data_source)
+    ).remote(args, pg, data_source=data_source, runtime_env=runtime_env)
 
     # Add timeout protection to prevent indefinite blocking during initialization
     # The timeout is set to 120 seconds to allow sufficient time for:

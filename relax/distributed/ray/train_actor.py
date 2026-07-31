@@ -75,6 +75,15 @@ class TrainRayActor(RayActor):
         args.rank = dist.get_rank()
         args.world_size = dist.get_world_size()
 
+        from relax.utils.task22_runtime_attestation import (
+            maybe_write_task22_runtime_attestation,
+        )
+
+        maybe_write_task22_runtime_attestation(
+            "actor",
+            metadata={"rank": args.rank, "world_size": args.world_size},
+        )
+
         numa_local_rank = int(os.environ["RANK"]) % args.num_gpus_per_node
         device_utils.set_numa_affinity(numa_local_rank)
 

@@ -128,12 +128,14 @@ ONLINE_STRICT_CHECKS = {
     "request_attempt_ids_unique",
     "request_placement_is_off",
     "run_contract_matches_validator_arguments",
-    "run_contract_schema_is_current_v5",
+    "run_contract_schema_is_current_v6",
     "run_contract_valid",
     "runtime_attestations_match_contract",
     "runtime_attestations_parseable",
     "runtime_contract_content_hashes_valid",
     "runtime_contract_fields_valid",
+    "qualification_monitor_contract_valid",
+    "qualification_gpu_contract_valid",
     "runtime_keyed_sync_id_sets_match",
     "slime_router_is_disabled",
     "timeline_event_intervals_valid",
@@ -654,6 +656,16 @@ def _validate_contract(
     admission_slack: int,
     headline_lo: int,
     headline_hi: int,
+    poll_interval: float = 1.0,
+    evidence_grace: float = 5.0,
+    no_progress_timeout: float = 600.0,
+    gpu_max_snapshot_age: float = 5.0,
+    gpu_max_snapshot_interval: float = DEFAULT_GPU_MAX_SNAPSHOT_INTERVAL_S,
+    monitor_timeout: float = 5700.0,
+    monitor_term_grace: float = 1.0,
+    training_term_timeout: float = 10.0,
+    num_gpus: int = 4,
+    cuda_visible_devices: str = "",
     final: bool = False,
 ) -> None:
     contract = _load_contract(run_dir / "run_contract.json")
@@ -670,6 +682,16 @@ def _validate_contract(
         "admission_slack": admission_slack,
         "request_placement_mode": "off",
         "use_slime_router": False,
+        "monitor_poll_interval_s": poll_interval,
+        "monitor_evidence_grace_s": evidence_grace,
+        "monitor_no_progress_timeout_s": no_progress_timeout,
+        "gpu_max_snapshot_age_s": gpu_max_snapshot_age,
+        "gpu_max_snapshot_interval_s": gpu_max_snapshot_interval,
+        "monitor_timeout_s": monitor_timeout,
+        "monitor_term_grace_s": monitor_term_grace,
+        "training_term_timeout_s": training_term_timeout,
+        "num_gpus": num_gpus,
+        "cuda_visible_devices": cuda_visible_devices,
     }
     mismatches = {
         key: (value, contract.get(key))
@@ -678,8 +700,10 @@ def _validate_contract(
     }
     if mismatches:
         raise MonitorFailure(f"run_contract_mismatch:{mismatches}")
-    if contract.get("schema_version", 0) < 3:
-        return
+    if contract.get("schema_version") != 6:
+        raise MonitorFailure(
+            f"run_contract_schema_mismatch:expected=6:actual={contract.get('schema_version')}"
+        )
     working_dir = contract.get("working_dir")
     runtime_hash = contract.get("runtime_env_json_sha256")
     if (
@@ -687,8 +711,39 @@ def _validate_contract(
         or not Path(working_dir).is_absolute()
         or not isinstance(runtime_hash, str)
         or len(runtime_hash) != 64
+        or not isinstance(contract.get("task22_env_sha256"), str)
+        or len(contract["task22_env_sha256"]) != 64
     ):
         raise MonitorFailure("invalid_runtime_contract_fields")
+    positive_monitor_fields = (
+        "monitor_poll_interval_s",
+        "monitor_evidence_grace_s",
+        "gpu_max_snapshot_age_s",
+        "gpu_max_snapshot_interval_s",
+        "monitor_timeout_s",
+        "training_term_timeout_s",
+    )
+    if (
+        any(
+            not isinstance(contract.get(name), (int, float))
+            or isinstance(contract.get(name), bool)
+            or float(contract[name]) <= 0
+            for name in positive_monitor_fields
+        )
+        or not isinstance(contract.get("monitor_term_grace_s"), (int, float))
+        or isinstance(contract.get("monitor_term_grace_s"), bool)
+        or float(contract["monitor_term_grace_s"]) < 0
+        or contract.get("monitor_no_progress_timeout_s") != 600.0
+    ):
+        raise MonitorFailure("invalid_qualification_monitor_contract")
+    visible_devices = cuda_visible_devices.split(",") if cuda_visible_devices else []
+    if (
+        num_gpus != 4
+        or (visible_devices and (len(visible_devices) != 4 or len(set(visible_devices)) != 4))
+        or contract.get("num_gpus") != 4
+        or contract.get("cuda_visible_devices") != cuda_visible_devices
+    ):
+        raise MonitorFailure("invalid_qualification_gpu_contract")
     attestation_dir = Path(
         os.environ.get(
             "TASK22_RUNTIME_ATTESTATION_DIR",
@@ -696,6 +751,7 @@ def _validate_contract(
         )
     )
     roles = Counter()
+    attestations = []
     for path in sorted(attestation_dir.glob("runtime_attestation_*.json")):
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
@@ -703,6 +759,7 @@ def _validate_contract(
             raise MonitorFailure(f"invalid_runtime_attestation:{path.name}:{exc}") from exc
         if not isinstance(payload, dict):
             raise MonitorFailure(f"invalid_runtime_attestation:{path.name}:not_object")
+        attestations.append(payload)
         if not attestation_matches_contract(payload, contract):
             raise MonitorFailure(
                 "runtime_attestation_contract_mismatch:"
@@ -710,8 +767,27 @@ def _validate_contract(
                 f"runtime_working_dir={payload.get('working_dir')}"
             )
         roles[payload.get("role")] += 1
-    if final and (roles["driver"] != 1 or roles["ray_worker"] < 1):
-        raise MonitorFailure(f"incomplete_runtime_attestation_roles:{dict(roles)}")
+    if final:
+        actor_ranks = {
+            payload.get("rank") for payload in attestations if payload.get("role") == "actor"
+        }
+        engine_ranks = {
+            payload.get("rank")
+            for payload in attestations
+            if payload.get("role") == "rollout_engine"
+        }
+        if not (
+            roles["driver"] == 1
+            and roles["actor"] == 2
+            and actor_ranks == {0, 1}
+            and roles["rollout_engine"] == expected_engines
+            and engine_ranks == set(range(expected_engines))
+        ):
+            raise MonitorFailure(
+                "incomplete_runtime_attestation_roles:"
+                f"roles={dict(roles)}:actors={sorted(map(str, actor_ranks))}:"
+                f"engines={sorted(map(str, engine_ranks))}"
+            )
 
 
 def _parse_metric_rows(text: str, pattern: re.Pattern[str]) -> dict[int, list[dict[str, Any]]]:
@@ -1360,7 +1436,9 @@ def _scan(
     final: bool,
     reported_lifecycle: set[tuple[str, int]],
     event_log: Path,
+    poll_interval: float = 1.0,
     evidence_grace: float = 5.0,
+    no_progress_timeout: float = 600.0,
     timeline_evidence_due_since: dict[int, float] | None = None,
     strict_evidence_due_since: dict[str, float] | None = None,
     now_monotonic: float | None = None,
@@ -1370,7 +1448,15 @@ def _scan(
     wall_time: float | None = None,
     gpu_max_snapshot_age: float | None = None,
     gpu_max_snapshot_interval: float = DEFAULT_GPU_MAX_SNAPSHOT_INTERVAL_S,
+    monitor_timeout: float = 5700.0,
+    monitor_term_grace: float = 1.0,
+    training_term_timeout: float = 10.0,
+    num_gpus: int = 4,
+    cuda_visible_devices: str = "",
 ) -> None:
+    contract_gpu_max_snapshot_age = (
+        5.0 if gpu_max_snapshot_age is None else gpu_max_snapshot_age
+    )
     _validate_contract(
         run_dir,
         expected_mode=expected_mode,
@@ -1383,6 +1469,16 @@ def _scan(
         admission_slack=admission_slack,
         headline_lo=headline_lo,
         headline_hi=headline_hi,
+        poll_interval=poll_interval,
+        evidence_grace=evidence_grace,
+        no_progress_timeout=no_progress_timeout,
+        gpu_max_snapshot_age=contract_gpu_max_snapshot_age,
+        gpu_max_snapshot_interval=gpu_max_snapshot_interval,
+        monitor_timeout=monitor_timeout,
+        monitor_term_grace=monitor_term_grace,
+        training_term_timeout=training_term_timeout,
+        num_gpus=num_gpus,
+        cuda_visible_devices=cuda_visible_devices,
         final=final,
     )
 
@@ -1770,7 +1866,7 @@ def monitor(
     poll_interval: float,
     evidence_grace: float,
     pid_start_identity: str | None = None,
-    no_progress_timeout: float = 300.0,
+    no_progress_timeout: float = 600.0,
     post_exit_grace: float | None = None,
     term_timeout: float = 10.0,
     sampler_pid: int | None = None,
@@ -1778,6 +1874,10 @@ def monitor(
     run_started_at: float | None = None,
     gpu_max_snapshot_age: float = 5.0,
     gpu_max_snapshot_interval: float = DEFAULT_GPU_MAX_SNAPSHOT_INTERVAL_S,
+    monitor_timeout: float = 5700.0,
+    monitor_term_grace: float = 1.0,
+    num_gpus: int = 4,
+    cuda_visible_devices: str = "",
 ) -> int:
     if (admission_min, admission_max, admission_slack) != (4, 8, 2):
         raise MonitorFailure(
@@ -1791,6 +1891,12 @@ def monitor(
         raise MonitorFailure(f"invalid_staleness_contract:{max_staleness}:expected=2")
     if expected_engines != 2:
         raise MonitorFailure(f"invalid_engine_contract:{expected_engines}:expected=2")
+    if num_gpus != 4:
+        raise MonitorFailure(f"invalid_gpu_contract:{num_gpus}:expected=4")
+    if no_progress_timeout != 600.0:
+        raise MonitorFailure(
+            f"invalid_no_progress_timeout:{no_progress_timeout:g}:expected=600"
+        )
 
     event_log = run_dir / "online_monitor.jsonl"
     reported_lifecycle: set[tuple[str, int]] = set()
@@ -1872,7 +1978,9 @@ def monitor(
                 final=False,
                 reported_lifecycle=reported_lifecycle,
                 event_log=event_log,
+                poll_interval=poll_interval,
                 evidence_grace=evidence_grace,
+                no_progress_timeout=no_progress_timeout,
                 timeline_evidence_due_since=timeline_evidence_due_since,
                 strict_evidence_due_since=strict_evidence_due_since,
                 now_monotonic=now,
@@ -1882,6 +1990,11 @@ def monitor(
                 wall_time=time.time(),
                 gpu_max_snapshot_age=gpu_max_snapshot_age,
                 gpu_max_snapshot_interval=gpu_max_snapshot_interval,
+                monitor_timeout=monitor_timeout,
+                monitor_term_grace=monitor_term_grace,
+                training_term_timeout=term_timeout,
+                num_gpus=num_gpus,
+                cuda_visible_devices=cuda_visible_devices,
             )
             # Scan before enforcing the deadline so a complete semantic record
             # already on disk at the boundary gets counted.
@@ -1915,7 +2028,9 @@ def monitor(
                             final=True,
                             reported_lifecycle=reported_lifecycle,
                             event_log=event_log,
+                            poll_interval=poll_interval,
                             evidence_grace=evidence_grace,
+                            no_progress_timeout=no_progress_timeout,
                             timeline_evidence_due_since=timeline_evidence_due_since,
                             strict_evidence_due_since=strict_evidence_due_since,
                             now_monotonic=now,
@@ -1925,6 +2040,11 @@ def monitor(
                             wall_time=time.time(),
                             gpu_max_snapshot_age=gpu_max_snapshot_age,
                             gpu_max_snapshot_interval=gpu_max_snapshot_interval,
+                            monitor_timeout=monitor_timeout,
+                            monitor_term_grace=monitor_term_grace,
+                            training_term_timeout=term_timeout,
+                            num_gpus=num_gpus,
+                            cuda_visible_devices=cuda_visible_devices,
                         )
                         if scan_state.semantic_revision != final_revision:
                             last_progress_token = _evidence_progress_token(run_dir, scan_state)
@@ -1996,9 +2116,13 @@ def main() -> None:
         type=float,
         default=DEFAULT_GPU_MAX_SNAPSHOT_INTERVAL_S,
     )
-    parser.add_argument("--no-progress-timeout", type=float, default=300.0)
+    parser.add_argument("--no-progress-timeout", type=float, default=600.0)
     parser.add_argument("--post-exit-grace", type=float)
     parser.add_argument("--term-timeout", type=float, default=10.0)
+    parser.add_argument("--monitor-timeout", type=float, default=5700.0)
+    parser.add_argument("--monitor-term-grace", type=float, default=1.0)
+    parser.add_argument("--num-gpus", type=int, required=True)
+    parser.add_argument("--cuda-visible-devices", required=True)
     args = parser.parse_args()
     if args.pid <= 0:
         parser.error("--pid must be positive")
@@ -2012,6 +2136,10 @@ def main() -> None:
         parser.error("--post-exit-grace must be non-negative")
     if args.term_timeout < 0:
         parser.error("--term-timeout must be non-negative")
+    if args.monitor_timeout <= 0:
+        parser.error("--monitor-timeout must be positive")
+    if args.monitor_term_grace < 0:
+        parser.error("--monitor-term-grace must be non-negative")
     if args.sampler_pid is not None and args.sampler_pid <= 0:
         parser.error("--sampler-pid must be positive")
     if args.gpu_max_snapshot_age <= 0:
@@ -2058,6 +2186,10 @@ def main() -> None:
             run_started_at=args.run_started_at,
             gpu_max_snapshot_age=args.gpu_max_snapshot_age,
             gpu_max_snapshot_interval=args.gpu_max_snapshot_interval,
+            monitor_timeout=args.monitor_timeout,
+            monitor_term_grace=args.monitor_term_grace,
+            num_gpus=args.num_gpus,
+            cuda_visible_devices=args.cuda_visible_devices,
         )
     )
 

@@ -28,9 +28,16 @@ echo "TASK22_PREFLIGHT mode=$MODE repo=$REPO"
     scripts/task22/analyze_rollout_observability.py \
     scripts/task22/compare_admission_pair.py \
     scripts/task22/input_guard.py \
+    scripts/task22/enforce_process_deadline.py \
     scripts/task22/monitor_admission_run.py \
+    scripts/task22/sample_gpu_state.py \
     scripts/task22/simulate_request_placement.py \
     scripts/task22/validate_admission_run.py \
+    relax/backends/sglang/sglang_engine.py \
+    relax/distributed/ray/actor_group.py \
+    relax/distributed/ray/placement_group.py \
+    relax/distributed/ray/rollout.py \
+    relax/distributed/ray/train_actor.py \
     relax/entrypoints/train.py \
     relax/engine/router/placement.py \
     relax/engine/router/router.py \
@@ -103,9 +110,35 @@ for command in cmp git ray nvidia-smi timeout sha256sum; do
     fi
 done
 
-gpu_count="$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l | tr -d ' ')"
+if [[ "${NUM_GPUS:-}" != "4" ]]; then
+    echo "Formal Task 22 Ray declaration requires NUM_GPUS=4; got ${NUM_GPUS:-unset}" >&2
+    exit 4
+fi
+if ! normalized_visible="$(
+    CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-}" "$PYTHON_BIN" -c '
+import os
+
+raw = os.environ["CUDA_VISIBLE_DEVICES"]
+if not raw.strip():
+    print("")
+    raise SystemExit(0)
+devices = [value.strip() for value in raw.split(",")]
+if any(not value for value in devices) or len(devices) != 4 or len(set(devices)) != 4:
+    raise SystemExit(4)
+print(",".join(devices))
+'
+)"; then
+    echo "Formal Task 22 requires CUDA_VISIBLE_DEVICES to be empty or 4 unique devices" >&2
+    exit 4
+fi
+if [[ "$normalized_visible" != "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+    echo "Formal Task 22 requires normalized CUDA_VISIBLE_DEVICES=$normalized_visible" >&2
+    exit 4
+fi
+
+gpu_count="$(env -u CUDA_VISIBLE_DEVICES nvidia-smi --query-gpu=index --format=csv,noheader | wc -l | tr -d ' ')"
 if [[ "$gpu_count" != "4" ]]; then
-    echo "Formal Task 22 runner requires exactly 4 visible GPUs, found $gpu_count" >&2
+    echo "Formal Task 22 runner requires exactly 4 physical GPUs, found $gpu_count" >&2
     exit 4
 fi
 
@@ -125,5 +158,6 @@ DATA_DIR="${DATA_DIR:?Set DATA_DIR for formal preflight}"
 }
 
 echo "TASK22_PREFLIGHT sglang_smoke=PASS"
+echo "TASK22_PREFLIGHT ray_declared_gpus=$NUM_GPUS"
 echo "TASK22_PREFLIGHT gpu_count=$gpu_count"
 echo "TASK22_PREFLIGHT verdict=PASS_FORMAL"

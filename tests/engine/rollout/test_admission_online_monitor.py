@@ -33,7 +33,9 @@ from scripts.task22.monitor_admission_run import (
 
 
 def _prepare_monitor_inputs(run_dir) -> None:
+    digest = "a" * 64
     contract = {
+        "schema_version": 6,
         "admission_mode": "shadow",
         "num_rollout": 1,
         "expected_samples_per_partition": 64,
@@ -46,8 +48,47 @@ def _prepare_monitor_inputs(run_dir) -> None:
         "admission_slack": 2,
         "request_placement_mode": "off",
         "use_slime_router": False,
+        "working_dir": str(run_dir.resolve()),
+        "working_dir_content_sha256": digest,
+        "runtime_env_json_sha256": digest,
+        "task22_env_sha256": digest,
+        "input_manifest_sha256": digest,
+        "monitor_poll_interval_s": 1.0,
+        "monitor_evidence_grace_s": 5.0,
+        "monitor_no_progress_timeout_s": 600.0,
+        "gpu_max_snapshot_age_s": 5.0,
+        "gpu_max_snapshot_interval_s": 2.0,
+        "monitor_timeout_s": 5700,
+        "monitor_term_grace_s": 1.0,
+        "training_term_timeout_s": 10.0,
+        "num_gpus": 4,
+        "cuda_visible_devices": "",
+        "training_python": {},
+        "sglang_source_sha256": {},
     }
     (run_dir / "run_contract.json").write_text(json.dumps(contract) + "\n")
+    attestation_dir = run_dir / "runtime_attestation"
+    attestation_dir.mkdir(exist_ok=True)
+    common = {
+        "working_dir": contract["working_dir"],
+        "working_dir_content_sha256": digest,
+        "runtime_env_json_sha256": digest,
+        "task22_env_sha256": digest,
+        "python": {},
+        "sglang_source_sha256": {},
+        "input_manifest": {"sha256": digest},
+    }
+    for role, rank in (
+        ("driver", None),
+        ("actor", 0),
+        ("actor", 1),
+        ("rollout_engine", 0),
+        ("rollout_engine", 1),
+    ):
+        suffix = role if rank is None else f"{role}_{rank}"
+        (attestation_dir / f"runtime_attestation_{suffix}.json").write_text(
+            json.dumps({**common, "role": role, "rank": rank}) + "\n"
+        )
     logs = run_dir / "logs"
     logs.mkdir(exist_ok=True)
     snapshot = (
@@ -103,7 +144,7 @@ def _write_physical_flow(run_dir, rollout_ids=(0,)) -> None:
 def test_online_monitor_uses_content_hash_not_ray_unpack_path(tmp_path) -> None:
     digest = "a" * 64
     contract = {
-        "schema_version": 5,
+        "schema_version": 6,
         "admission_mode": "shadow",
         "num_rollout": 1,
         "expected_samples_per_partition": 64,
@@ -119,24 +160,53 @@ def test_online_monitor_uses_content_hash_not_ray_unpack_path(tmp_path) -> None:
         "working_dir": "/source/repo",
         "working_dir_content_sha256": digest,
         "runtime_env_json_sha256": digest,
+        "task22_env_sha256": digest,
         "input_manifest_sha256": digest,
+        "monitor_poll_interval_s": 1.0,
+        "monitor_evidence_grace_s": 5.0,
+        "monitor_no_progress_timeout_s": 600.0,
+        "gpu_max_snapshot_age_s": 5.0,
+        "gpu_max_snapshot_interval_s": 2.0,
+        "monitor_timeout_s": 5700,
+        "monitor_term_grace_s": 1.0,
+        "training_term_timeout_s": 10.0,
+        "num_gpus": 4,
+        "cuda_visible_devices": "",
         "training_python": {},
         "sglang_source_sha256": {},
     }
     (tmp_path / "run_contract.json").write_text(json.dumps(contract) + "\n")
     attestation_dir = tmp_path / "runtime_attestation"
     attestation_dir.mkdir()
-    for role in ("driver", "ray_worker"):
+    for role, rank in (("driver", None), ("actor", 0), ("actor", 1)):
         attestation = {
             "role": role,
+            "rank": rank,
             "working_dir": f"/tmp/ray/session/{role}",
             "working_dir_content_sha256": digest,
             "runtime_env_json_sha256": digest,
+            "task22_env_sha256": digest,
             "python": {},
             "sglang_source_sha256": {},
             "input_manifest": {"sha256": digest},
         }
-        (attestation_dir / f"runtime_attestation_{role}.json").write_text(
+        suffix = role if rank is None else f"{role}_{rank}"
+        (attestation_dir / f"runtime_attestation_{suffix}.json").write_text(
+            json.dumps(attestation) + "\n"
+        )
+    for rank in range(2):
+        attestation = {
+            "role": "rollout_engine",
+            "rank": rank,
+            "working_dir": f"/tmp/ray/session/rollout_engine_{rank}",
+            "working_dir_content_sha256": digest,
+            "runtime_env_json_sha256": digest,
+            "task22_env_sha256": digest,
+            "python": {},
+            "sglang_source_sha256": {},
+            "input_manifest": {"sha256": digest},
+        }
+        (attestation_dir / f"runtime_attestation_rollout_engine_{rank}.json").write_text(
             json.dumps(attestation) + "\n"
         )
 
@@ -155,7 +225,7 @@ def test_online_monitor_uses_content_hash_not_ray_unpack_path(tmp_path) -> None:
         final=True,
     )
 
-    worker_path = attestation_dir / "runtime_attestation_ray_worker.json"
+    worker_path = attestation_dir / "runtime_attestation_actor_0.json"
     worker = json.loads(worker_path.read_text())
     worker["working_dir_content_sha256"] = "b" * 64
     worker_path.write_text(json.dumps(worker) + "\n")
@@ -614,7 +684,7 @@ def test_monitor_kills_even_when_failure_audit_cannot_be_written(tmp_path, monke
 
 
 def test_monitor_fails_closed_when_running_evidence_makes_no_progress(tmp_path, monkeypatch) -> None:
-    times = iter((0.0, 0.0, 2.0))
+    times = iter((0.0, 0.0, 601.0))
     stopped = []
     monkeypatch.setattr("scripts.task22.monitor_admission_run.time.monotonic", lambda: next(times))
     monkeypatch.setattr("scripts.task22.monitor_admission_run.time.sleep", lambda delay: None)
@@ -646,13 +716,13 @@ def test_monitor_fails_closed_when_running_evidence_makes_no_progress(tmp_path, 
         poll_interval=0.01,
         evidence_grace=5.0,
         pid_start_identity="start-1",
-        no_progress_timeout=1.0,
+        no_progress_timeout=600.0,
     )
 
     assert rc == 4
     assert stopped == [123]
     rows = [json.loads(line) for line in (tmp_path / "online_monitor.jsonl").read_text().splitlines()]
-    assert any(row.get("reason") == "no_evidence_progress:1s" for row in rows)
+    assert any(row.get("reason") == "no_evidence_progress:600s" for row in rows)
 
 
 def test_strict_check_coverage_mapping_has_no_validator_omissions() -> None:
@@ -680,6 +750,44 @@ def test_online_monitor_rejects_run_contract_fixed_field_drift(tmp_path) -> None
     contract_path = tmp_path / "run_contract.json"
     contract = json.loads(contract_path.read_text())
     contract["expected_engines"] = 1
+    contract_path.write_text(json.dumps(contract))
+
+    with pytest.raises(MonitorFailure, match="run_contract_mismatch"):
+        _validate_contract(
+            tmp_path,
+            expected_mode="shadow",
+            expected_rollouts=1,
+            expected_samples_per_partition=64,
+            expected_engines=2,
+            max_staleness=2,
+            admission_min=4,
+            admission_max=8,
+            admission_slack=2,
+            headline_lo=5,
+            headline_hi=6,
+        )
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "monitor_poll_interval_s",
+        "monitor_evidence_grace_s",
+        "monitor_no_progress_timeout_s",
+        "gpu_max_snapshot_age_s",
+        "gpu_max_snapshot_interval_s",
+        "monitor_timeout_s",
+        "monitor_term_grace_s",
+        "training_term_timeout_s",
+    ),
+)
+def test_online_monitor_rejects_supervision_argument_contract_drift_999(
+    tmp_path, field
+) -> None:
+    _prepare_monitor_inputs(tmp_path)
+    contract_path = tmp_path / "run_contract.json"
+    contract = json.loads(contract_path.read_text())
+    contract[field] = 999
     contract_path.write_text(json.dumps(contract))
 
     with pytest.raises(MonitorFailure, match="run_contract_mismatch"):

@@ -3,6 +3,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from relax.engine.rollout.request_observability import attempt_token_from_id
 from scripts.task22.validate_admission_run import validate_run
 
@@ -199,7 +201,7 @@ def _build_valid_run(tmp_path: Path) -> Path:
     (run_dir / "EXIT_CODE").write_text("0\n", encoding="utf-8")
     digest = "a" * 64
     contract = {
-        "schema_version": 5,
+        "schema_version": 6,
         "admission_mode": "shadow",
         "num_rollout": 1,
         "expected_samples_per_partition": 1,
@@ -215,7 +217,18 @@ def _build_valid_run(tmp_path: Path) -> Path:
         "working_dir": str(run_dir.resolve()),
         "working_dir_content_sha256": digest,
         "runtime_env_json_sha256": digest,
+        "task22_env_sha256": digest,
         "input_manifest_sha256": digest,
+        "monitor_poll_interval_s": 1.0,
+        "monitor_evidence_grace_s": 5.0,
+        "monitor_no_progress_timeout_s": 600.0,
+        "gpu_max_snapshot_age_s": 5.0,
+        "gpu_max_snapshot_interval_s": 2.0,
+        "monitor_timeout_s": 5700,
+        "monitor_term_grace_s": 1.0,
+        "training_term_timeout_s": 10.0,
+        "num_gpus": 4,
+        "cuda_visible_devices": "",
         "training_python": {},
         "sglang_source_sha256": {},
     }
@@ -227,17 +240,25 @@ def _build_valid_run(tmp_path: Path) -> Path:
         )
     attestation_dir = run_dir / "runtime_attestation"
     attestation_dir.mkdir()
-    for role in ("driver", "ray_worker"):
+    for role, rank in (
+        ("driver", None),
+        ("actor", 0),
+        ("actor", 1),
+        ("rollout_engine", 0),
+    ):
         attestation = {
             "role": role,
+            "rank": rank,
             "working_dir": contract["working_dir"],
             "working_dir_content_sha256": digest,
             "runtime_env_json_sha256": digest,
+            "task22_env_sha256": digest,
             "python": {},
             "sglang_source_sha256": {},
             "input_manifest": {"sha256": digest},
         }
-        (attestation_dir / f"runtime_attestation_{role}.json").write_text(
+        suffix = role if rank is None else f"{role}_{rank}"
+        (attestation_dir / f"runtime_attestation_{suffix}.json").write_text(
             json.dumps(attestation) + "\n",
             encoding="utf-8",
         )
@@ -281,6 +302,34 @@ def test_admission_run_validator_accepts_complete_evidence(tmp_path) -> None:
     assert result["checks"]["runtime_keyed_sync_id_sets_match"]
 
 
+@pytest.mark.parametrize(
+    "field",
+    (
+        "monitor_poll_interval_s",
+        "monitor_evidence_grace_s",
+        "monitor_no_progress_timeout_s",
+        "gpu_max_snapshot_age_s",
+        "gpu_max_snapshot_interval_s",
+        "monitor_timeout_s",
+        "monitor_term_grace_s",
+        "training_term_timeout_s",
+    ),
+)
+def test_admission_run_validator_rejects_supervision_argument_contract_drift_999(
+    tmp_path, field
+) -> None:
+    run_dir = _build_valid_run(tmp_path)
+    contract_path = run_dir / "run_contract.json"
+    contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    contract[field] = 999
+    contract_path.write_text(json.dumps(contract) + "\n", encoding="utf-8")
+
+    result = _validate(run_dir)
+
+    assert result["verdict"] == "FAIL"
+    assert not result["checks"]["run_contract_matches_validator_arguments"]
+
+
 def test_admission_run_validator_accepts_ray_unpack_path_with_matching_content_hash(tmp_path) -> None:
     run_dir = _build_valid_run(tmp_path)
     for path in (run_dir / "runtime_attestation").glob("runtime_attestation_*.json"):
@@ -295,7 +344,7 @@ def test_admission_run_validator_accepts_ray_unpack_path_with_matching_content_h
 
 def test_admission_run_validator_rejects_ray_unpack_content_hash_drift(tmp_path) -> None:
     run_dir = _build_valid_run(tmp_path)
-    path = run_dir / "runtime_attestation/runtime_attestation_ray_worker.json"
+    path = run_dir / "runtime_attestation/runtime_attestation_actor_0.json"
     attestation = json.loads(path.read_text(encoding="utf-8"))
     attestation["working_dir"] = "/tmp/ray/session/working_dir"
     attestation["working_dir_content_sha256"] = "b" * 64
@@ -305,6 +354,47 @@ def test_admission_run_validator_rejects_ray_unpack_content_hash_drift(tmp_path)
 
     assert result["verdict"] == "FAIL"
     assert not result["checks"]["runtime_attestations_match_contract"]
+
+
+def test_admission_run_validator_requires_real_actor_and_each_rollout_engine(tmp_path) -> None:
+    run_dir = _build_valid_run(tmp_path)
+    engine_path = run_dir / "runtime_attestation/runtime_attestation_rollout_engine_0.json"
+    engine = json.loads(engine_path.read_text(encoding="utf-8"))
+    for rank in range(2):
+        (run_dir / "runtime_attestation" / f"runtime_attestation_rollout_engine_{rank}.json").write_text(
+            json.dumps({**engine, "rank": rank}) + "\n",
+            encoding="utf-8",
+        )
+    contract = json.loads((run_dir / "run_contract.json").read_text(encoding="utf-8"))
+    contract["expected_engines"] = 2
+    (run_dir / "run_contract.json").write_text(json.dumps(contract) + "\n", encoding="utf-8")
+
+    result = validate_run(
+        run_dir,
+        expected_mode="shadow",
+        expected_rollouts=1,
+        expected_samples_per_partition=1,
+        expected_engines=2,
+        max_staleness=2,
+        headline_lo=0,
+        headline_hi=0,
+        require_resume=False,
+    )
+    assert result["checks"]["runtime_attestation_roles_complete"]
+
+    (run_dir / "runtime_attestation/runtime_attestation_rollout_engine_1.json").unlink()
+    result = validate_run(
+        run_dir,
+        expected_mode="shadow",
+        expected_rollouts=1,
+        expected_samples_per_partition=1,
+        expected_engines=2,
+        max_staleness=2,
+        headline_lo=0,
+        headline_hi=0,
+        require_resume=False,
+    )
+    assert not result["checks"]["runtime_attestation_roles_complete"]
 
 
 def test_admission_run_validator_rejects_missing_admission_ledger(tmp_path) -> None:
@@ -550,7 +640,7 @@ def test_admission_run_validator_rejects_downgraded_contract_schema(tmp_path) ->
     result = _validate(run_dir)
 
     assert result["verdict"] == "FAIL"
-    assert not result["checks"]["run_contract_schema_is_current_v5"]
+    assert not result["checks"]["run_contract_schema_is_current_v6"]
 
 
 def test_admission_run_validator_rejects_missing_contract_schema(tmp_path) -> None:
@@ -563,7 +653,7 @@ def test_admission_run_validator_rejects_missing_contract_schema(tmp_path) -> No
     result = _validate(run_dir)
 
     assert result["verdict"] == "FAIL"
-    assert not result["checks"]["run_contract_schema_is_current_v5"]
+    assert not result["checks"]["run_contract_schema_is_current_v6"]
 
 
 def test_admission_run_validator_recomputes_bounded_admission(tmp_path) -> None:

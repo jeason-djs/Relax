@@ -380,6 +380,15 @@ class SGLangEngine(RayActor):
         else:
             self._init_normal(server_args_dict)
 
+        from relax.utils.task22_runtime_attestation import (
+            maybe_write_task22_runtime_attestation,
+        )
+
+        maybe_write_task22_runtime_attestation(
+            "rollout_engine",
+            metadata={"rank": self.rank, "worker_type": self.worker_type},
+        )
+
         # Register to DCS coordinator only if not skipped (e.g., for scaled-out engines)
         # Scaled-out engines use direct weight sync from seed engine instead of DCS.
         # Done after engine startup so the coordinator can immediately reach the server.

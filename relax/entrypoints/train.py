@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import atexit
+import json
 import os
 import signal
 import sys
@@ -30,24 +31,6 @@ logger = get_logger(__name__)
 # Global reference so signal handlers / atexit can reach the controller.
 _ctrl: Controller | None = None
 _shutdown_done = False
-
-
-@ray.remote(num_cpus=0)
-def _write_task22_worker_attestation(
-    directory: str,
-    runtime_env_json: str,
-    input_manifest_path: str,
-    input_roots_json: str,
-) -> str:
-    from relax.utils.task22_runtime_attestation import write_attestation
-
-    return write_attestation(
-        directory,
-        "ray_worker",
-        runtime_env_json,
-        input_manifest_path,
-        input_roots_json,
-    )
 
 
 def _hard_exit(code: int):
@@ -105,6 +88,17 @@ def main(args):
         runtime_env = yaml.safe_load(file)
 
     runtime_env = post_process_env(args, runtime_env)
+    attestation_dir = os.environ.get("TASK22_RUNTIME_ATTESTATION_DIR")
+    if attestation_dir:
+        submitted_runtime_env = json.loads(os.environ["RUNTIME_ENV_JSON"])
+        submitted_env_vars = submitted_runtime_env.get("env_vars")
+        if not isinstance(submitted_env_vars, dict):
+            raise RuntimeError("Task 22 runtime env must contain an env_vars object")
+        runtime_env["env_vars"].update(submitted_env_vars)
+        runtime_env["env_vars"]["RUNTIME_ENV_JSON"] = os.environ["RUNTIME_ENV_JSON"]
+        runtime_env["env_vars"]["TASK22_RUNTIME_ATTESTATION_DIR"] = attestation_dir
+        if working_dir := submitted_runtime_env.get("working_dir"):
+            runtime_env["working_dir"] = working_dir
     if not ray.is_initialized():
         # this is for local ray cluster
         ray.init(runtime_env=runtime_env)
@@ -117,7 +111,6 @@ def main(args):
         except RuntimeError:
             pass
 
-    attestation_dir = os.environ.get("TASK22_RUNTIME_ATTESTATION_DIR")
     if attestation_dir:
         from relax.utils.task22_runtime_attestation import write_attestation
 
@@ -130,14 +123,6 @@ def main(args):
             runtime_env_json,
             input_manifest_path,
             input_roots_json,
-        )
-        ray.get(
-            _write_task22_worker_attestation.remote(
-                attestation_dir,
-                runtime_env_json,
-                input_manifest_path,
-                input_roots_json,
-            )
         )
 
     # init_tracking must run after serve.start() (metrics adapter probes Ray

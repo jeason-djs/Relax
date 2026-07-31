@@ -10,6 +10,7 @@ import platform
 import socket
 import subprocess
 import sys
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -61,6 +62,39 @@ def runtime_env_sha256(value: str) -> str:
     parsed = json.loads(value)
     canonical = json.dumps(parsed, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(canonical).hexdigest()
+
+
+def task22_env_sha256(env: dict[str, str] | None = None) -> str:
+    """Hash the qualification variables actually visible to this process."""
+
+    source = os.environ if env is None else env
+    names = (
+        "RELAX_REQUEST_PLACEMENT_MODE",
+        "RELAX_REQUEST_PLACEMENT_POLICY",
+        "RELAX_RID_ONLY_REQUEST_LOGGING",
+        "SGLANG_LOG_SCHEDULER_STATUS_INTERVAL",
+        "SGLANG_LOG_SCHEDULER_STATUS_TARGET",
+        "TASK22_INPUT_MANIFEST",
+        "TASK22_INPUT_ROOTS_JSON",
+        "TASK22_PYTHON",
+    )
+    payload = {name: source.get(name) for name in names}
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def merge_runtime_env(
+    runtime_env: dict[str, Any] | None,
+    env_vars: dict[str, str],
+) -> dict[str, Any]:
+    """Preserve working-dir/package settings while applying role env vars."""
+
+    merged = deepcopy(runtime_env or {})
+    inherited = merged.setdefault("env_vars", {})
+    if not isinstance(inherited, dict):
+        raise TypeError("runtime_env.env_vars must be a dictionary")
+    inherited.update(env_vars)
+    return merged
 
 
 def _is_runtime_file(relative_path: Path) -> bool:
@@ -143,6 +177,8 @@ def collect_attestation(
     runtime_env_json: str | None = None,
     input_manifest_path: str | None = None,
     input_roots_json: str | None = None,
+    *,
+    verify_input_contents: bool = True,
 ) -> dict[str, Any]:
     requested_python = os.environ["TASK22_PYTHON"]
     if not os.path.isabs(requested_python) or not os.access(requested_python, os.X_OK):
@@ -160,6 +196,21 @@ def collect_attestation(
     for module_name in SGLANG_MODULES:
         module_path = os.path.realpath(importlib.import_module(module_name).__file__)
         sglang_source_sha256[module_path] = sha256_file(module_path)
+    input_manifest = (
+        _input_manifest_attestation(input_manifest_path, input_roots_json)
+        if verify_input_contents
+        else {
+            "sha256": manifest_sha256(
+                load_json_nofollow(
+                    Path(
+                        input_manifest_path
+                        if input_manifest_path is not None
+                        else os.environ["TASK22_INPUT_MANIFEST"]
+                    )
+                )
+            )
+        }
+    )
     return {
         "schema_version": 3,
         "role": role,
@@ -170,6 +221,7 @@ def collect_attestation(
         "runtime_env_json_sha256": runtime_env_sha256(
             runtime_env_json if runtime_env_json is not None else os.environ["RUNTIME_ENV_JSON"]
         ),
+        "task22_env_sha256": task22_env_sha256(),
         "python": {
             "launch_path": requested_python,
             "executable_realpath": executable_realpath,
@@ -180,7 +232,7 @@ def collect_attestation(
             "version": platform.python_version(),
         },
         "sglang_source_sha256": sglang_source_sha256,
-        "input_manifest": _input_manifest_attestation(input_manifest_path, input_roots_json),
+        "input_manifest": input_manifest,
     }
 
 
@@ -190,20 +242,45 @@ def write_attestation(
     runtime_env_json: str | None = None,
     input_manifest_path: str | None = None,
     input_roots_json: str | None = None,
+    metadata: dict[str, Any] | None = None,
+    *,
+    verify_input_contents: bool = True,
 ) -> str:
     output_dir = Path(directory)
     suffix = "driver" if role == "driver" else f"worker_{socket.gethostname()}_{os.getpid()}"
     output_path = output_dir / f"runtime_attestation_{suffix}.json"
+    payload = collect_attestation(
+        role,
+        runtime_env_json,
+        input_manifest_path,
+        input_roots_json,
+        verify_input_contents=verify_input_contents,
+    )
+    if metadata:
+        payload.update(metadata)
     _exclusive_json(
         output_path,
-        collect_attestation(
-            role,
-            runtime_env_json,
-            input_manifest_path,
-            input_roots_json,
-        ),
+        payload,
     )
     return str(output_path)
+
+
+def maybe_write_task22_runtime_attestation(
+    role: str,
+    *,
+    metadata: dict[str, Any] | None = None,
+) -> str | None:
+    """Write evidence from a real qualification process when enabled."""
+
+    directory = os.environ.get("TASK22_RUNTIME_ATTESTATION_DIR")
+    if not directory:
+        return None
+    return write_attestation(
+        directory,
+        role,
+        metadata=metadata,
+        verify_input_contents=False,
+    )
 
 
 def attestation_matches_contract(attestation: dict[str, Any], contract: dict[str, Any]) -> bool:
@@ -214,6 +291,7 @@ def attestation_matches_contract(attestation: dict[str, Any], contract: dict[str
         attestation.get("working_dir_content_sha256")
         == contract.get("working_dir_content_sha256")
         and attestation.get("runtime_env_json_sha256") == contract.get("runtime_env_json_sha256")
+        and attestation.get("task22_env_sha256") == contract.get("task22_env_sha256")
         and attestation.get("python") == contract.get("training_python")
         and attestation.get("sglang_source_sha256") == contract.get("sglang_source_sha256")
         and attestation.get("input_manifest", {}).get("sha256")

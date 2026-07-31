@@ -10,6 +10,8 @@ MONITOR="$REPO/scripts/task22/monitor_admission_run.py"
 COMPARATOR="$REPO/scripts/task22/compare_admission_pair.py"
 PREFLIGHT="$REPO/scripts/task22/preflight_admission.sh"
 INPUT_GUARD="$REPO/scripts/task22/input_guard.py"
+GPU_SAMPLER="$REPO/scripts/task22/sample_gpu_state.py"
+PROCESS_DEADLINE="$REPO/scripts/task22/enforce_process_deadline.py"
 PYTHON_REQUEST="${TASK22_PYTHON:?Set TASK22_PYTHON to an absolute executable launcher}"
 if [[ "$PYTHON_REQUEST" != /* || ! -x "$PYTHON_REQUEST" ]]; then
     echo "TASK22_PYTHON must be an executable absolute path" >&2
@@ -104,13 +106,53 @@ PARTITION_ADMISSION_SLACK="${PARTITION_ADMISSION_SLACK:-2}"
 TRAIN_SEED="${TRAIN_SEED:-1234}"
 ROLLOUT_SEED="${ROLLOUT_SEED:-42}"
 RUN_TIMEOUT_S="${RUN_TIMEOUT_S:-5400}"
-MODEL_DIR="${MODEL_DIR:?Set MODEL_DIR}"
-DATA_DIR="${DATA_DIR:?Set DATA_DIR}"
-EXP_DIR="${EXP_DIR:-$MODEL_DIR}"
+TASK22_MONITOR_POLL_INTERVAL_WAS_SET="${TASK22_MONITOR_POLL_INTERVAL+x}"
+TASK22_MONITOR_EVIDENCE_GRACE_WAS_SET="${TASK22_MONITOR_EVIDENCE_GRACE+x}"
+TASK22_MONITOR_NO_PROGRESS_TIMEOUT_S_WAS_SET="${TASK22_MONITOR_NO_PROGRESS_TIMEOUT_S+x}"
+TASK22_GPU_MAX_SNAPSHOT_AGE_S_WAS_SET="${TASK22_GPU_MAX_SNAPSHOT_AGE_S+x}"
+TASK22_GPU_MAX_SNAPSHOT_INTERVAL_S_WAS_SET="${TASK22_GPU_MAX_SNAPSHOT_INTERVAL_S+x}"
+TASK22_MONITOR_TIMEOUT_S_WAS_SET="${TASK22_MONITOR_TIMEOUT_S+x}"
+TASK22_MONITOR_TERM_GRACE_S_WAS_SET="${TASK22_MONITOR_TERM_GRACE_S+x}"
+TASK22_TRAINING_TERM_TIMEOUT_S_WAS_SET="${TASK22_TRAINING_TERM_TIMEOUT_S+x}"
+NUM_GPUS_WAS_SET="${NUM_GPUS+x}"
+CUDA_VISIBLE_DEVICES_WAS_SET="${CUDA_VISIBLE_DEVICES+x}"
+TASK22_MONITOR_POLL_INTERVAL="${TASK22_MONITOR_POLL_INTERVAL:-1}"
+TASK22_MONITOR_EVIDENCE_GRACE="${TASK22_MONITOR_EVIDENCE_GRACE:-5}"
+TASK22_MONITOR_NO_PROGRESS_TIMEOUT_S="${TASK22_MONITOR_NO_PROGRESS_TIMEOUT_S:-600}"
+TASK22_GPU_MAX_SNAPSHOT_AGE_S="${TASK22_GPU_MAX_SNAPSHOT_AGE_S:-5}"
+TASK22_GPU_MAX_SNAPSHOT_INTERVAL_S="${TASK22_GPU_MAX_SNAPSHOT_INTERVAL_S:-2}"
+TASK22_MONITOR_TIMEOUT_S="${TASK22_MONITOR_TIMEOUT_S:-$((RUN_TIMEOUT_S + 300))}"
+TASK22_MONITOR_TERM_GRACE_S="${TASK22_MONITOR_TERM_GRACE_S:-1}"
+TASK22_TRAINING_TERM_TIMEOUT_S="${TASK22_TRAINING_TERM_TIMEOUT_S:-10}"
+NUM_GPUS="${NUM_GPUS:-4}"
+CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-}"
+CUDA_VISIBLE_DEVICES="$(
+    CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" "$PYTHON_BIN" -c '
+import os
+
+raw = os.environ["CUDA_VISIBLE_DEVICES"]
+if not raw.strip():
+    print("")
+    raise SystemExit(0)
+devices = [value.strip() for value in raw.split(",")]
+if any(not value for value in devices) or len(devices) != 4 or len(set(devices)) != 4:
+    raise SystemExit(
+        "CUDA_VISIBLE_DEVICES must be empty or identify exactly 4 unique devices"
+    )
+print(",".join(devices))
+'
+)" || exit 4
 if [[ -z "$RESUME_ON_DIR" ]]; then
+    MODEL_DIR="${MODEL_DIR:?Set MODEL_DIR}"
+    DATA_DIR="${DATA_DIR:?Set DATA_DIR}"
+    EXP_DIR="${EXP_DIR:-$MODEL_DIR}"
     MODEL_DIR="$(cd -- "$MODEL_DIR" && pwd -P)"
     DATA_DIR="$(cd -- "$DATA_DIR" && pwd -P)"
     EXP_DIR="$(cd -- "$EXP_DIR" && pwd -P)"
+else
+    MODEL_DIR=""
+    DATA_DIR=""
+    EXP_DIR=""
 fi
 SOURCE_MODEL_INPUT_ROOT="$MODEL_DIR/Qwen3-4B"
 SOURCE_DATA_INPUT_FILE="$DATA_DIR/dapo-math-17k/dapo-math-17k.jsonl"
@@ -128,6 +170,8 @@ qualification_contract=(
     "PARTITION_ADMISSION_MAX:$PARTITION_ADMISSION_MAX:8"
     "PARTITION_ADMISSION_SLACK:$PARTITION_ADMISSION_SLACK:2"
     "RUN_TIMEOUT_S:$RUN_TIMEOUT_S:5400"
+    "TASK22_MONITOR_NO_PROGRESS_TIMEOUT_S:$TASK22_MONITOR_NO_PROGRESS_TIMEOUT_S:600"
+    "NUM_GPUS:$NUM_GPUS:4"
 )
 for contract_entry in "${qualification_contract[@]}"; do
     IFS=: read -r contract_name contract_actual contract_expected <<< "$contract_entry"
@@ -147,8 +191,6 @@ else
     PAIR_DIR="$RUN_ROOT/admission_matched_${GIT_COMMIT:0:12}_$STAMP"
 fi
 
-WORKING_DIR="${WORKING_DIR:-$REPO}"
-WORKING_DIR="$(cd -- "$WORKING_DIR" && pwd -P)"
 export SGLANG_LOG_SCHEDULER_STATUS_TARGET="${SGLANG_LOG_SCHEDULER_STATUS_TARGET:-stdout}"
 export SGLANG_LOG_SCHEDULER_STATUS_INTERVAL="${SGLANG_LOG_SCHEDULER_STATUS_INTERVAL:-1.0}"
 export RELAX_RID_ONLY_REQUEST_LOGGING=1
@@ -156,9 +198,18 @@ export RELAX_REQUEST_PLACEMENT_MODE=off
 export RELAX_REQUEST_PLACEMENT_POLICY=least_predicted_work
 export RAY_DEDUP_LOGS=0
 export TASK22_PYTHON="$PYTHON_REQUEST"
-export RUNTIME_ENV_JSON="${RUNTIME_ENV_JSON:-{}}"
-RUNTIME_ENV_JSON="$(
-    WORKING_DIR="$WORKING_DIR" RUNTIME_ENV_JSON="$RUNTIME_ENV_JSON" "$PYTHON_BIN" -c '
+if [[ -n "$RESUME_ON_DIR" ]]; then
+    WORKING_DIR=""
+    RUNTIME_ENV_JSON=""
+else
+    WORKING_DIR="${WORKING_DIR:-$REPO}"
+    WORKING_DIR="$(cd -- "$WORKING_DIR" && pwd -P)"
+    if [[ -z "${RUNTIME_ENV_JSON+x}" ]]; then
+        RUNTIME_ENV_JSON='{}'
+    fi
+    export RUNTIME_ENV_JSON
+    RUNTIME_ENV_JSON="$(
+        WORKING_DIR="$WORKING_DIR" RUNTIME_ENV_JSON="$RUNTIME_ENV_JSON" "$PYTHON_BIN" -c '
 import json
 import os
 
@@ -177,7 +228,8 @@ for name in (
     env_vars[name] = os.environ[name]
 print(json.dumps(runtime_env, sort_keys=True, separators=(",", ":")))
 '
-)"
+    )"
+fi
 
 export MODEL_DIR DATA_DIR EXP_DIR WORKING_DIR RUNTIME_ENV_JSON TASK22_RUNTIME_ATTESTATION_DIR
 
@@ -228,6 +280,94 @@ if [[ -n "$RESUME_ON_DIR" ]]; then
         echo "Resume pair artifact checksum verification failed" >&2
         exit 4
     fi
+    restored_contract_values=""
+    if ! restored_contract_values="$(
+        TASK22_MONITOR_POLL_INTERVAL_WAS_SET="$TASK22_MONITOR_POLL_INTERVAL_WAS_SET" \
+        TASK22_MONITOR_EVIDENCE_GRACE_WAS_SET="$TASK22_MONITOR_EVIDENCE_GRACE_WAS_SET" \
+        TASK22_MONITOR_NO_PROGRESS_TIMEOUT_S_WAS_SET="$TASK22_MONITOR_NO_PROGRESS_TIMEOUT_S_WAS_SET" \
+        TASK22_GPU_MAX_SNAPSHOT_AGE_S_WAS_SET="$TASK22_GPU_MAX_SNAPSHOT_AGE_S_WAS_SET" \
+        TASK22_GPU_MAX_SNAPSHOT_INTERVAL_S_WAS_SET="$TASK22_GPU_MAX_SNAPSHOT_INTERVAL_S_WAS_SET" \
+        TASK22_MONITOR_TIMEOUT_S_WAS_SET="$TASK22_MONITOR_TIMEOUT_S_WAS_SET" \
+        TASK22_MONITOR_TERM_GRACE_S_WAS_SET="$TASK22_MONITOR_TERM_GRACE_S_WAS_SET" \
+        TASK22_TRAINING_TERM_TIMEOUT_S_WAS_SET="$TASK22_TRAINING_TERM_TIMEOUT_S_WAS_SET" \
+        NUM_GPUS_WAS_SET="$NUM_GPUS_WAS_SET" \
+        CUDA_VISIBLE_DEVICES_WAS_SET="$CUDA_VISIBLE_DEVICES_WAS_SET" \
+        TASK22_MONITOR_POLL_INTERVAL="$TASK22_MONITOR_POLL_INTERVAL" \
+        TASK22_MONITOR_EVIDENCE_GRACE="$TASK22_MONITOR_EVIDENCE_GRACE" \
+        TASK22_MONITOR_NO_PROGRESS_TIMEOUT_S="$TASK22_MONITOR_NO_PROGRESS_TIMEOUT_S" \
+        TASK22_GPU_MAX_SNAPSHOT_AGE_S="$TASK22_GPU_MAX_SNAPSHOT_AGE_S" \
+        TASK22_GPU_MAX_SNAPSHOT_INTERVAL_S="$TASK22_GPU_MAX_SNAPSHOT_INTERVAL_S" \
+        TASK22_MONITOR_TIMEOUT_S="$TASK22_MONITOR_TIMEOUT_S" \
+        TASK22_MONITOR_TERM_GRACE_S="$TASK22_MONITOR_TERM_GRACE_S" \
+        TASK22_TRAINING_TERM_TIMEOUT_S="$TASK22_TRAINING_TERM_TIMEOUT_S" \
+        NUM_GPUS="$NUM_GPUS" CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" \
+        "$PYTHON_BIN" - "$PAIR_DIR/shadow/run_contract.json" <<'PY'
+import json
+import math
+import os
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    contract = json.load(source)
+if contract.get("schema_version") != 6:
+    raise SystemExit("Shadow contract is not schema v6")
+
+numeric = {
+    "TASK22_MONITOR_POLL_INTERVAL": "monitor_poll_interval_s",
+    "TASK22_MONITOR_EVIDENCE_GRACE": "monitor_evidence_grace_s",
+    "TASK22_MONITOR_NO_PROGRESS_TIMEOUT_S": "monitor_no_progress_timeout_s",
+    "TASK22_GPU_MAX_SNAPSHOT_AGE_S": "gpu_max_snapshot_age_s",
+    "TASK22_GPU_MAX_SNAPSHOT_INTERVAL_S": "gpu_max_snapshot_interval_s",
+    "TASK22_MONITOR_TIMEOUT_S": "monitor_timeout_s",
+    "TASK22_MONITOR_TERM_GRACE_S": "monitor_term_grace_s",
+    "TASK22_TRAINING_TERM_TIMEOUT_S": "training_term_timeout_s",
+}
+for env_name, key in numeric.items():
+    frozen = contract.get(key)
+    if (
+        not isinstance(frozen, (int, float))
+        or isinstance(frozen, bool)
+        or not math.isfinite(float(frozen))
+    ):
+        raise SystemExit(f"Shadow schema v6 lacks valid {key}")
+    if os.environ.get(f"{env_name}_WAS_SET"):
+        try:
+            current = float(os.environ[env_name])
+        except ValueError as exc:
+            raise SystemExit(f"Invalid resume environment {env_name}") from exc
+        if current != float(frozen):
+            raise SystemExit(f"Resume environment drift for {env_name}")
+    print(f"{env_name}={frozen}")
+
+frozen_num_gpus = contract.get("num_gpus")
+if frozen_num_gpus != 4:
+    raise SystemExit("Shadow schema v6 lacks num_gpus=4")
+if os.environ.get("NUM_GPUS_WAS_SET") and os.environ["NUM_GPUS"] != "4":
+    raise SystemExit("Resume environment drift for NUM_GPUS")
+print("NUM_GPUS=4")
+
+frozen_visible = contract.get("cuda_visible_devices")
+if not isinstance(frozen_visible, str):
+    raise SystemExit("Shadow schema v6 lacks normalized cuda_visible_devices")
+if (
+    os.environ.get("CUDA_VISIBLE_DEVICES_WAS_SET")
+    and os.environ["CUDA_VISIBLE_DEVICES"] != frozen_visible
+):
+    raise SystemExit("Resume environment drift for CUDA_VISIBLE_DEVICES")
+print(f"CUDA_VISIBLE_DEVICES={frozen_visible}")
+PY
+    )"; then
+        echo "Resume pair supervision or GPU contract restoration failed" >&2
+        exit 4
+    fi
+    while IFS='=' read -r name value; do
+        printf -v "$name" '%s' "$value"
+    done <<< "$restored_contract_values"
+    export TASK22_MONITOR_POLL_INTERVAL TASK22_MONITOR_EVIDENCE_GRACE
+    export TASK22_MONITOR_NO_PROGRESS_TIMEOUT_S TASK22_GPU_MAX_SNAPSHOT_AGE_S
+    export TASK22_GPU_MAX_SNAPSHOT_INTERVAL_S TASK22_MONITOR_TIMEOUT_S
+    export TASK22_MONITOR_TERM_GRACE_S TASK22_TRAINING_TERM_TIMEOUT_S
+    export NUM_GPUS CUDA_VISIBLE_DEVICES
     INPUT_SNAPSHOT="$(
         "$PYTHON_BIN" - "$PAIR_DIR/shadow/run_contract.json" <<'PY'
 import json
@@ -245,6 +385,67 @@ PY
         echo "Resume pair lacks a valid shared input snapshot contract" >&2
         exit 4
     }
+    EXP_DIR="$(
+        "$PYTHON_BIN" - "$PAIR_DIR/shadow/run_contract.json" <<'PY'
+import json
+import os
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    contract = json.load(source)
+exp_dir = contract.get("exp_dir")
+if not isinstance(exp_dir, str) or not os.path.isabs(exp_dir):
+    raise SystemExit("Shadow contract lacks an absolute experiment directory")
+print(os.path.realpath(exp_dir))
+PY
+    )" || {
+        echo "Resume pair lacks a valid experiment directory contract" >&2
+        exit 4
+    }
+    WORKING_DIR="$(
+        "$PYTHON_BIN" - "$PAIR_DIR/shadow/run_contract.json" <<'PY'
+import json
+import os
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    contract = json.load(source)
+working_dir = contract.get("working_dir")
+if not isinstance(working_dir, str) or not os.path.isabs(working_dir):
+    raise SystemExit("Shadow contract lacks an absolute working directory")
+print(os.path.realpath(working_dir))
+PY
+    )" || {
+        echo "Resume pair lacks a valid working directory contract" >&2
+        exit 4
+    }
+    RUNTIME_ENV_JSON="$(
+        "$PYTHON_BIN" - "$PAIR_DIR/shadow/run_contract.json" <<'PY'
+import hashlib
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    contract = json.load(source)
+raw = contract.get("runtime_env_json")
+if not isinstance(raw, str):
+    raise SystemExit("Shadow contract lacks normalized runtime_env_json")
+runtime_env = json.loads(raw)
+canonical = json.dumps(runtime_env, sort_keys=True, separators=(",", ":"))
+if raw != canonical:
+    raise SystemExit("Shadow runtime_env_json is not normalized")
+actual_hash = hashlib.sha256(canonical.encode()).hexdigest()
+if actual_hash != contract.get("runtime_env_json_sha256"):
+    raise SystemExit("Shadow runtime_env_json hash mismatch")
+if runtime_env.get("working_dir") != contract.get("working_dir"):
+    raise SystemExit("Shadow runtime_env_json working_dir mismatch")
+print(canonical)
+PY
+    )" || {
+        echo "Resume pair lacks a valid normalized runtime environment contract" >&2
+        exit 4
+    }
+    export WORKING_DIR RUNTIME_ENV_JSON EXP_DIR
     if ! verify_snapshot; then
         echo "Resume pair snapshot verification failed" >&2
         exit 4
@@ -282,6 +483,7 @@ fi
 sampler_pid=""
 training_pid=""
 monitor_pid=""
+monitor_watchdog_pid=""
 training_start_identity=""
 sampler_start_identity=""
 process_start_identity() {
@@ -329,12 +531,15 @@ def identity():
     try:
         stat = pathlib.Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
     except OSError:
-        return subprocess.run(
-            ["ps", "-o", "lstart=", "-p", str(pid)],
-            check=False,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
+        try:
+            return subprocess.run(
+                ["ps", "-o", "lstart=", "-p", str(pid)],
+                check=False,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+        except OSError:
+            return ""
     suffix = stat.rsplit(")", 1)[1].split()
     return suffix[19] if len(suffix) > 19 else ""
 
@@ -394,16 +599,25 @@ expected = sys.argv[2]
 try:
     stat = pathlib.Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
 except OSError:
-    actual = subprocess.run(
-        ["ps", "-o", "lstart=", "-p", str(pid)],
-        check=False,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
+    try:
+        actual = subprocess.run(
+            ["ps", "-o", "lstart=", "-p", str(pid)],
+            check=False,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except OSError:
+        actual = ""
 else:
     suffix = stat.rsplit(")", 1)[1].split()
     actual = suffix[19] if len(suffix) > 19 else ""
 if not actual:
+    # This PID is an unreaped direct child created by this runner, so it cannot
+    # be reused before the immediately following wait().
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
     raise SystemExit(0)
 if actual != expected:
     raise SystemExit(f"refusing to stop reused pid {pid}")
@@ -415,6 +629,11 @@ cleanup() {
         kill "$monitor_pid" >/dev/null 2>&1 || true
         wait "$monitor_pid" >/dev/null 2>&1 || true
         monitor_pid=""
+    fi
+    if [[ -n "$monitor_watchdog_pid" ]]; then
+        kill "$monitor_watchdog_pid" >/dev/null 2>&1 || true
+        wait "$monitor_watchdog_pid" >/dev/null 2>&1 || true
+        monitor_watchdog_pid=""
     fi
     if [[ -n "$training_pid" ]]; then
         stop_training_safely "$training_pid" "$training_start_identity" \
@@ -449,6 +668,7 @@ from pathlib import Path
 
 from scripts.task22.input_guard import _exclusive_json, load_json_nofollow, manifest_sha256
 from relax.utils.task22_runtime_attestation import (
+    task22_env_sha256,
     working_dir_content_hashes,
     working_dir_content_sha256,
 )
@@ -511,7 +731,7 @@ runtime_env_canonical = json.dumps(
 ).encode()
 input_manifest = load_json_nofollow(Path(os.environ["TASK22_INPUT_MANIFEST"]))
 contract = {
-    "schema_version": 5,
+    "schema_version": 6,
     "git_commit": os.environ["GIT_COMMIT"],
     "admission_mode": mode,
     "runner_scope": os.environ["RUN_SCOPE"],
@@ -536,7 +756,23 @@ contract = {
     "working_dir": os.path.realpath(os.environ["WORKING_DIR"]),
     "working_dir_content_sha256": working_dir_content_sha256(os.environ["WORKING_DIR"]),
     "runtime_env_json_sha256": hashlib.sha256(runtime_env_canonical).hexdigest(),
+    "runtime_env_json": runtime_env_canonical.decode(),
+    "task22_env_sha256": task22_env_sha256(),
     "input_manifest_sha256": manifest_sha256(input_manifest),
+    "monitor_poll_interval_s": float(os.environ["TASK22_MONITOR_POLL_INTERVAL"]),
+    "monitor_evidence_grace_s": float(os.environ["TASK22_MONITOR_EVIDENCE_GRACE"]),
+    "monitor_no_progress_timeout_s": float(
+        os.environ["TASK22_MONITOR_NO_PROGRESS_TIMEOUT_S"]
+    ),
+    "gpu_max_snapshot_age_s": float(os.environ["TASK22_GPU_MAX_SNAPSHOT_AGE_S"]),
+    "gpu_max_snapshot_interval_s": float(
+        os.environ["TASK22_GPU_MAX_SNAPSHOT_INTERVAL_S"]
+    ),
+    "monitor_timeout_s": int(os.environ["TASK22_MONITOR_TIMEOUT_S"]),
+    "monitor_term_grace_s": float(os.environ["TASK22_MONITOR_TERM_GRACE_S"]),
+    "training_term_timeout_s": float(os.environ["TASK22_TRAINING_TERM_TIMEOUT_S"]),
+    "num_gpus": int(os.environ["NUM_GPUS"]),
+    "cuda_visible_devices": os.environ["CUDA_VISIBLE_DEVICES"],
     "nccl_nvls_enable": os.environ["NCCL_NVLS_ENABLE"],
     "nccl_socket_ifname": os.environ["NCCL_SOCKET_IFNAME"],
     "training_python": {
@@ -593,15 +829,7 @@ PY
         write_contract "$mode" "$run_dir/run_contract.json"
     fi
 
-    (
-        while true; do
-            date '+%Y-%m-%dT%H:%M:%S.%N%z'
-            nvidia-smi \
-                --query-gpu=index,memory.used,utilization.gpu,utilization.memory,power.draw \
-                --format=csv,noheader
-            sleep 1
-        done
-    ) > "$run_dir/logs/nvidia_smi_1s.csv" 2>&1 &
+    "$PYTHON_BIN" -u "$GPU_SAMPLER" > "$run_dir/logs/nvidia_smi_1s.csv" 2>&1 &
     sampler_pid=$!
     sampler_start_identity="$(process_start_identity "$sampler_pid")"
     local run_started_at
@@ -639,7 +867,8 @@ PY
         bash "$WRAPPER" &
     training_pid=$!
     training_start_identity="$(process_start_identity "$training_pid")"
-    "$PYTHON_BIN" "$MONITOR" \
+    timeout --signal=TERM --kill-after="$TASK22_MONITOR_TERM_GRACE_S" \
+        "$TASK22_MONITOR_TIMEOUT_S" "$PYTHON_BIN" "$MONITOR" \
         --run-dir "$run_dir" \
         --pid "$training_pid" \
         --pid-start-identity "$training_start_identity" \
@@ -657,48 +886,66 @@ PY
         --admission-slack "$PARTITION_ADMISSION_SLACK" \
         --headline-lo "$HEADLINE_LO" \
         --headline-hi "$HEADLINE_HI" \
-        --poll-interval "${TASK22_MONITOR_POLL_INTERVAL:-1}" \
-        --evidence-grace "${TASK22_MONITOR_EVIDENCE_GRACE:-5}" \
-        --gpu-max-snapshot-interval "${TASK22_GPU_MAX_SNAPSHOT_INTERVAL_S:-2}" \
+        --poll-interval "$TASK22_MONITOR_POLL_INTERVAL" \
+        --evidence-grace "$TASK22_MONITOR_EVIDENCE_GRACE" \
+        --no-progress-timeout "$TASK22_MONITOR_NO_PROGRESS_TIMEOUT_S" \
+        --term-timeout "$TASK22_TRAINING_TERM_TIMEOUT_S" \
+        --gpu-max-snapshot-age "$TASK22_GPU_MAX_SNAPSHOT_AGE_S" \
+        --gpu-max-snapshot-interval "$TASK22_GPU_MAX_SNAPSHOT_INTERVAL_S" \
+        --monitor-timeout "$TASK22_MONITOR_TIMEOUT_S" \
+        --monitor-term-grace "$TASK22_MONITOR_TERM_GRACE_S" \
+        --num-gpus "$NUM_GPUS" \
+        --cuda-visible-devices "$CUDA_VISIBLE_DEVICES" \
         > "$run_dir/logs/online_monitor.log" 2>&1 &
     monitor_pid=$!
-    local monitor_timeout="${TASK22_MONITOR_TIMEOUT_S:-$((RUN_TIMEOUT_S + 300))}"
-    local monitor_started=$SECONDS
-    local monitor_timed_out=0
-    while kill -0 "$monitor_pid" >/dev/null 2>&1; do
-        if (( SECONDS - monitor_started >= monitor_timeout )); then
-            monitor_timed_out=1
-            kill -TERM "$monitor_pid" >/dev/null 2>&1 || true
-            sleep "${TASK22_MONITOR_TERM_GRACE_S:-1}"
-            kill -KILL "$monitor_pid" >/dev/null 2>&1 || true
-            break
-        fi
-        sleep 0.05
-    done
+    local monitor_timeout_marker="$run_dir/logs/.monitor_timeout"
+    "$PYTHON_BIN" "$PROCESS_DEADLINE" \
+        --pid "$monitor_pid" \
+        --timeout "$TASK22_MONITOR_TIMEOUT_S" \
+        --term-grace "$TASK22_MONITOR_TERM_GRACE_S" \
+        --marker "$monitor_timeout_marker" \
+        </dev/null >/dev/null 2>&1 &
+    monitor_watchdog_pid=$!
+    printf '%s\n' WAITING_MONITOR > "$run_dir/SUPERVISION_STATE"
     wait "$monitor_pid"
     local monitor_rc=$?
-    if [[ "$monitor_timed_out" -eq 1 ]]; then
+    printf 'MONITOR_EXITED(%s)\n' "$monitor_rc" > "$run_dir/SUPERVISION_STATE"
+    kill "$monitor_watchdog_pid" >/dev/null 2>&1 || true
+    wait "$monitor_watchdog_pid" >/dev/null 2>&1 || true
+    monitor_watchdog_pid=""
+    if [[ -f "$monitor_timeout_marker" ]]; then
         monitor_rc=124
-        printf 'monitor hard timeout after %ss\n' "$monitor_timeout" \
+    fi
+    if [[ "$monitor_rc" -eq 124 || "$monitor_rc" -eq 137 ]]; then
+        monitor_rc=124
+        printf 'monitor hard timeout after %ss\n' "$TASK22_MONITOR_TIMEOUT_S" \
             >> "$run_dir/logs/online_monitor.log"
     fi
     monitor_pid=""
     if [[ "$monitor_rc" -ne 0 ]]; then
+        printf 'STOPPING_TRAINING(monitor=%s)\n' "$monitor_rc" > "$run_dir/SUPERVISION_STATE"
         stop_training_safely "$training_pid" "$training_start_identity" \
-            "${TASK22_TRAINING_TERM_TIMEOUT_S:-10}" \
+            "$TASK22_TRAINING_TERM_TIMEOUT_S" \
             >> "$run_dir/logs/online_monitor.log" 2>&1 || true
     fi
+    printf 'WAITING_TRAINING(monitor=%s)\n' "$monitor_rc" > "$run_dir/SUPERVISION_STATE"
     wait "$training_pid"
     local run_rc=$?
+    printf 'TRAINING_EXITED(training=%s,monitor=%s)\n' "$run_rc" "$monitor_rc" \
+        > "$run_dir/SUPERVISION_STATE"
     training_pid=""
     training_start_identity=""
     set -e
 
+    printf 'STOPPING_SAMPLER(training=%s,monitor=%s)\n' "$run_rc" "$monitor_rc" \
+        > "$run_dir/SUPERVISION_STATE"
     stop_pid_safely "$sampler_pid" "$sampler_start_identity" >/dev/null 2>&1 || true
     wait "$sampler_pid" >/dev/null 2>&1 || true
     sampler_pid=""
     sampler_start_identity=""
     ray stop --force >/dev/null 2>&1 || true
+    printf 'SUPERVISION_COMPLETE(training=%s,monitor=%s)\n' "$run_rc" "$monitor_rc" \
+        > "$run_dir/SUPERVISION_STATE"
     local input_guard_rc=0
     if ! "$PYTHON_BIN" "$INPUT_GUARD" snapshot-verify \
         --snapshot "$INPUT_SNAPSHOT" \
@@ -728,6 +975,16 @@ PY
         --max-staleness "$MAX_STALENESS" \
         --headline-lo "$HEADLINE_LO" \
         --headline-hi "$HEADLINE_HI" \
+        --monitor-poll-interval "$TASK22_MONITOR_POLL_INTERVAL" \
+        --monitor-evidence-grace "$TASK22_MONITOR_EVIDENCE_GRACE" \
+        --monitor-no-progress-timeout "$TASK22_MONITOR_NO_PROGRESS_TIMEOUT_S" \
+        --gpu-max-snapshot-age "$TASK22_GPU_MAX_SNAPSHOT_AGE_S" \
+        --gpu-max-snapshot-interval "$TASK22_GPU_MAX_SNAPSHOT_INTERVAL_S" \
+        --monitor-timeout "$TASK22_MONITOR_TIMEOUT_S" \
+        --monitor-term-grace "$TASK22_MONITOR_TERM_GRACE_S" \
+        --training-term-timeout "$TASK22_TRAINING_TERM_TIMEOUT_S" \
+        --num-gpus "$NUM_GPUS" \
+        --cuda-visible-devices "$CUDA_VISIBLE_DEVICES" \
         --require-resume \
         --output-json "$run_dir/validation.json" \
         > "$run_dir/validation.stdout.json"
@@ -786,6 +1043,11 @@ export PARTITION_ADMISSION_MIN PARTITION_ADMISSION_MAX PARTITION_ADMISSION_SLACK
 export TRAIN_SEED ROLLOUT_SEED RUN_TIMEOUT_S MODEL_DIR DATA_DIR EXP_DIR
 export NCCL_NVLS_ENABLE NCCL_SOCKET_IFNAME
 export RUN_SCOPE
+export TASK22_MONITOR_POLL_INTERVAL TASK22_MONITOR_EVIDENCE_GRACE
+export TASK22_MONITOR_NO_PROGRESS_TIMEOUT_S TASK22_GPU_MAX_SNAPSHOT_AGE_S
+export TASK22_GPU_MAX_SNAPSHOT_INTERVAL_S TASK22_MONITOR_TIMEOUT_S
+export TASK22_MONITOR_TERM_GRACE_S TASK22_TRAINING_TERM_TIMEOUT_S
+export NUM_GPUS CUDA_VISIBLE_DEVICES
 export TASK22_INPUT_MANIFEST="$INPUT_SNAPSHOT/MANIFEST.json"
 export TASK22_INPUT_ROOTS_JSON
 TASK22_INPUT_ROOTS_JSON="$(

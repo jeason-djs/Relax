@@ -50,6 +50,7 @@ from relax.utils.multimodal.stats import get_sample_multimodal_stats
 from relax.utils.opd.opd_utils import compute_mopd_metrics
 from relax.utils.reload_utils import ReloadableMixin
 from relax.utils.tracking_utils import init_tracking
+from relax.utils.task22_runtime_attestation import merge_runtime_env
 from relax.utils.training.train_dump_utils import (
     save_debug_rollout_data,
     save_eval_summary_jsonl,
@@ -418,6 +419,7 @@ class EngineGroup:
     is_scaled_out: bool = False  # True for groups added via scale-out, False for initial groups
     skip_dcs_registration: bool = False  # Skip DCS registration for scaled-out engines
     skip_router_registration: bool = False  # Skip router registration until weight sync completes
+    runtime_env: dict | None = None
 
     @property
     def nodes_per_engine(self):
@@ -501,16 +503,29 @@ class EngineGroup:
                     "SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2": "0",
                 }.items()
             }
+            for name in (
+                "RELAX_REQUEST_PLACEMENT_MODE",
+                "RELAX_REQUEST_PLACEMENT_POLICY",
+                "RELAX_RID_ONLY_REQUEST_LOGGING",
+                "RUNTIME_ENV_JSON",
+                "SGLANG_LOG_SCHEDULER_STATUS_INTERVAL",
+                "SGLANG_LOG_SCHEDULER_STATUS_TARGET",
+                "TASK22_INPUT_MANIFEST",
+                "TASK22_INPUT_ROOTS_JSON",
+                "TASK22_PYTHON",
+                "TASK22_RUNTIME_ATTESTATION_DIR",
+            ):
+                if name in os.environ:
+                    env_vars[name] = os.environ[name]
             if getattr(self.args, "fp16", False):
                 env_vars["SGLANG_MAMBA_CONV_DTYPE"] = "float16"
 
             accelerator_kwargs = get_ray_accelerator_kwargs(num_gpus)
+            engine_runtime_env = merge_runtime_env(self.runtime_env, env_vars)
             rollout_engine = RolloutRayActor.options(
                 num_cpus=num_cpus,
                 scheduling_strategy=scheduling_strategy,
-                runtime_env={
-                    "env_vars": env_vars,
-                },
+                runtime_env=engine_runtime_env,
                 **accelerator_kwargs,
             ).remote(
                 self.args,
@@ -790,9 +805,10 @@ class RolloutManager(ReloadableMixin):
     - get_loaded_modules(): Retrieve information about loaded modules
     """
 
-    def __init__(self, args, pg, data_source=None):
+    def __init__(self, args, pg, data_source=None, runtime_env=None):
         self.pg = pg
         self.args = args
+        self.runtime_env = runtime_env or {}
         self._dynamic_global_batch_size = None
 
         init_tracking(args, primary=False)
@@ -824,7 +840,7 @@ class RolloutManager(ReloadableMixin):
             self.servers: dict[str, RolloutServer] = {}
         else:
             init_http_client(args)
-            self.servers = start_rollout_servers(args, pg)
+            self.servers = start_rollout_servers(args, pg, runtime_env=self.runtime_env)
         self.rollout_engine_lock = Lock.options(num_cpus=1, num_gpus=0).remote()
         self.rollout_id = -1
         self._metric_checker = MetricChecker.maybe_create(args)
@@ -1851,6 +1867,7 @@ class RolloutManager(ReloadableMixin):
                 is_scaled_out=True,
                 skip_dcs_registration=True,  # Will be done in _finalize_engine_group_registration
                 skip_router_registration=True,  # Will be done in _finalize_engine_group_registration
+                runtime_env=self.runtime_env,
             )
 
             # Step 3: Start engines
@@ -2121,6 +2138,7 @@ class RolloutManager(ReloadableMixin):
                 router_port=router_port,
                 is_scaled_out=True,
                 skip_dcs_registration=False,  # Already registered above
+                runtime_env=self.runtime_env,
             )
         else:
             # Mark DCS registration as done (for ray_native mode)
@@ -3759,7 +3777,7 @@ def _wait_engine_init_with_progress(
     logger.info(f"[engine-init-barrier:{model_name}] all {total} engines ready")
 
 
-def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
+def start_rollout_servers(args, pg, runtime_env=None) -> dict[str, RolloutServer]:
     """Start rollout servers: one per model, each with its own router.
 
     Each model defined in the sglang config gets its own router and set
@@ -3810,6 +3828,7 @@ def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
                 sglang_overrides=group_cfg.overrides,
                 router_ip=router_ip,
                 router_port=router_port,
+                runtime_env=runtime_env,
             )
             handles, port_cursors = group.start_engines(port_cursors)
             all_init_handles.extend(handles)

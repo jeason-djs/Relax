@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import hashlib
 import json
 import os
 import shutil
@@ -12,6 +13,7 @@ import pytest
 
 from relax.utils.task22_runtime_attestation import (
     attestation_matches_contract,
+    merge_runtime_env,
     working_dir_content_hashes,
     working_dir_content_sha256,
     working_dir_runtime_files,
@@ -24,6 +26,8 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 RUNNER = REPO_ROOT / "scripts" / "task22" / "run_admission_matched_ab.sh"
 INPUT_GUARD = REPO_ROOT / "scripts" / "task22" / "input_guard.py"
 RUNTIME_ATTESTATION = REPO_ROOT / "relax" / "utils" / "task22_runtime_attestation.py"
+GPU_SAMPLER = REPO_ROOT / "scripts" / "task22" / "sample_gpu_state.py"
+PROCESS_DEADLINE = REPO_ROOT / "scripts" / "task22" / "enforce_process_deadline.py"
 LOCAL_ENTRYPOINT = REPO_ROOT / "scripts" / "entrypoint" / "local.sh"
 TASK22_TRAINING_ENTRYPOINT = (
     REPO_ROOT / "scripts" / "training" / "text" / "run-qwen3-4B-4xgpu-hybrid-async-task22.sh"
@@ -151,6 +155,8 @@ def _build_fake_repo(tmp_path: Path) -> tuple[Path, Path, dict[str, str]]:
     for relative_path in (
         *PRODUCTION_FINGERPRINTED_FILES,
         "relax/utils/task22_runtime_attestation.py",
+        "scripts/task22/enforce_process_deadline.py",
+        "scripts/task22/sample_gpu_state.py",
         "scripts/task22/run_admission_matched_ab.sh",
         "scripts/task22/input_guard.py",
     ):
@@ -164,6 +170,12 @@ def _build_fake_repo(tmp_path: Path) -> tuple[Path, Path, dict[str, str]]:
         elif relative_path == "relax/utils/task22_runtime_attestation.py":
             path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(RUNTIME_ATTESTATION, path)
+        elif relative_path == "scripts/task22/sample_gpu_state.py":
+            path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(GPU_SAMPLER, path)
+        elif relative_path == "scripts/task22/enforce_process_deadline.py":
+            path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(PROCESS_DEADLINE, path)
         else:
             _write(path, "# runner contract fixture\n")
     _write(repo / "pyproject.toml", "[tool.pytest.ini_options]\n")
@@ -362,6 +374,8 @@ for raw_path in sys.argv[1:]:
         "RUN_ROOT": str(run_root),
         "TASK22_RUN_STAMP": "fixture",
         "RUN_TIMEOUT_S": "5400",
+        "NUM_GPUS": "4",
+        "CUDA_VISIBLE_DEVICES": "",
         "TASK22_MONITOR_POLL_INTERVAL": "0.01",
     }
     return repo, run_root, env
@@ -373,9 +387,20 @@ def test_runner_fixture_passes_real_online_monitor_and_real_final_validator(tmp_
     contract = json.loads(contract_path.read_text(encoding="utf-8"))
     contract.update(
         {
-            "schema_version": 5,
+            "schema_version": 6,
             "working_dir": str(tmp_path.resolve()),
             "runtime_env_json_sha256": "a" * 64,
+            "task22_env_sha256": "e" * 64,
+            "monitor_poll_interval_s": 1.0,
+            "monitor_evidence_grace_s": 5.0,
+            "monitor_no_progress_timeout_s": 600.0,
+            "gpu_max_snapshot_age_s": 5.0,
+            "gpu_max_snapshot_interval_s": 2.0,
+            "monitor_timeout_s": 5700,
+            "monitor_term_grace_s": 1.0,
+            "training_term_timeout_s": 10.0,
+            "num_gpus": 4,
+            "cuda_visible_devices": "",
             "training_python": {
                 "launch_path": str(Path(sys.executable).absolute()),
                 "executable_realpath": os.path.realpath(sys.executable),
@@ -395,13 +420,20 @@ def test_runner_fixture_passes_real_online_monitor_and_real_final_validator(tmp_
         "working_dir": contract["working_dir"],
         "working_dir_content_sha256": contract["working_dir_content_sha256"],
         "runtime_env_json_sha256": contract["runtime_env_json_sha256"],
+        "task22_env_sha256": contract["task22_env_sha256"],
         "python": contract["training_python"],
         "sglang_source_sha256": contract["sglang_source_sha256"],
         "input_manifest": {"sha256": contract["input_manifest_sha256"]},
     }
-    for role in ("driver", "ray_worker"):
-        (attestation_dir / f"runtime_attestation_{role}.json").write_text(
-            json.dumps({**common_attestation, "role": role}) + "\n",
+    for role, rank in (
+        ("driver", None),
+        ("actor", 0),
+        ("actor", 1),
+        ("rollout_engine", 0),
+    ):
+        suffix = role if rank is None else f"{role}_{rank}"
+        (attestation_dir / f"runtime_attestation_{suffix}.json").write_text(
+            json.dumps({**common_attestation, "role": role, "rank": rank}) + "\n",
             encoding="utf-8",
         )
 
@@ -451,6 +483,7 @@ def test_driver_and_worker_python_identity_fields_must_match_contract(field) -> 
         "working_dir": "/fixture/repo",
         "working_dir_content_sha256": "c" * 64,
         "runtime_env_json_sha256": "d" * 64,
+        "task22_env_sha256": "f" * 64,
         "training_python": python_identity,
         "sglang_source_sha256": {},
         "input_manifest_sha256": "e" * 64,
@@ -459,6 +492,7 @@ def test_driver_and_worker_python_identity_fields_must_match_contract(field) -> 
         "working_dir": contract["working_dir"],
         "working_dir_content_sha256": contract["working_dir_content_sha256"],
         "runtime_env_json_sha256": contract["runtime_env_json_sha256"],
+        "task22_env_sha256": contract["task22_env_sha256"],
         "python": dict(python_identity),
         "sglang_source_sha256": {},
         "input_manifest": {"sha256": contract["input_manifest_sha256"]},
@@ -489,6 +523,7 @@ def test_runtime_attestation_compares_cwd_content_across_ray_unpack_paths(tmp_pa
         "working_dir": str(submitted_repo.resolve()),
         "working_dir_content_sha256": content_sha256,
         "runtime_env_json_sha256": "d" * 64,
+        "task22_env_sha256": "f" * 64,
         "training_python": {},
         "sglang_source_sha256": {},
         "input_manifest_sha256": "e" * 64,
@@ -497,6 +532,7 @@ def test_runtime_attestation_compares_cwd_content_across_ray_unpack_paths(tmp_pa
         "working_dir": str(ray_working_dir.resolve()),
         "working_dir_content_sha256": working_dir_content_sha256(ray_working_dir),
         "runtime_env_json_sha256": contract["runtime_env_json_sha256"],
+        "task22_env_sha256": contract["task22_env_sha256"],
         "python": {},
         "sglang_source_sha256": {},
         "input_manifest": {"sha256": contract["input_manifest_sha256"]},
@@ -536,6 +572,27 @@ def test_runtime_hash_rejects_any_new_runtime_python_drift(tmp_path) -> None:
     assert not attestation_matches_contract(attestation, contract)
 
 
+def test_runtime_env_merge_preserves_working_dir_and_overrides_role_env() -> None:
+    original = {
+        "working_dir": "/fixture/source",
+        "pip": ["fixture-wheel"],
+        "env_vars": {"SHARED": "base", "ROLE": "old"},
+    }
+
+    merged = merge_runtime_env(original, {"ROLE": "actor", "TASK22_PYTHON": "/venv/python"})
+
+    assert merged == {
+        "working_dir": "/fixture/source",
+        "pip": ["fixture-wheel"],
+        "env_vars": {
+            "SHARED": "base",
+            "ROLE": "actor",
+            "TASK22_PYTHON": "/venv/python",
+        },
+    }
+    assert original["env_vars"]["ROLE"] == "old"
+
+
 def test_runtime_file_enumeration_includes_config_and_excludes_tests_and_temporary_files(
     tmp_path,
 ) -> None:
@@ -564,13 +621,31 @@ def test_runtime_file_enumeration_includes_config_and_excludes_tests_and_tempora
 def test_runner_stops_after_shadow_and_resumes_same_pair_for_on(tmp_path) -> None:
     repo, run_root, env = _build_fake_repo(tmp_path)
     runner = repo / "scripts/task22/run_admission_matched_ab.sh"
+    original_runtime_env = {
+        "env_vars": {"PRESERVED_FROM_SHADOW": "yes"},
+        "pip": ["shadow-only-wheel"],
+    }
+    shadow_env = {
+        **env,
+        "WORKING_DIR": str(repo),
+        "RUNTIME_ENV_JSON": json.dumps(original_runtime_env),
+        "TASK22_MONITOR_POLL_INTERVAL": "0.02",
+        "TASK22_MONITOR_EVIDENCE_GRACE": "6",
+        "TASK22_MONITOR_NO_PROGRESS_TIMEOUT_S": "600",
+        "TASK22_GPU_MAX_SNAPSHOT_AGE_S": "7",
+        "TASK22_GPU_MAX_SNAPSHOT_INTERVAL_S": "3",
+        "TASK22_MONITOR_TIMEOUT_S": "5800",
+        "TASK22_MONITOR_TERM_GRACE_S": "2",
+        "TASK22_TRAINING_TERM_TIMEOUT_S": "11",
+        "CUDA_VISIBLE_DEVICES": "3, 1,2,0",
+    }
 
     shadow = subprocess.run(
         ["bash", str(runner), "--run", "--stop-after-shadow"],
         check=True,
         capture_output=True,
         text=True,
-        env=env,
+        env=shadow_env,
     )
     pair_dirs = list(run_root.glob("admission_matched_*_fixture"))
     assert len(pair_dirs) == 1
@@ -584,7 +659,25 @@ def test_runner_stops_after_shadow_and_resumes_same_pair_for_on(tmp_path) -> Non
     ).read_text(encoding="utf-8").strip() == "AWAITING_ON_AUTHORIZATION"
     assert (pair_dir / "ARTIFACT_SHA256SUMS").is_file()
 
-    resume_env = {**env, "TASK22_AUTHORIZE_ON_RUN": "1"}
+    resume_env = {**shadow_env, "TASK22_AUTHORIZE_ON_RUN": "1"}
+    for name in (
+        "MODEL_DIR",
+        "DATA_DIR",
+        "EXP_DIR",
+        "WORKING_DIR",
+        "RUNTIME_ENV_JSON",
+        "NUM_GPUS",
+        "CUDA_VISIBLE_DEVICES",
+        "TASK22_MONITOR_POLL_INTERVAL",
+        "TASK22_MONITOR_EVIDENCE_GRACE",
+        "TASK22_MONITOR_NO_PROGRESS_TIMEOUT_S",
+        "TASK22_GPU_MAX_SNAPSHOT_AGE_S",
+        "TASK22_GPU_MAX_SNAPSHOT_INTERVAL_S",
+        "TASK22_MONITOR_TIMEOUT_S",
+        "TASK22_MONITOR_TERM_GRACE_S",
+        "TASK22_TRAINING_TERM_TIMEOUT_S",
+    ):
+        resume_env.pop(name, None)
     resumed = subprocess.run(
         ["bash", str(runner), "--run", "--resume-on", str(pair_dir)],
         check=True,
@@ -611,6 +704,27 @@ def test_runner_stops_after_shadow_and_resumes_same_pair_for_on(tmp_path) -> Non
     assert contract_diffs == {"admission_mode"}
     assert shadow_contract["request_placement_mode"] == "off"
     assert on_contract["request_placement_mode"] == "off"
+    assert shadow_contract["monitor_no_progress_timeout_s"] == 600
+    assert on_contract["monitor_no_progress_timeout_s"] == 600
+    assert shadow_contract["monitor_poll_interval_s"] == 0.02
+    assert shadow_contract["monitor_evidence_grace_s"] == 6
+    assert shadow_contract["gpu_max_snapshot_age_s"] == 7
+    assert shadow_contract["gpu_max_snapshot_interval_s"] == 3
+    assert shadow_contract["monitor_timeout_s"] == 5800
+    assert shadow_contract["monitor_term_grace_s"] == 2
+    assert shadow_contract["training_term_timeout_s"] == 11
+    assert shadow_contract["num_gpus"] == 4
+    assert shadow_contract["cuda_visible_devices"] == "3,1,2,0"
+    assert shadow_contract["working_dir"] == str(repo.resolve())
+    assert shadow_contract["runtime_env_json"] == on_contract["runtime_env_json"]
+    normalized_runtime_env = json.loads(shadow_contract["runtime_env_json"])
+    assert normalized_runtime_env["pip"] == ["shadow-only-wheel"]
+    assert normalized_runtime_env["env_vars"]["PRESERVED_FROM_SHADOW"] == "yes"
+    assert normalized_runtime_env["working_dir"] == str(repo.resolve())
+    assert (
+        hashlib.sha256(shadow_contract["runtime_env_json"].encode()).hexdigest()
+        == shadow_contract["runtime_env_json_sha256"]
+    )
 
 
 def test_runner_accepts_absolute_python_symlink_and_rejects_relative_path(tmp_path) -> None:
@@ -682,6 +796,68 @@ def test_shadow_qualification_rejects_contract_drift_before_creating_artifacts(t
     assert denied.returncode == 4
     assert "requires PARTITION_ADMISSION_MIN=4" in denied.stderr
     assert not run_root.exists()
+
+
+@pytest.mark.parametrize(
+    ("override", "message"),
+    (
+        ({"NUM_GPUS": "3"}, "requires NUM_GPUS=4"),
+        (
+            {"CUDA_VISIBLE_DEVICES": "0,1,2"},
+            "CUDA_VISIBLE_DEVICES must be empty or identify exactly 4 unique devices",
+        ),
+        (
+            {"CUDA_VISIBLE_DEVICES": "0,1,1,2"},
+            "CUDA_VISIBLE_DEVICES must be empty or identify exactly 4 unique devices",
+        ),
+    ),
+)
+def test_runner_rejects_invalid_four_gpu_contract_before_creating_artifacts(
+    tmp_path, override, message
+) -> None:
+    repo, run_root, env = _build_fake_repo(tmp_path)
+    runner = repo / "scripts/task22/run_admission_matched_ab.sh"
+
+    denied = subprocess.run(
+        ["bash", str(runner), "--run", "--stop-after-shadow"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={**env, **override},
+    )
+
+    assert denied.returncode == 4
+    assert message in denied.stderr
+    assert not run_root.exists()
+
+
+def test_runner_resume_rejects_explicit_supervision_environment_drift(tmp_path) -> None:
+    repo, run_root, env = _build_fake_repo(tmp_path)
+    runner = repo / "scripts/task22/run_admission_matched_ab.sh"
+    subprocess.run(
+        ["bash", str(runner), "--run", "--stop-after-shadow"],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={**env, "TASK22_GPU_MAX_SNAPSHOT_AGE_S": "7"},
+    )
+    pair_dir = next(run_root.glob("admission_matched_*_fixture"))
+
+    denied = subprocess.run(
+        ["bash", str(runner), "--run", "--resume-on", str(pair_dir)],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={
+            **env,
+            "TASK22_AUTHORIZE_ON_RUN": "1",
+            "TASK22_GPU_MAX_SNAPSHOT_AGE_S": "8",
+        },
+    )
+
+    assert denied.returncode == 4
+    assert "Resume environment drift for TASK22_GPU_MAX_SNAPSHOT_AGE_S" in denied.stderr
+    assert not (pair_dir / "on").exists()
 
 
 def test_runner_resume_rejects_tampered_shadow_artifacts(tmp_path) -> None:
@@ -926,6 +1102,23 @@ def test_runner_default_pair_rejects_qualification_contract_drift(tmp_path) -> N
 
     assert denied.returncode == 4
     assert "requires HEADLINE_LO=5" in denied.stderr
+    assert not run_root.exists()
+
+
+def test_runner_rejects_monitor_contract_drift_before_creating_artifacts(tmp_path) -> None:
+    repo, run_root, env = _build_fake_repo(tmp_path)
+    runner = repo / "scripts/task22/run_admission_matched_ab.sh"
+
+    denied = subprocess.run(
+        ["bash", str(runner), "--run", "--stop-after-shadow"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={**env, "TASK22_MONITOR_NO_PROGRESS_TIMEOUT_S": "300"},
+    )
+
+    assert denied.returncode == 4
+    assert "requires TASK22_MONITOR_NO_PROGRESS_TIMEOUT_S=600" in denied.stderr
     assert not run_root.exists()
 
 

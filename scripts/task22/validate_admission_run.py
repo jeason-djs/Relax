@@ -51,7 +51,7 @@ ATTEMPT_OUTCOMES = {
 SYNC_EVENT_PHASES = {"gate", "pause", "flush", "transfer", "continue"}
 EVENT_PHASES = SYNC_EVENT_PHASES | {"abort"}
 FLOW_PHASES = {"gate_blocked", "gate_ready", "physical_start", "physical_end", "partition_close"}
-RUN_CONTRACT_SCHEMA_VERSION = 5
+RUN_CONTRACT_SCHEMA_VERSION = 6
 
 
 class Validation:
@@ -282,6 +282,16 @@ def validate_run(
     headline_lo: int,
     headline_hi: int,
     require_resume: bool,
+    monitor_poll_interval: float = 1.0,
+    monitor_evidence_grace: float = 5.0,
+    monitor_no_progress_timeout: float = 600.0,
+    gpu_max_snapshot_age: float = 5.0,
+    gpu_max_snapshot_interval: float = 2.0,
+    monitor_timeout: float = 5700.0,
+    monitor_term_grace: float = 1.0,
+    training_term_timeout: float = 10.0,
+    num_gpus: int = 4,
+    cuda_visible_devices: str = "",
 ) -> dict[str, Any]:
     validation = Validation()
     driver_log = run_dir / "driver.log"
@@ -305,7 +315,7 @@ def validate_run(
     else:
         validation.check("run_contract_valid", True)
     validation.check(
-        "run_contract_schema_is_current_v5",
+        "run_contract_schema_is_current_v6",
         contract.get("schema_version") == RUN_CONTRACT_SCHEMA_VERSION,
         {
             "expected": RUN_CONTRACT_SCHEMA_VERSION,
@@ -320,6 +330,16 @@ def validate_run(
         "max_staleness": max_staleness,
         "headline_lo": headline_lo,
         "headline_hi": headline_hi,
+        "monitor_poll_interval_s": monitor_poll_interval,
+        "monitor_evidence_grace_s": monitor_evidence_grace,
+        "monitor_no_progress_timeout_s": monitor_no_progress_timeout,
+        "gpu_max_snapshot_age_s": gpu_max_snapshot_age,
+        "gpu_max_snapshot_interval_s": gpu_max_snapshot_interval,
+        "monitor_timeout_s": monitor_timeout,
+        "monitor_term_grace_s": monitor_term_grace,
+        "training_term_timeout_s": training_term_timeout,
+        "num_gpus": num_gpus,
+        "cuda_visible_devices": cuda_visible_devices,
     }
     validation.check(
         "run_contract_matches_validator_arguments",
@@ -356,7 +376,46 @@ def validate_run(
             isinstance(contract.get("working_dir"), str)
             and Path(contract["working_dir"]).is_absolute()
             and isinstance(contract.get("runtime_env_json_sha256"), str)
-            and len(contract["runtime_env_json_sha256"]) == 64,
+            and len(contract["runtime_env_json_sha256"]) == 64
+            and isinstance(contract.get("task22_env_sha256"), str)
+            and len(contract["task22_env_sha256"]) == 64,
+        )
+        validation.check(
+            "qualification_monitor_contract_valid",
+            all(
+                isinstance(contract.get(name), (int, float))
+                and not isinstance(contract.get(name), bool)
+                and float(contract[name]) > 0
+                for name in (
+                    "monitor_poll_interval_s",
+                    "monitor_evidence_grace_s",
+                    "gpu_max_snapshot_age_s",
+                    "gpu_max_snapshot_interval_s",
+                    "monitor_timeout_s",
+                    "training_term_timeout_s",
+                )
+            )
+            and isinstance(contract.get("monitor_term_grace_s"), (int, float))
+            and not isinstance(contract.get("monitor_term_grace_s"), bool)
+            and float(contract["monitor_term_grace_s"]) >= 0
+            and contract.get("monitor_no_progress_timeout_s") == 600.0,
+        )
+        visible_devices = cuda_visible_devices.split(",") if cuda_visible_devices else []
+        validation.check(
+            "qualification_gpu_contract_valid",
+            num_gpus == 4
+            and contract.get("num_gpus") == 4
+            and contract.get("cuda_visible_devices") == cuda_visible_devices
+            and (
+                not visible_devices
+                or (len(visible_devices) == 4 and len(set(visible_devices)) == 4)
+            ),
+            {
+                "expected_num_gpus": num_gpus,
+                "contract_num_gpus": contract.get("num_gpus"),
+                "expected_cuda_visible_devices": cuda_visible_devices,
+                "contract_cuda_visible_devices": contract.get("cuda_visible_devices"),
+            },
         )
         if contract.get("schema_version") == RUN_CONTRACT_SCHEMA_VERSION:
             content_hashes_valid = all(
@@ -417,10 +476,26 @@ def validate_run(
                 },
             )
         roles = Counter(item.get("role") for item in attestations)
+        actor_ranks = {
+            item.get("rank") for item in attestations if item.get("role") == "actor"
+        }
+        engine_ranks = {
+            item.get("rank")
+            for item in attestations
+            if item.get("role") == "rollout_engine"
+        }
         validation.check(
             "runtime_attestation_roles_complete",
-            roles["driver"] == 1 and roles["ray_worker"] >= 1,
-            dict(roles),
+            roles["driver"] == 1
+            and roles["actor"] == 2
+            and actor_ranks == {0, 1}
+            and roles["rollout_engine"] == expected_engines
+            and engine_ranks == set(range(expected_engines)),
+            {
+                "roles": dict(roles),
+                "actor_ranks": sorted(value for value in actor_ranks if isinstance(value, int)),
+                "engine_ranks": sorted(value for value in engine_ranks if isinstance(value, int)),
+            },
         )
         if contract.get("schema_version") == RUN_CONTRACT_SCHEMA_VERSION:
             runtime_input_hashes = {
@@ -1379,6 +1454,16 @@ def main() -> None:
     parser.add_argument("--max-staleness", type=int, default=2)
     parser.add_argument("--headline-lo", type=int, default=5)
     parser.add_argument("--headline-hi", type=int, default=14)
+    parser.add_argument("--monitor-poll-interval", type=float, default=1.0)
+    parser.add_argument("--monitor-evidence-grace", type=float, default=5.0)
+    parser.add_argument("--monitor-no-progress-timeout", type=float, default=600.0)
+    parser.add_argument("--gpu-max-snapshot-age", type=float, default=5.0)
+    parser.add_argument("--gpu-max-snapshot-interval", type=float, default=2.0)
+    parser.add_argument("--monitor-timeout", type=float, default=5700.0)
+    parser.add_argument("--monitor-term-grace", type=float, default=1.0)
+    parser.add_argument("--training-term-timeout", type=float, default=10.0)
+    parser.add_argument("--num-gpus", type=int, default=4)
+    parser.add_argument("--cuda-visible-devices", default="")
     parser.add_argument("--require-resume", action="store_true")
     parser.add_argument("--output-json", type=Path)
     args = parser.parse_args()
@@ -1396,6 +1481,16 @@ def main() -> None:
         max_staleness=args.max_staleness,
         headline_lo=args.headline_lo,
         headline_hi=args.headline_hi,
+        monitor_poll_interval=args.monitor_poll_interval,
+        monitor_evidence_grace=args.monitor_evidence_grace,
+        monitor_no_progress_timeout=args.monitor_no_progress_timeout,
+        gpu_max_snapshot_age=args.gpu_max_snapshot_age,
+        gpu_max_snapshot_interval=args.gpu_max_snapshot_interval,
+        monitor_timeout=args.monitor_timeout,
+        monitor_term_grace=args.monitor_term_grace,
+        training_term_timeout=args.training_term_timeout,
+        num_gpus=args.num_gpus,
+        cuda_visible_devices=args.cuda_visible_devices,
         require_resume=args.require_resume,
     )
     rendered = json.dumps(result, indent=2, sort_keys=True)
