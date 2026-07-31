@@ -14,6 +14,7 @@ import pytest
 from relax.utils.task22_runtime_attestation import (
     attestation_matches_contract,
     merge_runtime_env,
+    runtime_source_root,
     working_dir_content_hashes,
     working_dir_content_sha256,
     working_dir_runtime_files,
@@ -23,6 +24,12 @@ from tests.engine.rollout.test_admission_run_validator import _build_valid_run, 
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
+
+
+def test_runtime_source_root_tracks_loaded_package_instead_of_cwd(monkeypatch, tmp_path) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    assert runtime_source_root() == REPO_ROOT
 RUNNER = REPO_ROOT / "scripts" / "task22" / "run_admission_matched_ab.sh"
 INPUT_GUARD = REPO_ROOT / "scripts" / "task22" / "input_guard.py"
 RUNTIME_ATTESTATION = REPO_ROOT / "relax" / "utils" / "task22_runtime_attestation.py"

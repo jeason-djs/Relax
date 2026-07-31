@@ -133,7 +133,8 @@ def main(args):
     # writes wandb_run_id into args, which then propagates to remote actors).
     init_tracking(args)
 
-    ctrl = Controller(args, runtime_env)
+    service_runtime_env = {key: value for key, value in runtime_env.items() if key != "working_dir"}
+    ctrl = Controller(args, service_runtime_env)
     _ctrl = ctrl
 
     # Register signal handlers so that `ray job stop` (SIGTERM) triggers cleanup.

@@ -148,6 +148,10 @@ def working_dir_content_sha256(working_dir: str | os.PathLike[str]) -> str:
     return hashlib.sha256(canonical).hexdigest()
 
 
+def runtime_source_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
 def _input_manifest_attestation(
     expected_path: str | None = None,
     roots_json: str | None = None,
@@ -191,7 +195,7 @@ def collect_attestation(
         capture_output=True,
         text=True,
     ).stdout
-    working_dir = os.path.realpath(os.getcwd())
+    working_dir = os.path.realpath(runtime_source_root())
     sglang_source_sha256 = {}
     for module_name in SGLANG_MODULES:
         module_path = os.path.realpath(importlib.import_module(module_name).__file__)
