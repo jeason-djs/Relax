@@ -8,6 +8,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 PREFLIGHT = REPO_ROOT / "scripts" / "task22" / "preflight_admission.sh"
@@ -200,3 +202,51 @@ def test_formal_preflight_runs_metrics_service_test_only_after_formal_dependency
     assert source.count(metrics_test) == 1
     assert source.index(metrics_test) > source.index(formal_import)
     assert source.index(metrics_test) > source.index('if [[ "$MODE" == "local" ]]')
+
+
+@pytest.mark.parametrize(
+    ("extra_env", "gpu_lines", "message"),
+    (
+        ({"NUM_GPUS": "3"}, 4, "Ray declaration requires NUM_GPUS=4"),
+        (
+            {"NUM_GPUS": "4", "CUDA_VISIBLE_DEVICES": "0,1,2"},
+            4,
+            "CUDA_VISIBLE_DEVICES to be empty or 4 unique devices",
+        ),
+        ({"NUM_GPUS": "4"}, 3, "requires exactly 4 physical GPUs"),
+    ),
+)
+def test_formal_preflight_rejects_non_four_gpu_contract_before_launch(
+    tmp_path, extra_env, gpu_lines, message
+) -> None:
+    repo, env = _build_preflight_repo(tmp_path, target_in_parent=True)
+    manifest_path = repo / "scripts/task22/approved_sync_baseline.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["sources"][SYNC_SOURCES[0]] = 1
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    fake_bin = tmp_path / "formal-bin"
+    fake_bin.mkdir()
+    _write(fake_bin / "ray", "#!/usr/bin/env bash\nexit 0\n", executable=True)
+    _write(fake_bin / "timeout", "#!/usr/bin/env bash\nexit 0\n", executable=True)
+    _write(fake_bin / "sha256sum", "#!/usr/bin/env bash\nexit 0\n", executable=True)
+    _write(
+        fake_bin / "nvidia-smi",
+        "#!/usr/bin/env bash\n" + "".join(f"printf '%s\\n' {index}\n" for index in range(gpu_lines)),
+        executable=True,
+    )
+
+    result = subprocess.run(
+        ["bash", "scripts/task22/preflight_admission.sh", "--formal"],
+        cwd=repo,
+        check=False,
+        capture_output=True,
+        text=True,
+        env={
+            **env,
+            "PATH": f"{fake_bin}:{env['PATH']}",
+            **extra_env,
+        },
+    )
+
+    assert result.returncode == 4
+    assert message in result.stderr
