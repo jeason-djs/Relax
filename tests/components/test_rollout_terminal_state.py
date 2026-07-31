@@ -24,6 +24,9 @@ class _AsyncRemote:
             raise self.result
         return self.result
 
+    async def __call__(self, *args, **kwargs):
+        return await self.remote(*args, **kwargs)
+
 
 class _SyncRemote:
     def __init__(self):
