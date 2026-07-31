@@ -4,6 +4,7 @@ from scripts.task22.monitor_admission_health import (
     COARSE_PROGRESS_RE,
     HARD_FAILURE_RE,
     _read_appended,
+    monitor,
     update_failure_state,
 )
 from scripts.task22 import sample_gpu_state
@@ -88,6 +89,45 @@ def test_repeated_failure_does_not_extend_grace_deadline() -> None:
 
     assert since == 10.0
     assert reason == "CUDA error"
+
+
+def test_monitor_exits_when_leader_is_gone_even_if_process_group_remains(
+    monkeypatch, tmp_path
+) -> None:
+    process_checks: list[tuple[int, str | None]] = []
+
+    def fake_process_exists(pid: int, expected_identity: str | None = None) -> bool:
+        process_checks.append((pid, expected_identity))
+        return False
+
+    monkeypatch.setattr(
+        "scripts.task22.monitor_admission_health._process_exists",
+        fake_process_exists,
+    )
+    monkeypatch.setattr(
+        "scripts.task22.monitor_admission_health._process_group_exists",
+        lambda process_group_id: True,
+    )
+
+    assert (
+        monitor(
+            tmp_path,
+            pid=123,
+            process_group_id=123,
+            pid_start_identity="leader-start",
+            sampler_pid=None,
+            sampler_start_identity=None,
+            poll_interval=0.001,
+            no_progress_timeout=1.0,
+            hard_failure_grace=1.0,
+            term_timeout=0.0,
+        )
+        == 0
+    )
+    assert process_checks == [(123, None)]
+    assert '"event": "training_exited"' in (
+        tmp_path / "online_monitor.jsonl"
+    ).read_text()
 
 
 def test_gpu_sampler_builds_one_complete_snapshot_before_write(monkeypatch) -> None:

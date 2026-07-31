@@ -425,6 +425,8 @@ def admission_decision_record(
         "physical_rollout_id": physical_rollout_id,
         "mode": decision.mode.value,
         "logical_debt_groups": logical_debt_groups,
+        "logical_debt_remaining": decision.debt_remaining,
+        "debt_basis": "logical_previous_partition",
         "release_remaining": decision.debt_remaining,
         "inflight_groups": decision.inflight_groups,
         "available_groups": decision.available_groups,

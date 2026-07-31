@@ -225,6 +225,7 @@ def export_placement_trace(driver_log: Path, request_dir: Path, output_path: Pat
 
     client_rows = _load_client_rows(request_dir)
     received_engines: dict[str, set[str]] = defaultdict(set)
+    engine_to_gpu: dict[str, int] = {}
     scheduler_snapshots: dict[str, list[dict[str, Any]]] = defaultdict(list)
     engine_pids = set()
     for raw_line in _complete_driver_lines(driver_log):
@@ -234,6 +235,10 @@ def export_placement_trace(driver_log: Path, request_dir: Path, output_path: Pat
             continue
         engine_pid = pid_match.group(1)
         engine_pids.add(engine_pid)
+        if "server_args=ServerArgs(" in clean:
+            gpu_match = BASE_GPU_RE.search(clean)
+            if gpu_match:
+                engine_to_gpu[engine_pid] = int(gpu_match.group(1))
         event = _extract_event(raw_line)
         if event is None:
             continue
@@ -285,6 +290,14 @@ def export_placement_trace(driver_log: Path, request_dir: Path, output_path: Pat
         sorted(engine_pids),
         scheduler_snapshots,
     )
+    for row in rows:
+        actual_engine_id = row.get("actual_engine_id")
+        if isinstance(actual_engine_id, str) and actual_engine_id.startswith("engine-pid-"):
+            row["actual_engine_gpu_id"] = engine_to_gpu.get(
+                actual_engine_id.removeprefix("engine-pid-")
+            )
+        else:
+            row["actual_engine_gpu_id"] = None
     snapshot_ages = [
         float(snapshot["snapshot_age_s"])
         for row in rows

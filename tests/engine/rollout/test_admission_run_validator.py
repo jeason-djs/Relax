@@ -69,12 +69,15 @@ def _decision_row() -> dict:
         "decision_sequence": 1,
         "physical_rollout_id": 0,
         "mode": "shadow",
-        "release_remaining": 2,
+        "logical_debt_groups": 0,
+        "logical_debt_remaining": 0,
+        "debt_basis": "logical_previous_partition",
+        "release_remaining": 0,
         "inflight_groups": 3,
         "available_groups": 5,
         "eager_admit_groups": 2,
-        "bounded_admit_groups": 1,
-        "desired_inflight_groups": 4,
+        "bounded_admit_groups": 5,
+        "desired_inflight_groups": 8,
         "actual_admit_groups": 2,
         "bypass_reason": None,
     }
@@ -164,6 +167,12 @@ def _driver_lines() -> list[str]:
                 "ready_partition=train_0 t=1.500000"
             ),
             "TASK22_FLOW phase=physical_start physical_rollout_id=0 t=0.500000",
+            (
+                "TASK22_TRANSFER physical_rollout_id=0 target_partition=train_0 "
+                "flush_reason=preferred_size groups=1 samples=8 is_last=true "
+                "buffer_enter=5.000000 flush_trigger=5.100000 put_begin=5.200000 "
+                "put_end=5.400000 buffer_dwell=0.100000 trigger_to_put=0.100000 put_wall=0.200000"
+            ),
             "TASK22_FLOW phase=partition_close physical_rollout_id=0 target_partition=train_0 groups=1 t=5.500000",
             (
                 "TASK22_FLOW phase=physical_end physical_rollout_id=0 "
@@ -212,6 +221,8 @@ def _build_valid_run(tmp_path: Path) -> Path:
         "admission_min": 4,
         "admission_max": 8,
         "admission_slack": 2,
+        "admission_debt_basis": "logical_previous_partition",
+        "transfer_flush_policy": "previous_boundary_current_preferred",
         "request_placement_mode": "off",
         "use_slime_router": False,
         "working_dir": str(run_dir.resolve()),
@@ -293,16 +304,68 @@ def _validate(run_dir: Path) -> dict:
 
 
 def test_admission_run_validator_accepts_complete_evidence(tmp_path) -> None:
-    result = _validate(_build_valid_run(tmp_path))
+    run_dir = _build_valid_run(tmp_path)
+    result = _validate(run_dir)
 
     assert result["verdict"] == "PASS", result["failures"]
     assert all(result["checks"].values())
     assert result["counts"]["consumption_rows"] == 1
     assert result["checks"]["unique_bootstrap_sync_cycle"]
     assert result["checks"]["runtime_keyed_sync_id_sets_match"]
+    assert result["checks"]["rid_engine_mapping_artifact_complete"]
+    trace_rows = [
+        json.loads(line)
+        for line in (run_dir / "observability" / "placement_trace.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert [
+        (row["rid"], row["actual_engine_id"], row["actual_engine_gpu_id"])
+        for row in trace_rows
+    ] == [(RID, "engine-pid-100", 2)]
 
 
-def test_admission_run_validator_accepts_clean_ab_without_heavy_server_or_timeline_logs(
+def test_admission_run_validator_requires_exact_logical_debt_close_transfer(tmp_path) -> None:
+    run_dir = _build_valid_run(tmp_path)
+    driver_log = run_dir / "driver.log"
+    driver_text = driver_log.read_text(encoding="utf-8").replace(
+        "TASK22_FLOW phase=physical_start physical_rollout_id=0 t=0.500000",
+        (
+            "TASK22_FLOW phase=physical_start physical_rollout_id=0 "
+            "previous_partition=train_-1 previous_debt_groups=1 "
+            "current_partition=train_0 current_target_groups=1 "
+            "work_envelope_groups=2 t=0.500000"
+        ),
+    )
+    driver_log.write_text(driver_text, encoding="utf-8")
+
+    missing = _validate(run_dir)
+
+    assert missing["verdict"] == "FAIL"
+    assert not missing["checks"]["previous_partition_closes_at_logical_debt_boundary"]
+
+    exact_close = (
+        "TASK22_TRANSFER physical_rollout_id=0 target_partition=train_-1 "
+        "flush_reason=logical_debt_closed groups=1 samples=8 is_last=true "
+        "buffer_enter=4.000000 flush_trigger=4.100000 put_begin=4.200000 "
+        "put_end=4.400000 buffer_dwell=0.100000 trigger_to_put=0.100000 "
+        "put_wall=0.200000\n"
+    )
+    driver_log.write_text(
+        driver_text.replace(
+            "TASK22_FLOW phase=partition_close",
+            exact_close + "TASK22_FLOW phase=partition_close",
+        ),
+        encoding="utf-8",
+    )
+
+    complete = _validate(run_dir)
+
+    assert complete["verdict"] == "PASS", complete["failures"]
+    assert complete["checks"]["previous_partition_closes_at_logical_debt_boundary"]
+
+
+def test_admission_run_validator_accepts_clean_ab_with_rid_mapping_without_timeline(
     tmp_path,
 ) -> None:
     run_dir = _build_valid_run(tmp_path)
@@ -319,8 +382,17 @@ def test_admission_run_validator_accepts_clean_ab_without_heavy_server_or_timeli
             "gpu_sample_interval_s": 5.0,
             "hard_failure_grace_s": 300.0,
             "pair_cooldown_s": 60.0,
+            "admission_debt_basis": "logical_previous_partition",
+            "transfer_flush_policy": "previous_boundary_current_preferred",
+            "scheduler_status_interval_s": 5.0,
             "runtime_env_json": json.dumps(
-                {"env_vars": {"RELAX_RID_ONLY_REQUEST_LOGGING": "1"}},
+                {
+                    "env_vars": {
+                        "RELAX_RID_ONLY_REQUEST_LOGGING": "1",
+                        "SGLANG_LOG_SCHEDULER_STATUS_TARGET": "stdout",
+                        "SGLANG_LOG_SCHEDULER_STATUS_INTERVAL": "5.0",
+                    }
+                },
                 sort_keys=True,
                 separators=(",", ":"),
             ),
@@ -332,16 +404,6 @@ def test_admission_run_validator_accepts_clean_ab_without_heavy_server_or_timeli
     (run_dir / "logs" / "nvidia_smi_1s.csv").rename(
         run_dir / "logs" / "nvidia_smi.csv"
     )
-    driver_log = run_dir / "driver.log"
-    driver_log.write_text(
-        "\n".join(
-            line
-            for line in driver_log.read_text().splitlines()
-            if '"event": "scheduler.status"' not in line
-        )
-        + "\n"
-    )
-
     result = validate_run(
         run_dir,
         expected_mode="shadow",
@@ -362,11 +424,27 @@ def test_admission_run_validator_accepts_clean_ab_without_heavy_server_or_timeli
     assert result["verdict"] == "PASS", result["failures"]
     assert result["checks"]["clean_evidence_contract_valid"]
     assert result["checks"]["clean_heavy_evidence_disabled"]
-    assert "request_observability_passes" not in result["checks"]
+    assert result["checks"]["request_observability_passes"]
     assert "headline_timeline_files_complete" not in result["checks"]
     assert result["checks"]["client_lifecycle_terminal"]
     assert result["checks"]["client_rid_roundtrip"]
     assert result["checks"]["client_lifecycle_timing_valid"]
+    assert result["checks"]["rid_engine_mapping_artifact_complete"]
+
+
+def test_admission_run_validator_rejects_rid_without_engine_gpu_mapping(tmp_path) -> None:
+    run_dir = _build_valid_run(tmp_path)
+    driver_log = run_dir / "driver.log"
+    driver_log.write_text(
+        driver_log.read_text(encoding="utf-8").replace("base_gpu_id=2", "base_gpu_id=None"),
+        encoding="utf-8",
+    )
+
+    result = _validate(run_dir)
+
+    assert result["verdict"] == "FAIL"
+    assert not result["checks"]["request_observability_passes"]
+    assert not result["checks"]["rid_engine_mapping_artifact_complete"]
 
 
 def test_clean_gpu_parser_ignores_only_trailing_incomplete_snapshot(tmp_path) -> None:

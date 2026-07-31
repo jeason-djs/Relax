@@ -17,7 +17,10 @@ from typing import Any
 
 from relax.engine.rollout.request_observability import attempt_token_from_id
 from relax.utils.task22_runtime_attestation import attestation_matches_contract
-from scripts.task22.analyze_rollout_observability import analyze as analyze_requests
+from scripts.task22.analyze_rollout_observability import (
+    analyze as analyze_requests,
+    export_placement_trace,
+)
 
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
@@ -51,6 +54,7 @@ ATTEMPT_OUTCOMES = {
 SYNC_EVENT_PHASES = {"gate", "pause", "flush", "transfer", "continue"}
 EVENT_PHASES = SYNC_EVENT_PHASES | {"abort"}
 FLOW_PHASES = {"gate_blocked", "gate_ready", "physical_start", "physical_end", "partition_close"}
+TRANSFER_FLUSH_REASONS = {"logical_debt_closed", "preferred_size", "physical_close"}
 RUN_CONTRACT_SCHEMA_VERSION = 6
 
 
@@ -419,14 +423,21 @@ def validate_run(
             "clean_evidence_contract_valid",
             contract.get("evidence_profile") == "clean_ab_v1"
             and contract.get("flashinfer_cuda_arch_list") == "12.0a"
+            and contract.get("admission_debt_basis") == "logical_previous_partition"
+            and contract.get("transfer_flush_policy") == "previous_boundary_current_preferred"
+            and contract.get("scheduler_status_interval_s") == 5.0
             and contract.get("gpu_sample_interval_s") == 5.0
             and contract.get("hard_failure_grace_s") >= 300.0
             and contract.get("pair_cooldown_s") >= 0.0
-            and "SGLANG_LOG_SCHEDULER_STATUS_TARGET" not in runtime_env_vars
-            and "SGLANG_LOG_SCHEDULER_STATUS_INTERVAL" not in runtime_env_vars,
+            and runtime_env_vars.get("RELAX_RID_ONLY_REQUEST_LOGGING") == "1"
+            and runtime_env_vars.get("SGLANG_LOG_SCHEDULER_STATUS_TARGET") == "stdout"
+            and runtime_env_vars.get("SGLANG_LOG_SCHEDULER_STATUS_INTERVAL") == "5.0",
             {
                 "evidence_profile": contract.get("evidence_profile"),
                 "flashinfer_cuda_arch_list": contract.get("flashinfer_cuda_arch_list"),
+                "admission_debt_basis": contract.get("admission_debt_basis"),
+                "transfer_flush_policy": contract.get("transfer_flush_policy"),
+                "scheduler_status_interval_s": contract.get("scheduler_status_interval_s"),
                 "gpu_sample_interval_s": contract.get("gpu_sample_interval_s"),
                 "hard_failure_grace_s": contract.get("hard_failure_grace_s"),
                 "pair_cooldown_s": contract.get("pair_cooldown_s"),
@@ -588,33 +599,54 @@ def validate_run(
     if not driver_log.is_file() or not observability_dir.is_dir():
         return validation.result(counts={})
     driver_text = _complete_driver_text(driver_log.read_text(encoding="utf-8", errors="replace"))
+    transfer_rows = _parse_structured_lines(driver_text, "TASK22_TRANSFER")
+    for row in transfer_rows:
+        group_count = _finite_field(row, "groups")
+        sample_count = _finite_field(row, "samples")
+        buffer_enter = _finite_field(row, "buffer_enter")
+        flush_trigger = _finite_field(row, "flush_trigger")
+        put_begin = _finite_field(row, "put_begin")
+        put_end = _finite_field(row, "put_end")
+        validation.check(
+            "transfer_trace_fields_valid",
+            row.get("flush_reason") in TRANSFER_FLUSH_REASONS
+            and row.get("is_last") in {"true", "false"}
+            and group_count is not None
+            and sample_count is not None
+            and group_count > 0
+            and sample_count == group_count * 8
+            and all(
+                value is not None
+                for value in (buffer_enter, flush_trigger, put_begin, put_end)
+            )
+            and float(buffer_enter) <= float(flush_trigger) <= float(put_begin) <= float(put_end),
+            row,
+        )
+    validation.check(
+        "transfer_trace_present",
+        bool(transfer_rows),
+        {"count": len(transfer_rows)},
+    )
     if evidence_profile == "clean_ab_v1":
         validation.check(
             "clean_heavy_evidence_disabled",
-            not any(timeline_dir.glob("timeline_step_*.json"))
-            and '"event": "scheduler.status"' not in driver_text,
+            not any(timeline_dir.glob("timeline_step_*.json")),
         )
 
-    if evidence_profile == "clean_ab_v1":
-        request_analysis = {
-            "verdict": "SKIP",
-            "reason": "server scheduler/request logs disabled in clean A/B profile",
-        }
-    else:
-        try:
-            request_analysis = analyze_requests(
-                driver_log,
-                observability_dir,
-                expected_engines=expected_engines,
-                require_resume=require_resume,
-            )
-        except Exception as exc:  # noqa: BLE001
-            request_analysis = {"verdict": "ERROR", "error": f"{type(exc).__name__}: {exc}"}
-        validation.check(
-            "request_observability_passes",
-            request_analysis.get("verdict") == "PASS",
-            request_analysis,
+    try:
+        request_analysis = analyze_requests(
+            driver_log,
+            observability_dir,
+            expected_engines=expected_engines,
+            require_resume=require_resume,
         )
+    except Exception as exc:  # noqa: BLE001
+        request_analysis = {"verdict": "ERROR", "error": f"{type(exc).__name__}: {exc}"}
+    validation.check(
+        "request_observability_passes",
+        request_analysis.get("verdict") == "PASS",
+        request_analysis,
+    )
 
     request_paths, request_rows = _load_glob(
         observability_dir,
@@ -635,6 +667,46 @@ def validate_run(
         observability_dir,
         "consumption_ledger_rollout_*_rank_*.jsonl",
         validation,
+    )
+    placement_trace_path = observability_dir / "placement_trace.jsonl"
+    try:
+        placement_trace_summary = export_placement_trace(
+            driver_log,
+            observability_dir,
+            placement_trace_path,
+        )
+        placement_trace_rows = _read_jsonl(placement_trace_path, validation)
+    except Exception as exc:  # noqa: BLE001
+        placement_trace_summary = {
+            "output_path": str(placement_trace_path),
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+        placement_trace_rows = []
+    mapped_trace_rids = {
+        str(row["rid"])
+        for row in placement_trace_rows
+        if isinstance(row.get("rid"), str)
+        and isinstance(row.get("actual_engine_id"), str)
+        and row["actual_engine_id"].startswith("engine-pid-")
+        and isinstance(row.get("actual_engine_gpu_id"), int)
+        and not isinstance(row.get("actual_engine_gpu_id"), bool)
+    }
+    expected_trace_rids = {
+        str(row["rid"]) for row in request_rows if isinstance(row.get("rid"), str)
+    }
+    validation.check(
+        "rid_engine_mapping_artifact_complete",
+        bool(expected_trace_rids)
+        and len(placement_trace_rows) == len(request_rows)
+        and mapped_trace_rids == expected_trace_rids,
+        {
+            "path": str(placement_trace_path),
+            "expected_rows": len(request_rows),
+            "actual_rows": len(placement_trace_rows),
+            "missing_rids": sorted(expected_trace_rids - mapped_trace_rids)[:20],
+            "extra_rids": sorted(mapped_trace_rids - expected_trace_rids)[:20],
+            "summary": placement_trace_summary,
+        },
     )
     event_rows = _parse_structured_lines(driver_text, "TASK22_EVENT")
     flow_rows = _parse_structured_lines(driver_text, "TASK22_FLOW")
@@ -786,10 +858,23 @@ def validate_run(
             if actual != expected_actual:
                 mode_semantics_valid = False
                 validation.failures["admission_mode_semantics"].append(row.get("decision_id"))
-        debt = row.get("release_remaining")
+        debt = row.get("logical_debt_remaining")
+        logical_debt = row.get("logical_debt_groups")
         available = row.get("available_groups")
+        validation.check(
+            "admission_uses_logical_debt",
+            row.get("debt_basis") == "logical_previous_partition"
+            and debt == logical_debt
+            and row.get("release_remaining") == debt,
+            {
+                "decision_id": row.get("decision_id"),
+                "debt_basis": row.get("debt_basis"),
+                "logical_debt_remaining": debt,
+                "logical_debt_groups": logical_debt,
+                "release_remaining": row.get("release_remaining"),
+            },
+        )
         if bypass == "final_backfill":
-            logical_debt = row.get("logical_debt_groups")
             validation.check(
                 "final_backfill_actual_within_debt",
                 isinstance(actual, int)
@@ -804,7 +889,7 @@ def validate_run(
                 {
                     "decision_id": row.get("decision_id"),
                     "actual_admit_groups": actual,
-                    "release_remaining": debt,
+                    "logical_debt_remaining": debt,
                     "logical_debt_groups": logical_debt,
                     "available_groups": available,
                 },
@@ -1375,6 +1460,7 @@ def validate_run(
                 )
 
     physical_intervals: dict[int, tuple[float, float]] = {}
+    physical_previous_debt: dict[int, int] = {}
     for rollout_id in sorted(expected_physical):
         start_rows = flow_by_phase_key[("physical_start", str(rollout_id))]
         end_rows = flow_by_phase_key[("physical_end", str(rollout_id))]
@@ -1385,6 +1471,10 @@ def validate_run(
                 {"phase": phase, "rollout_id": rollout_id},
             )
         if len(start_rows) == 1 and len(end_rows) == 1:
+            try:
+                physical_previous_debt[rollout_id] = int(start_rows[0].get("previous_debt_groups", "0"))
+            except (TypeError, ValueError):
+                physical_previous_debt[rollout_id] = -1
             start_time = _finite_field(start_rows[0], "t")
             end_begin = _finite_field(end_rows[0], "t_begin")
             end_time = _finite_field(end_rows[0], "t_end")
@@ -1446,6 +1536,36 @@ def validate_run(
                     "physical_interval": interval,
                 },
             )
+
+    transfer_rows_by_physical: dict[int, list[dict[str, str]]] = defaultdict(list)
+    for row in transfer_rows:
+        try:
+            transfer_physical = int(row["physical_rollout_id"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        transfer_rows_by_physical[transfer_physical].append(row)
+    for rollout_id, previous_debt in sorted(physical_previous_debt.items()):
+        if previous_debt <= 0:
+            continue
+        expected_partition = f"train_{rollout_id - 1}"
+        close_transfers = [
+            row
+            for row in transfer_rows_by_physical[rollout_id]
+            if row.get("flush_reason") == "logical_debt_closed"
+        ]
+        validation.check(
+            "previous_partition_closes_at_logical_debt_boundary",
+            len(close_transfers) == 1
+            and close_transfers[0].get("target_partition") == expected_partition
+            and close_transfers[0].get("is_last") == "true"
+            and _finite_field(close_transfers[0], "groups") == previous_debt,
+            {
+                "physical_rollout_id": rollout_id,
+                "previous_debt_groups": previous_debt,
+                "expected_partition": expected_partition,
+                "transfers": close_transfers,
+            },
+        )
 
     headline_steps = list(range(headline_lo, headline_hi + 1))
     rollout_metrics = _parse_metric_rows(driver_text, ROLLOUT_METRICS_RE)
@@ -1565,6 +1685,7 @@ def validate_run(
     return validation.result(
         counts=counts,
         request_analysis=request_analysis,
+        placement_trace=placement_trace_summary,
         quality_metrics=quality_rows,
     )
 

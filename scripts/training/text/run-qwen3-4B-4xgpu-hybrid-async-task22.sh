@@ -41,7 +41,9 @@ PARTITION_ADMISSION_MODE="${PARTITION_ADMISSION_MODE:-off}"
 REQUEST_PLACEMENT_MODE="${REQUEST_PLACEMENT_MODE:-off}"
 REQUEST_PLACEMENT_POLICY="${REQUEST_PLACEMENT_POLICY:-least_predicted_work}"
 REQUEST_OBSERVABILITY_DIR="${REQUEST_OBSERVABILITY_DIR:-}"
-TIMELINE_DUMP_DIR="${TIMELINE_DUMP_DIR:-/tmp/timeline}"
+if [[ -z "${TIMELINE_DUMP_DIR+x}" ]]; then
+    TIMELINE_DUMP_DIR="/tmp/timeline"
+fi
 TASK22_EVIDENCE_PROFILE="${TASK22_EVIDENCE_PROFILE:-qualification_v1}"
 FLASHINFER_CUDA_ARCH_LIST="${FLASHINFER_CUDA_ARCH_LIST:-12.0a}"
 DRIVER_LOG_PATH="${DRIVER_LOG_PATH:-log/qwen3-4b-task22-p1-${PARTITION_ADMISSION_MODE}-${now}.log}"
@@ -121,10 +123,14 @@ if [[ -n "$REQUEST_OBSERVABILITY_DIR" ]]; then
     bash "$REPO/scripts/task22/prepare_rollout_observability.sh"
     export RELAX_RID_ONLY_REQUEST_LOGGING=1
     export RAY_DEDUP_LOGS=0
-    if [[ "$TASK22_EVIDENCE_PROFILE" == "qualification_v1" ]]; then
-        export SGLANG_LOG_SCHEDULER_STATUS_TARGET="${SGLANG_LOG_SCHEDULER_STATUS_TARGET:-stdout}"
-        export SGLANG_LOG_SCHEDULER_STATUS_INTERVAL="${SGLANG_LOG_SCHEDULER_STATUS_INTERVAL:-1.0}"
-    fi
+    export SGLANG_LOG_SCHEDULER_STATUS_TARGET="${SGLANG_LOG_SCHEDULER_STATUS_TARGET:-stdout}"
+    export SGLANG_LOG_SCHEDULER_STATUS_INTERVAL="$(
+        if [[ "$TASK22_EVIDENCE_PROFILE" == "qualification_v1" ]]; then
+            printf '%s\n' "${SGLANG_LOG_SCHEDULER_STATUS_INTERVAL:-1.0}"
+        else
+            printf '%s\n' "${SGLANG_LOG_SCHEDULER_STATUS_INTERVAL:-5.0}"
+        fi
+    )"
     RUNTIME_ENV_JSON="$(
         RUNTIME_ENV_JSON="$RUNTIME_ENV_JSON" "$PYTHON_BIN" -c '
 import json
@@ -196,7 +202,7 @@ if [[ "${USE_SLIME_ROUTER:-0}" == "1" ]]; then
     SGLANG_ARGS+=(--use-slime-router)
 fi
 
-if [[ -n "$REQUEST_OBSERVABILITY_DIR" && "$TASK22_EVIDENCE_PROFILE" == "qualification_v1" ]]; then
+if [[ -n "$REQUEST_OBSERVABILITY_DIR" ]]; then
     SGLANG_ARGS+=(
         --sglang-log-requests
         --sglang-log-requests-level 0

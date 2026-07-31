@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from enum import Enum
-from typing import Any
+from typing import Any, Generic, TypeVar
 
 
 class AdmissionMode(str, Enum):
@@ -73,32 +73,33 @@ class AdmissionDecision:
     bypass_reason: str | None = None
 
 
-def previous_partition_release_remaining(
-    *, previous_debt_groups: int, completed_groups: int, transfer_batch_groups: int
-) -> int:
-    """Groups still needed before the previous partition's closing transfer.
-
-    TransferQueue publication is batched. If a partition owes six groups but
-    transfers happen in batches of eight, completing six groups does not yet
-    make the partition visible as complete to the Actor; two more completions
-    are needed to trigger the split transfer.
-    """
+def previous_partition_debt_remaining(*, previous_debt_groups: int, completed_groups: int) -> int:
+    """Return successful group completions still owed to the previous partition."""
 
     for name, value in (
         ("previous_debt_groups", previous_debt_groups),
         ("completed_groups", completed_groups),
-        ("transfer_batch_groups", transfer_batch_groups),
     ):
         if value < 0:
             raise ValueError(f"{name} must be non-negative")
-    if transfer_batch_groups == 0:
+    return max(previous_debt_groups - min(completed_groups, previous_debt_groups), 0)
+
+
+def previous_partition_release_remaining(
+    *, previous_debt_groups: int, completed_groups: int, transfer_batch_groups: int
+) -> int:
+    """Compatibility wrapper for previous-partition logical debt.
+
+    Transfer batching is a data-plane preference and must not delay the
+    producer's ``is_last`` partition close.
+    """
+
+    if transfer_batch_groups <= 0:
         raise ValueError("transfer_batch_groups must be positive")
-    if previous_debt_groups == 0:
-        return 0
-    closing_transfer_target = (
-        (previous_debt_groups + transfer_batch_groups - 1) // transfer_batch_groups
-    ) * transfer_batch_groups
-    return max(closing_transfer_target - completed_groups, 0)
+    return previous_partition_debt_remaining(
+        previous_debt_groups=previous_debt_groups,
+        completed_groups=completed_groups,
+    )
 
 
 def split_transfer_counts(batch_groups: int, remaining_previous_debt: int) -> tuple[int, int]:
@@ -110,6 +111,154 @@ def split_transfer_counts(batch_groups: int, remaining_previous_debt: int) -> tu
         raise ValueError("remaining_previous_debt must be non-negative")
     previous_groups = min(batch_groups, remaining_previous_debt)
     return previous_groups, batch_groups - previous_groups
+
+
+GroupT = TypeVar("GroupT")
+
+
+@dataclass(frozen=True)
+class PartitionTransferBatch(Generic[GroupT]):
+    """One partition-homogeneous transfer selected by the rollout planner."""
+
+    partition_kind: str
+    groups: tuple[GroupT, ...]
+    flush_reason: str
+    is_last: bool
+    buffer_enter_abs: float
+    flush_trigger_abs: float
+
+
+class PartitionTransferPlanner(Generic[GroupT]):
+    """Separate semantic previous closes from current throughput batching."""
+
+    def __init__(
+        self,
+        *,
+        previous_quota_groups: int,
+        current_quota_groups: int,
+        preferred_batch_groups: int,
+    ) -> None:
+        for name, value in (
+            ("previous_quota_groups", previous_quota_groups),
+            ("current_quota_groups", current_quota_groups),
+            ("preferred_batch_groups", preferred_batch_groups),
+        ):
+            if value < 0:
+                raise ValueError(f"{name} must be non-negative")
+        if preferred_batch_groups == 0:
+            raise ValueError("preferred_batch_groups must be positive")
+        self.previous_quota_groups = previous_quota_groups
+        self.current_quota_groups = current_quota_groups
+        self.preferred_batch_groups = preferred_batch_groups
+        self.previous_groups: list[GroupT] = []
+        self.current_groups: list[GroupT] = []
+        self._previous_buffer_enter_abs: float | None = None
+        self._current_buffer_enter_abs: float | None = None
+        self.committed_previous_groups = 0
+        self.committed_current_groups = 0
+
+    @property
+    def previous_remaining_groups(self) -> int:
+        return max(self.previous_quota_groups - self.committed_previous_groups, 0)
+
+    def _pop_previous(self, *, now: float, reason: str, is_last: bool) -> PartitionTransferBatch[GroupT]:
+        groups = tuple(self.previous_groups)
+        assert groups and self._previous_buffer_enter_abs is not None
+        self.previous_groups.clear()
+        buffer_enter_abs = self._previous_buffer_enter_abs
+        self._previous_buffer_enter_abs = None
+        return PartitionTransferBatch(
+            partition_kind="previous",
+            groups=groups,
+            flush_reason=reason,
+            is_last=is_last,
+            buffer_enter_abs=buffer_enter_abs,
+            flush_trigger_abs=now,
+        )
+
+    def _pop_current(
+        self,
+        count: int,
+        *,
+        now: float,
+        reason: str,
+        is_last: bool,
+    ) -> PartitionTransferBatch[GroupT]:
+        groups = tuple(self.current_groups[:count])
+        assert groups and self._current_buffer_enter_abs is not None
+        del self.current_groups[:count]
+        buffer_enter_abs = self._current_buffer_enter_abs
+        self._current_buffer_enter_abs = now if self.current_groups else None
+        return PartitionTransferBatch(
+            partition_kind="current",
+            groups=groups,
+            flush_reason=reason,
+            is_last=is_last,
+            buffer_enter_abs=buffer_enter_abs,
+            flush_trigger_abs=now,
+        )
+
+    def add_completed(self, group: GroupT, *, now: float) -> list[PartitionTransferBatch[GroupT]]:
+        """Route one successful group and return immediately flushable batches."""
+
+        if self.committed_previous_groups < self.previous_quota_groups:
+            if not self.previous_groups:
+                self._previous_buffer_enter_abs = now
+            self.previous_groups.append(group)
+            self.committed_previous_groups += 1
+            if self.committed_previous_groups == self.previous_quota_groups:
+                return [
+                    self._pop_previous(
+                        now=now,
+                        reason="logical_debt_closed",
+                        is_last=True,
+                    )
+                ]
+            return []
+
+        if self.committed_current_groups >= self.current_quota_groups:
+            raise ValueError("successful group exceeds the current partition quota")
+        if not self.current_groups:
+            self._current_buffer_enter_abs = now
+        self.current_groups.append(group)
+        self.committed_current_groups += 1
+        if len(self.current_groups) < self.preferred_batch_groups:
+            return []
+        is_last = (
+            self.committed_current_groups == self.current_quota_groups
+            and len(self.current_groups) == self.preferred_batch_groups
+        )
+        return [
+            self._pop_current(
+                self.preferred_batch_groups,
+                now=now,
+                reason="preferred_size",
+                is_last=is_last,
+            )
+        ]
+
+    def flush_tail(self, *, now: float, reason: str = "physical_close") -> list[PartitionTransferBatch[GroupT]]:
+        """Flush partition-homogeneous tails without fabricating completion."""
+
+        batches: list[PartitionTransferBatch[GroupT]] = []
+        if self.previous_groups:
+            batches.append(
+                self._pop_previous(
+                    now=now,
+                    reason=reason,
+                    is_last=self.committed_previous_groups >= self.previous_quota_groups,
+                )
+            )
+        if self.current_groups:
+            batches.append(
+                self._pop_current(
+                    len(self.current_groups),
+                    now=now,
+                    reason=reason,
+                    is_last=self.committed_current_groups >= self.current_quota_groups,
+                )
+            )
+        return batches
 
 
 def config_from_namespace(args: Any) -> tuple[DebtAwareAdmissionConfig, str | None]:
@@ -314,14 +463,13 @@ def plan_next_admission(
     # Debt closure, however, must always be based on actually transferred groups.
     available_groups = max(target_groups - progress_groups - inflight_groups, 0)
     eager_admit_groups = eager_fetch_groups if cumulative_submitted_groups < target_groups else 0
-    release_remaining = previous_partition_release_remaining(
+    logical_debt_remaining = previous_partition_debt_remaining(
         previous_debt_groups=previous_debt_groups,
         completed_groups=transferred_groups,
-        transfer_batch_groups=transfer_batch_groups,
     )
     return controller.admit_count(
         inflight_groups=inflight_groups,
-        debt_remaining=release_remaining,
+        debt_remaining=logical_debt_remaining,
         available_groups=available_groups,
         eager_admit_groups=eager_admit_groups,
     )

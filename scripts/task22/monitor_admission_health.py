@@ -182,10 +182,11 @@ def monitor(
             and expected_identity is not None
             and _process_start_identity(pid) != expected_identity
         )
-        running = (
-            pid_present
-            or _process_group_exists(process_group_id)
-        ) and not identity_changed
+        # The supervised leader is the completion contract reaped by the
+        # runner. Descendants may outlive it while Ray shuts down and retain
+        # the old PGID; group liveness is only relevant when stopping a failed
+        # run, not when detecting natural completion.
+        running = pid_present and not identity_changed
         if not running:
             _append_event(event_log, "training_exited")
             return 0

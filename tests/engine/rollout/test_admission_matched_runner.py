@@ -1146,6 +1146,30 @@ def test_runner_on_first_clean_pair_keeps_only_admission_mode_as_contract_diff(t
     assert not any((pair_dir / "shadow").glob("timeline/timeline_step_*.json"))
 
 
+def test_runner_on_only_runs_no_shadow_leg(tmp_path) -> None:
+    repo, run_root, env = _build_fake_repo(tmp_path)
+    runner = repo / "scripts/task22/run_admission_matched_ab.sh"
+    completed = subprocess.run(
+        ["bash", str(runner), "--run", "--on-only"],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={
+            **env,
+            "TASK22_AUTHORIZE_ON_RUN": "1",
+            "TASK22_EVIDENCE_PROFILE": "clean_ab_v1",
+        },
+    )
+
+    pair_dir = next(run_root.glob("admission_matched_*_fixture"))
+    assert "verdict=ON_PASS" in completed.stdout
+    assert "scope=on_qualification" in completed.stdout
+    assert (pair_dir / "on" / "validation.json").is_file()
+    assert not (pair_dir / "shadow").exists()
+    assert (pair_dir / "ON_VALID").read_text(encoding="utf-8").strip() == "PASS"
+    assert (pair_dir / "PAIR_STATUS").read_text(encoding="utf-8").strip() == "ON_VALIDATED"
+
+
 def test_runner_on_first_requires_explicit_on_authorization(tmp_path) -> None:
     repo, run_root, env = _build_fake_repo(tmp_path)
     denied = subprocess.run(

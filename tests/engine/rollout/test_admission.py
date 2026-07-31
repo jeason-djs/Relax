@@ -8,9 +8,11 @@ from relax.engine.rollout.admission import (
     AdmissionMode,
     DebtAwareAdmissionConfig,
     DebtAwareAdmissionController,
+    PartitionTransferPlanner,
     UnrecoverableFinalBackfillError,
     config_from_namespace,
     plan_next_admission,
+    previous_partition_debt_remaining,
     previous_partition_release_remaining,
     require_final_backfill_deficit,
     split_transfer_counts,
@@ -145,27 +147,25 @@ def test_admission_fail_open_preserves_eager_count_and_records_reason() -> None:
     assert controller.metrics()["rollout/admission/failed_open"] == 1.0
 
 
-def test_previous_partition_release_accounts_for_transfer_batching() -> None:
+def test_previous_partition_debt_does_not_wait_for_transfer_batch_fill() -> None:
+    assert previous_partition_debt_remaining(previous_debt_groups=6, completed_groups=0) == 6
+    assert previous_partition_debt_remaining(previous_debt_groups=6, completed_groups=5) == 1
+    assert previous_partition_debt_remaining(previous_debt_groups=6, completed_groups=6) == 0
+
+
+def test_previous_partition_release_compatibility_wrapper_uses_logical_debt() -> None:
     assert (
         previous_partition_release_remaining(
             previous_debt_groups=6,
             completed_groups=0,
             transfer_batch_groups=8,
         )
-        == 8
+        == 6
     )
     assert (
         previous_partition_release_remaining(
             previous_debt_groups=6,
             completed_groups=6,
-            transfer_batch_groups=8,
-        )
-        == 2
-    )
-    assert (
-        previous_partition_release_remaining(
-            previous_debt_groups=6,
-            completed_groups=8,
             transfer_batch_groups=8,
         )
         == 0
@@ -216,9 +216,9 @@ def test_plan_next_admission_matches_task22_fully_async_partial_false_shape() ->
     )
 
     assert initial.actual_admit_groups == 8
-    assert initial.debt_remaining == 8
-    assert near_close.actual_admit_groups == 2
-    assert near_close.debt_remaining == 2
+    assert initial.debt_remaining == 6
+    assert near_close.actual_admit_groups == 6
+    assert near_close.debt_remaining == 0
 
 
 def test_plan_next_admission_refills_after_dynamic_filter_drop() -> None:
@@ -236,8 +236,8 @@ def test_plan_next_admission_refills_after_dynamic_filter_drop() -> None:
         eager_fetch_groups=14,
     )
 
-    assert decision.desired_inflight_groups == 8
-    assert decision.actual_admit_groups == 3
+    assert decision.desired_inflight_groups == 6
+    assert decision.actual_admit_groups == 1
 
 
 def test_plan_next_admission_counts_aborted_group_as_rollout_progress_not_transfer() -> None:
@@ -256,8 +256,8 @@ def test_plan_next_admission_counts_aborted_group_as_rollout_progress_not_transf
     )
 
     assert decision.available_groups == 6
-    assert decision.debt_remaining == 3
-    assert decision.actual_admit_groups == 3
+    assert decision.debt_remaining == 1
+    assert decision.actual_admit_groups == 2
 
 
 def test_plan_next_admission_closes_debt_then_opens_normal_window_without_overfetch() -> None:
@@ -290,16 +290,16 @@ def test_plan_next_admission_closes_debt_then_opens_normal_window_without_overfe
         target_groups=14,
         progress_groups=8,
         transferred_groups=8,
-        inflight_groups=2,
-        cumulative_submitted_groups=10,
+        inflight_groups=6,
+        cumulative_submitted_groups=14,
         previous_debt_groups=6,
         transfer_batch_groups=8,
         eager_fetch_groups=14,
     )
 
     assert first.actual_admit_groups == 8
-    assert close_debt.actual_admit_groups == 2
-    assert normal.actual_admit_groups == 4
+    assert close_debt.actual_admit_groups == 6
+    assert normal.actual_admit_groups == 0
     assert (
         sum(
             decision.actual_admit_groups
@@ -311,6 +311,68 @@ def test_plan_next_admission_closes_debt_then_opens_normal_window_without_overfe
         )
         == 14
     )
+
+
+def test_partition_transfer_planner_closes_previous_at_logical_debt_boundary() -> None:
+    planner: PartitionTransferPlanner[str] = PartitionTransferPlanner(
+        previous_quota_groups=6,
+        current_quota_groups=8,
+        preferred_batch_groups=8,
+    )
+
+    assert planner.add_completed("p0", now=10.0) == []
+    for index in range(1, 5):
+        assert planner.add_completed(f"p{index}", now=10.0 + index) == []
+    batches = planner.add_completed("p5", now=15.0)
+
+    assert len(batches) == 1
+    batch = batches[0]
+    assert batch.partition_kind == "previous"
+    assert batch.groups == ("p0", "p1", "p2", "p3", "p4", "p5")
+    assert batch.flush_reason == "logical_debt_closed"
+    assert batch.is_last
+    assert batch.buffer_enter_abs == 10.0
+    assert batch.flush_trigger_abs == 15.0
+    assert planner.previous_remaining_groups == 0
+
+
+def test_partition_transfer_planner_batches_current_independently() -> None:
+    planner: PartitionTransferPlanner[str] = PartitionTransferPlanner(
+        previous_quota_groups=2,
+        current_quota_groups=8,
+        preferred_batch_groups=8,
+    )
+    planner.add_completed("previous-0", now=1.0)
+    planner.add_completed("previous-1", now=2.0)
+
+    for index in range(7):
+        assert planner.add_completed(f"current-{index}", now=3.0 + index) == []
+    batches = planner.add_completed("current-7", now=10.0)
+
+    assert len(batches) == 1
+    batch = batches[0]
+    assert batch.partition_kind == "current"
+    assert batch.groups == tuple(f"current-{index}" for index in range(8))
+    assert batch.flush_reason == "preferred_size"
+    assert batch.is_last
+
+
+def test_partition_transfer_planner_flushes_underfilled_current_tail_without_closing() -> None:
+    planner: PartitionTransferPlanner[str] = PartitionTransferPlanner(
+        previous_quota_groups=0,
+        current_quota_groups=8,
+        preferred_batch_groups=8,
+    )
+    for index in range(3):
+        planner.add_completed(f"current-{index}", now=1.0 + index)
+
+    batches = planner.flush_tail(now=5.0)
+
+    assert len(batches) == 1
+    assert batches[0].partition_kind == "current"
+    assert batches[0].groups == ("current-0", "current-1", "current-2")
+    assert batches[0].flush_reason == "physical_close"
+    assert not batches[0].is_last
 
 
 @pytest.mark.parametrize("mode", [AdmissionMode.OFF, AdmissionMode.SHADOW])

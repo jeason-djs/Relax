@@ -371,6 +371,7 @@ def test_rollout_observability_analyzer_exports_prompt_free_placement_trace(tmp_
     assert exported["observed_work"] == 30
     assert exported["candidate_engine_ids"] == ["engine-a", "engine-b"]
     assert exported["actual_engine_id"] == "engine-a"
+    assert exported["actual_engine_gpu_id"] is None
     assert not {"prompt", "input_ids", "sampling_params", "output_ids"}.intersection(exported)
 
 
@@ -443,6 +444,27 @@ def test_placement_trace_uses_latest_scheduler_snapshot_before_dispatch(tmp_path
     assert snapshot["active_requests"] == 1
     assert snapshot["queued_requests"] == 1
     assert snapshot["predicted_work"] == 33
+
+
+def test_placement_trace_maps_server_engine_pid_to_gpu(tmp_path) -> None:
+    request_dir = tmp_path / "requests"
+    request_dir.mkdir()
+    rid = "relax:p1:kfresh:g1:s1:a0:engine-gpu"
+    row = _finished_row(rid)
+    row.update({"physical_rollout_id": 1})
+    (request_dir / "request_lifecycle_rollout_1.jsonl").write_text(
+        json.dumps(row) + "\n",
+        encoding="utf-8",
+    )
+    driver_log = tmp_path / "driver.log"
+    driver_log.write_text(_valid_single_engine_log([rid]), encoding="utf-8")
+    output_path = tmp_path / "placement_trace.jsonl"
+
+    export_placement_trace(driver_log, request_dir, output_path)
+    exported = json.loads(output_path.read_text(encoding="utf-8"))
+
+    assert exported["actual_engine_id"] == "engine-pid-100"
+    assert exported["actual_engine_gpu_id"] == 2
 
 
 def test_rollout_observability_analyzer_exports_aborted_placement_trace(tmp_path) -> None:

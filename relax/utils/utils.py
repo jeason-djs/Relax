@@ -505,6 +505,9 @@ async def transfer_batch_to_data_system(
     data_system_client: Any,
     is_last: bool = False,
     physical_rollout_id: int | None = None,
+    flush_reason: str = "unspecified",
+    buffer_enter_abs: float | None = None,
+    flush_trigger_abs: float | None = None,
 ) -> None:
     """Helper function to transfer a batch of samples to the data system
     client.
@@ -517,6 +520,9 @@ async def transfer_batch_to_data_system(
         is_last: Mark this as the final batch of the partition train_{rollout_id}
             so the data system can detect streaming end-of-stream without a preset
             global batch size. See the is_last bookkeeping in generate_rollout.
+        flush_reason: Scheduler reason that released this transfer batch.
+        buffer_enter_abs: Wall timestamp when the oldest group entered its partition buffer.
+        flush_trigger_abs: Wall timestamp when the scheduler triggered this flush.
     """
     try:
         # Guard against empty batch_samples
@@ -532,6 +538,9 @@ async def transfer_batch_to_data_system(
         while isinstance(batch_samples[0], list):
             batch_samples = sum(batch_samples, [])
         target_partition = f"train_{rollout_id}"
+        transfer_begin_abs = time.time()
+        flush_trigger = transfer_begin_abs if flush_trigger_abs is None else flush_trigger_abs
+        buffer_enter = flush_trigger if buffer_enter_abs is None else buffer_enter_abs
         global CURRENT_ROLLOUT_BATCH
         CURRENT_ROLLOUT_BATCH.extend(batch_samples)
         rollout_batch = convert_samples_to_train_data(args, batch_samples)
@@ -548,6 +557,28 @@ async def transfer_batch_to_data_system(
         custom_meta = [{"total_lengths": int(tl)} for tl in total_lengths] if total_lengths is not None else None
         await data_system_client.async_put(
             data=rollout_batch, partition_id=target_partition, custom_meta=custom_meta, is_last=is_last
+        )
+        transfer_end_abs = time.time()
+        logger.info(
+            "TASK22_TRANSFER physical_rollout_id=%s target_partition=%s "
+            "flush_reason=%s groups=%s samples=%s is_last=%s "
+            "buffer_enter=%.6f flush_trigger=%.6f put_begin=%.6f put_end=%.6f "
+            "buffer_dwell=%.6f trigger_to_put=%.6f put_wall=%.6f"
+            % (
+                str(physical_rollout_id if physical_rollout_id is not None else -1),
+                target_partition,
+                flush_reason,
+                str(batch_count),
+                str(len(batch_samples)),
+                str(bool(is_last)).lower(),
+                buffer_enter,
+                flush_trigger,
+                transfer_begin_abs,
+                transfer_end_abs,
+                max(flush_trigger - buffer_enter, 0.0),
+                max(transfer_begin_abs - flush_trigger, 0.0),
+                transfer_end_abs - transfer_begin_abs,
+            )
         )
 
         for sample in batch_samples:

@@ -23,16 +23,18 @@ MODE=""
 STOP_AFTER_SHADOW=0
 RESUME_ON_DIR=""
 ON_FIRST=0
+ON_ONLY=0
 
 usage() {
     cat <<EOF
-usage: $0 [--check|--run] [--stop-after-shadow | --resume-on PAIR_DIR | --on-first]
+usage: $0 [--check|--run] [--stop-after-shadow | --resume-on PAIR_DIR | --on-first | --on-only]
 
   --check              run formal preflight without starting training (default)
   --run                run the authorized experiment
   --stop-after-shadow  stop after strict Shadow validation; never start ON
   --resume-on PAIR_DIR resume a validated qualification pair at the ON leg
   --on-first           run matched ON first, then Shadow
+  --on-only            run one authorized ON qualification leg
 EOF
 }
 
@@ -71,6 +73,14 @@ while (( $# > 0 )); do
             fi
             ON_FIRST=1
             ;;
+        --on-only)
+            if [[ "$ON_ONLY" == "1" ]]; then
+                echo "--on-only may be specified only once" >&2
+                usage >&2
+                exit 2
+            fi
+            ON_ONLY=1
+            ;;
         --help|-h)
             usage
             exit 0
@@ -94,7 +104,14 @@ if [[ "$ON_FIRST" == "1" && ( "$MODE" != "--run" || "$STOP_AFTER_SHADOW" == "1" 
     usage >&2
     exit 2
 fi
-if [[ "$STOP_AFTER_SHADOW" == "1" || -n "$RESUME_ON_DIR" ]]; then
+if [[ "$ON_ONLY" == "1" && ( "$MODE" != "--run" || "$STOP_AFTER_SHADOW" == "1" || -n "$RESUME_ON_DIR" || "$ON_FIRST" == "1" ) ]]; then
+    echo "--on-only requires --run and cannot be combined with other run-order options" >&2
+    usage >&2
+    exit 2
+fi
+if [[ "$ON_ONLY" == "1" ]]; then
+    RUN_SCOPE="on_qualification"
+elif [[ "$STOP_AFTER_SHADOW" == "1" || -n "$RESUME_ON_DIR" ]]; then
     RUN_SCOPE="shadow_qualification"
 else
     RUN_SCOPE="matched_pair"
@@ -130,6 +147,10 @@ if [[ "$TASK22_EVIDENCE_PROFILE" != "qualification_v1" && "$TASK22_EVIDENCE_PROF
 fi
 if [[ "$ON_FIRST" == "1" && "$TASK22_EVIDENCE_PROFILE" != "clean_ab_v1" ]]; then
     echo "--on-first requires TASK22_EVIDENCE_PROFILE=clean_ab_v1" >&2
+    exit 4
+fi
+if [[ "$ON_ONLY" == "1" && "$TASK22_EVIDENCE_PROFILE" != "clean_ab_v1" ]]; then
+    echo "--on-only requires TASK22_EVIDENCE_PROFILE=clean_ab_v1" >&2
     exit 4
 fi
 TASK22_MONITOR_POLL_INTERVAL_WAS_SET="${TASK22_MONITOR_POLL_INTERVAL+x}"
@@ -251,7 +272,8 @@ if [[ "$TASK22_EVIDENCE_PROFILE" == "qualification_v1" ]]; then
     export SGLANG_LOG_SCHEDULER_STATUS_TARGET="${SGLANG_LOG_SCHEDULER_STATUS_TARGET:-stdout}"
     export SGLANG_LOG_SCHEDULER_STATUS_INTERVAL="${SGLANG_LOG_SCHEDULER_STATUS_INTERVAL:-1.0}"
 else
-    unset SGLANG_LOG_SCHEDULER_STATUS_TARGET SGLANG_LOG_SCHEDULER_STATUS_INTERVAL
+    export SGLANG_LOG_SCHEDULER_STATUS_TARGET="${SGLANG_LOG_SCHEDULER_STATUS_TARGET:-stdout}"
+    export SGLANG_LOG_SCHEDULER_STATUS_INTERVAL="${SGLANG_LOG_SCHEDULER_STATUS_INTERVAL:-5.0}"
 fi
 export TASK22_PYTHON="$PYTHON_REQUEST"
 if [[ -n "$RESUME_ON_DIR" ]]; then
@@ -272,9 +294,6 @@ import os
 runtime_env = json.loads(os.environ["RUNTIME_ENV_JSON"])
 runtime_env["working_dir"] = os.environ["WORKING_DIR"]
 env_vars = runtime_env.setdefault("env_vars", {})
-if os.environ["TASK22_EVIDENCE_PROFILE"] == "clean_ab_v1":
-    env_vars.pop("SGLANG_LOG_SCHEDULER_STATUS_TARGET", None)
-    env_vars.pop("SGLANG_LOG_SCHEDULER_STATUS_INTERVAL", None)
 for name in (
     "RELAX_REQUEST_PLACEMENT_MODE",
     "RELAX_REQUEST_PLACEMENT_POLICY",
@@ -336,6 +355,10 @@ if [[ -n "$RESUME_ON_DIR" && "${TASK22_AUTHORIZE_ON_RUN:-0}" != "1" ]]; then
 fi
 if [[ "$ON_FIRST" == "1" && "${TASK22_AUTHORIZE_ON_RUN:-0}" != "1" ]]; then
     echo "Set TASK22_AUTHORIZE_ON_RUN=1 to authorize the ON-first matched pair" >&2
+    exit 4
+fi
+if [[ "$ON_ONLY" == "1" && "${TASK22_AUTHORIZE_ON_RUN:-0}" != "1" ]]; then
+    echo "Set TASK22_AUTHORIZE_ON_RUN=1 to authorize the ON-only qualification" >&2
     exit 4
 fi
 if [[ -z "$RESUME_ON_DIR" && -e "$PAIR_DIR" ]]; then
@@ -837,7 +860,10 @@ contract = {
     "schema_version": 6,
     "git_commit": os.environ["GIT_COMMIT"],
     "admission_mode": mode,
+    "admission_debt_basis": "logical_previous_partition",
+    "transfer_flush_policy": "previous_boundary_current_preferred",
     "evidence_profile": os.environ["TASK22_EVIDENCE_PROFILE"],
+    "scheduler_status_interval_s": float(os.environ["SGLANG_LOG_SCHEDULER_STATUS_INTERVAL"]),
     "flashinfer_cuda_arch_list": os.environ["FLASHINFER_CUDA_ARCH_LIST"],
     "runner_scope": os.environ["RUN_SCOPE"],
     "request_placement_mode": os.environ["REQUEST_PLACEMENT_MODE"],
@@ -1230,7 +1256,21 @@ export REQUEST_PLACEMENT_MODE=off
 export REQUEST_PLACEMENT_POLICY=least_predicted_work
 export USE_SLIME_ROUTER=0
 
-if [[ "$ON_FIRST" == "1" ]]; then
+if [[ "$ON_ONLY" == "1" ]]; then
+    printf '%s\n' ON_RUNNING > "$PAIR_DIR/PAIR_STATUS"
+    if ! run_one on; then
+        printf '%s\n' ON_FAILED > "$PAIR_DIR/PAIR_STATUS"
+        echo "ON-only qualification failed strict validation" >&2
+        exit 5
+    fi
+    printf '%s\n' PASS > "$PAIR_DIR/ON_VALID"
+    printf '%s\n' ON_VALIDATED > "$PAIR_DIR/PAIR_STATUS"
+    write_artifact_checksums
+    echo "TASK22_MATCHED_AB verdict=ON_PASS"
+    echo "TASK22_MATCHED_AB scope=$RUN_SCOPE"
+    echo "TASK22_MATCHED_AB pair_dir=$PAIR_DIR"
+    exit 0
+elif [[ "$ON_FIRST" == "1" ]]; then
     printf '%s\n' ON_RUNNING > "$PAIR_DIR/PAIR_STATUS"
     if ! run_one on; then
         printf '%s\n' ON_FAILED > "$PAIR_DIR/PAIR_STATUS"

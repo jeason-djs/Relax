@@ -149,6 +149,7 @@ ONLINE_STRICT_CHECKS = {
 FINAL_ONLY_STRICT_CHECKS = {
     "abort_within_physical_interval",
     "admission_bounded_path_exercised",
+    "admission_uses_logical_debt",
     "attempt_decision_exists",
     "attempt_parent_chains_valid",
     "clean_evidence_contract_valid",
@@ -199,9 +200,13 @@ FINAL_ONLY_STRICT_CHECKS = {
     "request_attempt_tokens_unique",
     "request_file_physical_ids_match",
     "request_observability_passes",
+    "rid_engine_mapping_artifact_complete",
     "run_directory_exists",
     "runtime_attestation_roles_complete",
     "timeline_directory_present",
+    "transfer_trace_fields_valid",
+    "transfer_trace_present",
+    "previous_partition_closes_at_logical_debt_boundary",
 }
 STRICT_CHECK_COVERAGE = {
     **{name: "online" for name in ONLINE_STRICT_CHECKS},
