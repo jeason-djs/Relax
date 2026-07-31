@@ -848,7 +848,7 @@ def test_online_monitor_headline_metrics_are_unique_and_finite() -> None:
         _validate_headline_metrics(text, headline_lo=5, headline_hi=5, final=False)
 
 
-def test_online_monitor_gpu_snapshot_uses_grace_for_partial_write(tmp_path) -> None:
+def test_online_monitor_ignores_trailing_partial_gpu_snapshot_until_final(tmp_path) -> None:
     gpu_log = tmp_path / "nvidia.csv"
     gpu_log.write_text(
         "2026-07-30T10:00:00.000000000+0800\n"
@@ -864,7 +864,85 @@ def test_online_monitor_gpu_snapshot_uses_grace_for_partial_write(tmp_path) -> N
         evidence_due_since=due_since,
         now_monotonic=10.0,
     )
+    _validate_gpu_snapshots(
+        gpu_log,
+        expected_engines=2,
+        final=False,
+        evidence_grace=5.0,
+        evidence_due_since=due_since,
+        now_monotonic=15.0,
+    )
     with pytest.raises(MonitorFailure, match="incomplete GPU snapshot"):
+        _validate_gpu_snapshots(
+            gpu_log,
+            expected_engines=2,
+            final=True,
+            evidence_grace=5.0,
+            evidence_due_since=due_since,
+            now_monotonic=15.0,
+        )
+
+
+def test_online_monitor_partial_gpu_tail_keeps_last_complete_snapshot_for_freshness(tmp_path) -> None:
+    gpu_log = tmp_path / "nvidia.csv"
+    gpu_log.write_text(
+        "2026-07-30T10:00:00.000000000+0800\n"
+        "0, 100 MiB, 10 %, 20 %, 30 W\n"
+        "1, 100 MiB, 10 %, 20 %, 30 W\n"
+        "2, 100 MiB, 10 %, 20 %, 30 W\n"
+        "3, 100 MiB, 10 %, 20 %, 30 W\n"
+        "2026-07-30T10:00:01.000000000+0800\n"
+        "0, 101 MiB, 11 %, 21 %, 31 W\n"
+        "1, 101 MiB, 11 %, 21 %, 31 W\n"
+        "2, 101 MiB, 11 %, 21 %, 31 W\n"
+    )
+    last_complete = datetime.fromisoformat("2026-07-30T10:00:00+08:00").timestamp()
+
+    _validate_gpu_snapshots(
+        gpu_log,
+        expected_engines=2,
+        final=False,
+        evidence_grace=5.0,
+        evidence_due_since={},
+        now_monotonic=10.0,
+        wall_time=last_complete + 4,
+        max_snapshot_age=5.0,
+    )
+    with pytest.raises(MonitorFailure, match="stale_gpu_snapshot"):
+        _validate_gpu_snapshots(
+            gpu_log,
+            expected_engines=2,
+            final=False,
+            evidence_grace=5.0,
+            evidence_due_since={},
+            now_monotonic=15.0,
+            wall_time=last_complete + 6,
+            max_snapshot_age=5.0,
+        )
+
+
+def test_online_monitor_does_not_ignore_invalid_complete_gpu_snapshot(tmp_path) -> None:
+    gpu_log = tmp_path / "nvidia.csv"
+    gpu_log.write_text(
+        "2026-07-30T10:00:00.000000000+0800\n"
+        "0, 100 MiB, 10 %, 20 %, 30 W\n"
+        "1, 100 MiB, 10 %, 20 %, 30 W\n"
+        "2, 100 MiB, 10 %, 20 %, 30 W\n"
+        "2, 100 MiB, 10 %, 20 %, 30 W\n"
+        "2026-07-30T10:00:01.000000000+0800\n"
+        "0, 101 MiB, 11 %, 21 %, 31 W\n"
+    )
+
+    due_since = {}
+    _validate_gpu_snapshots(
+        gpu_log,
+        expected_engines=2,
+        final=False,
+        evidence_grace=5.0,
+        evidence_due_since=due_since,
+        now_monotonic=10.0,
+    )
+    with pytest.raises(MonitorFailure, match="GPU indices must be unique"):
         _validate_gpu_snapshots(
             gpu_log,
             expected_engines=2,

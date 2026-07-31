@@ -845,7 +845,7 @@ def _gpu_number(value: str, suffix: str) -> float:
 
 
 def _gpu_snapshot_status(
-    path: Path, expected_gpu_count: int
+    path: Path, expected_gpu_count: int, *, final: bool = False
 ) -> tuple[int, float | None, float | None, float, str | None]:
     if not path.is_file():
         return 0, None, None, 0.0, "missing GPU sampler output"
@@ -879,21 +879,10 @@ def _gpu_snapshot_status(
                 max_interval,
                 f"line={offset + 1}:invalid timestamp:{exc}",
             )
-        if last_timestamp is not None:
-            interval = parsed_timestamp - last_timestamp
-            if interval <= 0:
-                return (
-                    snapshots,
-                    first_timestamp,
-                    last_timestamp,
-                    max_interval,
-                    f"line={offset + 1}:timestamps not strictly increasing",
-                )
-            max_interval = max(max_interval, interval)
-        first_timestamp = parsed_timestamp if first_timestamp is None else first_timestamp
-        last_timestamp = parsed_timestamp
         offset += 1
         if len(lines) - offset < expected_gpu_count:
+            if not final:
+                return snapshots, first_timestamp, last_timestamp, max_interval, None
             return (
                 snapshots,
                 first_timestamp,
@@ -936,6 +925,19 @@ def _gpu_snapshot_status(
                 max_interval,
                 f"snapshot={snapshots}:GPU count={len(indices)}",
             )
+        if last_timestamp is not None:
+            interval = parsed_timestamp - last_timestamp
+            if interval <= 0:
+                return (
+                    snapshots,
+                    first_timestamp,
+                    last_timestamp,
+                    max_interval,
+                    f"line={offset - expected_gpu_count}:timestamps not strictly increasing",
+                )
+            max_interval = max(max_interval, interval)
+        first_timestamp = parsed_timestamp if first_timestamp is None else first_timestamp
+        last_timestamp = parsed_timestamp
         snapshots += 1
     return snapshots, first_timestamp, last_timestamp, max_interval, None
 
@@ -955,7 +957,7 @@ def _validate_gpu_snapshots(
     max_snapshot_interval: float = DEFAULT_GPU_MAX_SNAPSHOT_INTERVAL_S,
 ) -> None:
     snapshots, first_timestamp, last_timestamp, observed_max_interval, error = _gpu_snapshot_status(
-        path, expected_engines * 2
+        path, expected_engines * 2, final=final
     )
     _defer_or_raise(
         error is None,
