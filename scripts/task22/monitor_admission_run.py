@@ -36,7 +36,6 @@ ARTIFACT_ID_RE = re.compile(r"_(\d+)(?:_rank_\d+)?\.jsonl$")
 FATAL_RE = re.compile(
     r"(?:"
     r"\bFATAL\b|"
-    r"Traceback \(most recent call last\)|"
     r"\b(?:out[ -]of[ -]memory|OutOfMemoryError|OOM)\b|"
     r"\bXid(?:\s+\d+)?\b|"
     r"\bNCCL\b[^\n]*(?:error|abort|fail|timeout)|"

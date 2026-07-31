@@ -437,7 +437,6 @@ def test_online_monitor_final_strictly_rejects_multiple_bootstrap_candidates() -
         "ActorDiedError: worker exited",
         "Ray actor worker failed",
         "engine failed during startup",
-        "Traceback (most recent call last):",
         "Can not initialize distributed backend",
         "Job failed",
     ],
@@ -1015,6 +1014,17 @@ def test_online_monitor_final_requires_flow_for_declared_final_artifact(tmp_path
 
 def test_online_monitor_ignores_trailing_incomplete_driver_line(tmp_path) -> None:
     (tmp_path / "driver.log").write_text("healthy complete line\nTraceback (most recent call last):")
+
+    _scan_once(tmp_path)
+
+
+def test_online_monitor_preserves_complete_generic_traceback_for_exit_diagnosis(tmp_path) -> None:
+    (tmp_path / "driver.log").write_text(
+        "Traceback (most recent call last):\n"
+        '  File "train.py", line 1, in <module>\n'
+        "    raise RuntimeError('diagnostic')\n"
+        "RuntimeError: diagnostic\n"
+    )
 
     _scan_once(tmp_path)
 
