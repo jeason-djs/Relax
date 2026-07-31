@@ -142,6 +142,12 @@ if any(not value for value in devices) or len(devices) != 4 or len(set(devices))
 print(",".join(devices))
 '
 )" || exit 4
+TASK22_CUDA_VISIBLE_DEVICES_CONTRACT="$CUDA_VISIBLE_DEVICES"
+if [[ -n "$CUDA_VISIBLE_DEVICES" ]]; then
+    export CUDA_VISIBLE_DEVICES
+else
+    unset CUDA_VISIBLE_DEVICES
+fi
 if [[ -z "$RESUME_ON_DIR" ]]; then
     MODEL_DIR="${MODEL_DIR:?Set MODEL_DIR}"
     DATA_DIR="${DATA_DIR:?Set DATA_DIR}"
@@ -300,7 +306,7 @@ if [[ -n "$RESUME_ON_DIR" ]]; then
         TASK22_MONITOR_TIMEOUT_S="$TASK22_MONITOR_TIMEOUT_S" \
         TASK22_MONITOR_TERM_GRACE_S="$TASK22_MONITOR_TERM_GRACE_S" \
         TASK22_TRAINING_TERM_TIMEOUT_S="$TASK22_TRAINING_TERM_TIMEOUT_S" \
-        NUM_GPUS="$NUM_GPUS" CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" \
+        NUM_GPUS="$NUM_GPUS" CUDA_VISIBLE_DEVICES="$TASK22_CUDA_VISIBLE_DEVICES_CONTRACT" \
         "$PYTHON_BIN" - "$PAIR_DIR/shadow/run_contract.json" <<'PY'
 import json
 import math
@@ -367,7 +373,13 @@ PY
     export TASK22_MONITOR_NO_PROGRESS_TIMEOUT_S TASK22_GPU_MAX_SNAPSHOT_AGE_S
     export TASK22_GPU_MAX_SNAPSHOT_INTERVAL_S TASK22_MONITOR_TIMEOUT_S
     export TASK22_MONITOR_TERM_GRACE_S TASK22_TRAINING_TERM_TIMEOUT_S
-    export NUM_GPUS CUDA_VISIBLE_DEVICES
+    export NUM_GPUS
+    TASK22_CUDA_VISIBLE_DEVICES_CONTRACT="$CUDA_VISIBLE_DEVICES"
+    if [[ -n "$CUDA_VISIBLE_DEVICES" ]]; then
+        export CUDA_VISIBLE_DEVICES
+    else
+        unset CUDA_VISIBLE_DEVICES
+    fi
     INPUT_SNAPSHOT="$(
         "$PYTHON_BIN" - "$PAIR_DIR/shadow/run_contract.json" <<'PY'
 import json
@@ -655,7 +667,8 @@ trap cleanup EXIT INT TERM
 write_contract() {
     local mode="$1"
     local output_path="$2"
-    "$PYTHON_BIN" - "$output_path" "$mode" "$REPO" <<'PY'
+    TASK22_CUDA_VISIBLE_DEVICES_CONTRACT="$TASK22_CUDA_VISIBLE_DEVICES_CONTRACT" \
+        "$PYTHON_BIN" - "$output_path" "$mode" "$REPO" <<'PY'
 import hashlib
 import importlib
 import importlib.metadata
@@ -772,7 +785,7 @@ contract = {
     "monitor_term_grace_s": float(os.environ["TASK22_MONITOR_TERM_GRACE_S"]),
     "training_term_timeout_s": float(os.environ["TASK22_TRAINING_TERM_TIMEOUT_S"]),
     "num_gpus": int(os.environ["NUM_GPUS"]),
-    "cuda_visible_devices": os.environ["CUDA_VISIBLE_DEVICES"],
+    "cuda_visible_devices": os.environ["TASK22_CUDA_VISIBLE_DEVICES_CONTRACT"],
     "nccl_nvls_enable": os.environ["NCCL_NVLS_ENABLE"],
     "nccl_socket_ifname": os.environ["NCCL_SOCKET_IFNAME"],
     "training_python": {
@@ -895,7 +908,7 @@ PY
         --monitor-timeout "$TASK22_MONITOR_TIMEOUT_S" \
         --monitor-term-grace "$TASK22_MONITOR_TERM_GRACE_S" \
         --num-gpus "$NUM_GPUS" \
-        --cuda-visible-devices "$CUDA_VISIBLE_DEVICES" \
+        --cuda-visible-devices "$TASK22_CUDA_VISIBLE_DEVICES_CONTRACT" \
         > "$run_dir/logs/online_monitor.log" 2>&1 &
     monitor_pid=$!
     local monitor_timeout_marker="$run_dir/logs/.monitor_timeout"
@@ -984,7 +997,7 @@ PY
         --monitor-term-grace "$TASK22_MONITOR_TERM_GRACE_S" \
         --training-term-timeout "$TASK22_TRAINING_TERM_TIMEOUT_S" \
         --num-gpus "$NUM_GPUS" \
-        --cuda-visible-devices "$CUDA_VISIBLE_DEVICES" \
+        --cuda-visible-devices "$TASK22_CUDA_VISIBLE_DEVICES_CONTRACT" \
         --require-resume \
         --output-json "$run_dir/validation.json" \
         > "$run_dir/validation.stdout.json"
@@ -1047,7 +1060,7 @@ export TASK22_MONITOR_POLL_INTERVAL TASK22_MONITOR_EVIDENCE_GRACE
 export TASK22_MONITOR_NO_PROGRESS_TIMEOUT_S TASK22_GPU_MAX_SNAPSHOT_AGE_S
 export TASK22_GPU_MAX_SNAPSHOT_INTERVAL_S TASK22_MONITOR_TIMEOUT_S
 export TASK22_MONITOR_TERM_GRACE_S TASK22_TRAINING_TERM_TIMEOUT_S
-export NUM_GPUS CUDA_VISIBLE_DEVICES
+export NUM_GPUS TASK22_CUDA_VISIBLE_DEVICES_CONTRACT
 export TASK22_INPUT_MANIFEST="$INPUT_SNAPSHOT/MANIFEST.json"
 export TASK22_INPUT_ROOTS_JSON
 TASK22_INPUT_ROOTS_JSON="$(
