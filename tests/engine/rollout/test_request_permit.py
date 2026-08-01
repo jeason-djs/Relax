@@ -46,7 +46,10 @@ pytestmark = pytest.mark.skipif(not HAS_DEPS, reason="Missing ray/sglang depende
 class _StubState:
     def __init__(self, capacity: int = 1) -> None:
         self.aborted = False
-        self.semaphore = asyncio.Semaphore(capacity)
+        self.permit_manager = InferencePermitManager(capacity)
+        self.semaphore = self.permit_manager.semaphore
+        self.current_rollout_id = 4
+        self.permit_observability_rows = []
 
     @contextlib.contextmanager
     def dp_rank_context(self):
@@ -62,6 +65,12 @@ class _StubSample:
     def __init__(self) -> None:
         self.status = Sample.Status.PENDING
         self.generate_function_path = None
+        self.response_length = 0
+        self.tokens = [1, 2]
+        self.group_index = 7
+        self.index = 9
+        self.abort_count = 0
+        self.metadata = {}
 
 
 # --------------------------------------------------------------------------- #
@@ -271,6 +280,36 @@ async def test_dispatch_optin_vs_legacy_lock_scope(monkeypatch) -> None:
     await _dispatch_generate(optin_state, _StubArgs("x"), _StubSample(), {})
     assert free_between_turns == [False, False]
     assert not optin_state.semaphore.locked()
+
+
+async def test_dispatch_exports_wait_cancelled_before_grant(monkeypatch, tmp_path) -> None:
+    state = _StubState(capacity=1)
+    sample = _StubSample()
+
+    async def must_not_run(args, sample, sampling_params):
+        raise AssertionError("cancelled waiter reached inference")
+
+    monkeypatch.setenv("TASK22_CALIBRATION_DIR", str(tmp_path))
+    monkeypatch.setattr(sglang_rollout, "load_function", lambda path: must_not_run)
+    await state.semaphore.acquire()
+    task = asyncio.create_task(_dispatch_generate(state, _StubArgs("x"), sample, {}))
+
+    async def wait_until_queued() -> None:
+        while state.permit_manager.snapshot().waiting != 1:
+            if task.done():
+                await task
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(wait_until_queued(), timeout=1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    state.semaphore.release()
+
+    assert len(state.permit_observability_rows) == 1
+    row = state.permit_observability_rows[0]
+    assert row["permit_wait_status"] == "cancelled_before_grant"
+    assert "permit_acquire_granted_monotonic" not in row
 
 
 async def test_uncaught_abort_contained_in_dispatch(monkeypatch) -> None:
