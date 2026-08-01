@@ -105,6 +105,29 @@ logger = logging.getLogger(__name__)
 ROLLOUT_MINI_BATCH_METAS_KEY = "rollout_mini_batch_metas"
 
 
+def _task22_calibration_actor_phase(rollout_id: int, phase: str, begin: float, end: float | None = None) -> None:
+    """Emit rank-zero absolute timing only for the opt-in calibration run."""
+
+    if not os.environ.get("TASK22_CALIBRATION_DIR") or not is_megatron_main_rank():
+        return
+    if end is None:
+        logger.info(
+            "TASK22_CALIBRATION_ACTOR logical_step=%s phase=%s t=%.9f",
+            rollout_id,
+            phase,
+            begin,
+        )
+        return
+    logger.info(
+        "TASK22_CALIBRATION_ACTOR logical_step=%s phase=%s t_begin=%.9f t_end=%.9f dur=%.9f",
+        rollout_id,
+        phase,
+        begin,
+        end,
+        end - begin,
+    )
+
+
 def _split_by_rollout_mini_counts(values: Any, counts: list[int]) -> list[Any]:
     if not counts or any((not isinstance(c, int)) or c <= 0 for c in counts):
         raise ValueError(f"rollout mini counts must be positive integers, got {counts}")
@@ -1231,6 +1254,8 @@ class MegatronTrainRayActor(TrainRayActor):
         Advantages are computed after all sub-batches are collected to ensure correct
         global normalization across the full batch and DP group.
         """
+        data_wait_begin = time.time()
+        _task22_calibration_actor_phase(rollout_id, "data_wait_begin", data_wait_begin)
         logger.info(f"start to get rollout_id: {rollout_id} data from transfer queue for train_hybrid.")
         dp_size = mpu.get_data_parallel_world_size(with_context_parallel=False)
         plan = build_rollout_minibatch_plan(self.args, dp_size)
@@ -1305,6 +1330,11 @@ class MegatronTrainRayActor(TrainRayActor):
                 last_warn = last_progress
                 batch_index += 1
 
+                if batch_index == 1:
+                    _task22_calibration_actor_phase(rollout_id, "first_subbatch_ready", time.time())
+                if batch_index == plan.num_rollout_minis:
+                    _task22_calibration_actor_phase(rollout_id, "last_subbatch_ready", time.time())
+
                 # Forward passes on this sub-batch (small memory footprint)
                 if len(sub_batch["total_lengths"]) != batch_size:
                     raise RuntimeError(
@@ -1351,6 +1381,8 @@ class MegatronTrainRayActor(TrainRayActor):
             data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
             if self.args.use_routing_replay:
                 os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
+            actor_train_begin = time.time()
+            _task22_calibration_actor_phase(rollout_id, "actor_train_begin", actor_train_begin)
             with timer("actor_train"):
                 train(
                     rollout_id,
@@ -1360,6 +1392,7 @@ class MegatronTrainRayActor(TrainRayActor):
                     data_iterator,
                     num_microbatches,
                 )
+            _task22_calibration_actor_phase(rollout_id, "actor_train", actor_train_begin, time.time())
 
             self.prof.step(rollout_id=rollout_id)
 
@@ -1430,10 +1463,13 @@ class MegatronTrainRayActor(TrainRayActor):
         # Returned flags are for update_weights_fully_async only — hybrid uses
         # the sync update_weights path so we just discard them.
         self._wait_for_previous_eval()
-        self._check_services_health()
+        self._check_services_health(rollout_id)
 
         # Sync weights to rollout via UpdateWeightFromTensor (colocate mode)
+        weight_sync_begin = time.time()
+        _task22_calibration_actor_phase(rollout_id, "weight_sync_begin", weight_sync_begin)
         self.update_weights()
+        _task22_calibration_actor_phase(rollout_id, "weight_sync", weight_sync_begin, time.time())
         tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
         dist.barrier(group=get_gloo_group())
         self._run_step_evaluation(rollout_id, end_update_weight=True)
@@ -1516,7 +1552,7 @@ class MegatronTrainRayActor(TrainRayActor):
             # Wait for prior eval before pausing rollout for weight sync.
             self._wait_for_previous_eval()
 
-            rollout_only, actor_fwd_only = self._check_services_health()
+            rollout_only, actor_fwd_only = self._check_services_health(rollout_id)
             self.update_weights_fully_async(rollout_id, rollout_only=rollout_only, actor_fwd_only=actor_fwd_only)
             dist.barrier(group=get_gloo_group())
             self._run_step_evaluation(rollout_id, end_update_weight=True)
@@ -1701,7 +1737,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 ray.get(post_sync_handles)
 
     @timer("wait update_weights_fully_async")
-    def _check_services_health(self) -> tuple[bool, bool]:
+    def _check_services_health(self, rollout_id: int) -> tuple[bool, bool]:
         """Check rollout and actor_fwd service health before weight update.
 
         Only rank 0 sends HTTP requests to check service availability, then
@@ -1712,6 +1748,8 @@ class MegatronTrainRayActor(TrainRayActor):
             (rollout_only, actor_fwd_only): Flags indicating which services
             are unavailable and should be skipped during weight update.
         """
+        gate_begin = time.time()
+
         # Default: both services healthy → update both
         rollout_only = False
         actor_fwd_only = False
@@ -1770,6 +1808,17 @@ class MegatronTrainRayActor(TrainRayActor):
         dist.all_reduce(flags, op=dist.ReduceOp.MAX, group=get_gloo_group())
         rollout_only = bool(flags[0].item())
         actor_fwd_only = bool(flags[1].item())
+
+        if dist.get_rank() == 0 and os.environ.get("TASK22_CALIBRATION_DIR"):
+            gate_end = time.time()
+            logger.info(
+                "TASK22_CALIBRATION_GATE logical_step=%s sync_id=%s t_begin=%.9f t_end=%.9f dur=%.9f",
+                rollout_id,
+                rollout_id + 1,
+                gate_begin,
+                gate_end,
+                gate_end - gate_begin,
+            )
 
         return rollout_only, actor_fwd_only
 
