@@ -41,13 +41,14 @@ PARTITION_ADMISSION_MODE="${PARTITION_ADMISSION_MODE:-off}"
 PARTITION_ADMISSION_POLICY="${PARTITION_ADMISSION_POLICY:-legacy_debt_window}"
 REQUEST_PLACEMENT_MODE="${REQUEST_PLACEMENT_MODE:-off}"
 REQUEST_PLACEMENT_POLICY="${REQUEST_PLACEMENT_POLICY:-least_predicted_work}"
+SGLANG_DEBT_PRIORITY_MODE="${SGLANG_DEBT_PRIORITY_MODE:-off}"
 REQUEST_OBSERVABILITY_DIR="${REQUEST_OBSERVABILITY_DIR:-}"
 if [[ -z "${TIMELINE_DUMP_DIR+x}" ]]; then
     TIMELINE_DUMP_DIR="/tmp/timeline"
 fi
 TASK22_EVIDENCE_PROFILE="${TASK22_EVIDENCE_PROFILE:-qualification_v1}"
 FLASHINFER_CUDA_ARCH_LIST="${FLASHINFER_CUDA_ARCH_LIST:-12.0a}"
-DRIVER_LOG_PATH="${DRIVER_LOG_PATH:-log/qwen3-4b-task22-p1-${PARTITION_ADMISSION_MODE}-${now}.log}"
+DRIVER_LOG_PATH="${DRIVER_LOG_PATH:-log/qwen3-4b-task22-p1-${PARTITION_ADMISSION_MODE}-debt-priority-${SGLANG_DEBT_PRIORITY_MODE}-${now}.log}"
 TRAIN_SEED="${TRAIN_SEED:-1234}"
 ROLLOUT_SEED="${ROLLOUT_SEED:-42}"
 MAX_STALENESS="${MAX_STALENESS:-2}"
@@ -80,6 +81,14 @@ if [[ "$REQUEST_PLACEMENT_MODE" != "off" && -z "$REQUEST_OBSERVABILITY_DIR" ]]; 
     echo "Request placement shadow/on requires REQUEST_OBSERVABILITY_DIR" >&2
     exit 2
 fi
+if [[ "$SGLANG_DEBT_PRIORITY_MODE" != "off" && "$SGLANG_DEBT_PRIORITY_MODE" != "on" ]]; then
+    echo "SGLANG_DEBT_PRIORITY_MODE must be off or on" >&2
+    exit 2
+fi
+if [[ "$SGLANG_DEBT_PRIORITY_MODE" == "on" && -z "$REQUEST_OBSERVABILITY_DIR" ]]; then
+    echo "SGLANG_DEBT_PRIORITY_MODE=on requires REQUEST_OBSERVABILITY_DIR" >&2
+    exit 2
+fi
 if [[ "$TASK22_EVIDENCE_PROFILE" != "qualification_v1" && "$TASK22_EVIDENCE_PROFILE" != "clean_ab_v1" ]]; then
     echo "TASK22_EVIDENCE_PROFILE must be qualification_v1 or clean_ab_v1" >&2
     exit 2
@@ -88,6 +97,7 @@ fi
 export RELAX_REQUEST_PLACEMENT_MODE="$REQUEST_PLACEMENT_MODE"
 export RELAX_REQUEST_PLACEMENT_POLICY="$REQUEST_PLACEMENT_POLICY"
 export FLASHINFER_CUDA_ARCH_LIST
+export SGLANG_DEBT_PRIORITY_MODE
 
 CKPT_ARGS=(
     --hf-checkpoint "${MODEL_DIR}/Qwen3-4B/"
@@ -205,6 +215,14 @@ SGLANG_ARGS=(
     --sglang-show-time-cost
 )
 
+if [[ "$SGLANG_DEBT_PRIORITY_MODE" == "on" ]]; then
+    SGLANG_ARGS+=(
+        --sglang-enable-priority-scheduling
+        --sglang-disable-priority-preemption
+        --sglang-default-priority-value 0
+    )
+fi
+
 if [[ "${USE_SLIME_ROUTER:-0}" == "1" ]]; then
     SGLANG_ARGS+=(--use-slime-router)
 fi
@@ -223,7 +241,7 @@ WANDB_ARGS=(
     --use-metrics-service
     --task22-evidence-profile "$TASK22_EVIDENCE_PROFILE"
     --tb-project-name "$PROJECT_NAME"
-    --tb-experiment-name "qwen3-4b-task22-p1-${PARTITION_ADMISSION_MODE}-${now}"
+    --tb-experiment-name "qwen3-4b-task22-p1-${PARTITION_ADMISSION_MODE}-debt-priority-${SGLANG_DEBT_PRIORITY_MODE}-${now}"
 )
 if [[ -n "$TIMELINE_DUMP_DIR" ]]; then
     WANDB_ARGS+=(--timeline-dump-dir "$TIMELINE_DUMP_DIR")

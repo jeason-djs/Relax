@@ -73,6 +73,29 @@ __all__ = ["generate_rollout"]
 
 logger = get_logger(__name__)
 
+DEFAULT_ROLLOUT_REQUEST_PRIORITY = 0
+OLD_DEBT_REQUEST_PRIORITY = 1
+
+
+def resolve_partition_request_priority(args: Namespace, sample: Sample) -> int | None:
+    """Map Relax partition semantics to SGLang's waiting-queue priority.
+
+    Priority scheduling is opt-in through SGLang's own server flag. When it is
+    disabled, omit the request field entirely so the legacy request path stays
+    compatible. When enabled, old debt receives a higher value than fresh or
+    surplus work. Task 22's experiment wrapper disables priority preemption,
+    so this field only reorders waiting requests and never retracts running
+    work on behalf of the debt-priority policy.
+    """
+
+    if not getattr(args, "sglang_enable_priority_scheduling", False):
+        return None
+    metadata = getattr(sample, "metadata", None)
+    work_origin = metadata.get("work_origin") if isinstance(metadata, dict) else None
+    if work_origin == "old_debt":
+        return OLD_DEBT_REQUEST_PRIORITY
+    return DEFAULT_ROLLOUT_REQUEST_PRIORITY
+
 
 class GenerateState(metaclass=SingletonMeta):
     """The global state for the generation process."""
@@ -386,6 +409,14 @@ async def generate(
         "sampling_params": sampling_params,
         "return_logprob": not evaluation,
     }
+
+    request_priority = (
+        DEFAULT_ROLLOUT_REQUEST_PRIORITY
+        if evaluation and getattr(args, "sglang_enable_priority_scheduling", False)
+        else resolve_partition_request_priority(args, sample)
+    )
+    if request_priority is not None:
+        payload["priority"] = request_priority
 
     if args.use_rollout_routing_replay:
         payload["return_routed_experts"] = True

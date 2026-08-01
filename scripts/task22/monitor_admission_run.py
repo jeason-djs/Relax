@@ -20,6 +20,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from relax.engine.rollout.request_observability import request_priority_error
 from relax.utils.task22_runtime_attestation import attestation_matches_contract
 
 
@@ -681,6 +682,7 @@ def _validate_contract(
     training_term_timeout: float = 10.0,
     num_gpus: int = 4,
     cuda_visible_devices: str = "",
+    expected_debt_priority_mode: str | None = None,
     final: bool = False,
 ) -> None:
     contract = _load_contract(run_dir / "run_contract.json")
@@ -708,6 +710,8 @@ def _validate_contract(
         "num_gpus": num_gpus,
         "cuda_visible_devices": cuda_visible_devices,
     }
+    if expected_debt_priority_mode is not None:
+        expected["debt_priority_mode"] = expected_debt_priority_mode
     mismatches = {
         key: (value, contract.get(key))
         for key, value in expected.items()
@@ -1471,6 +1475,7 @@ def _scan(
     training_term_timeout: float = 10.0,
     num_gpus: int = 4,
     cuda_visible_devices: str = "",
+    expected_debt_priority_mode: str | None = None,
 ) -> None:
     contract_gpu_max_snapshot_age = (
         5.0 if gpu_max_snapshot_age is None else gpu_max_snapshot_age
@@ -1497,6 +1502,7 @@ def _scan(
         training_term_timeout=training_term_timeout,
         num_gpus=num_gpus,
         cuda_visible_devices=cuda_visible_devices,
+        expected_debt_priority_mode=expected_debt_priority_mode,
         final=final,
     )
 
@@ -1594,6 +1600,12 @@ def _scan(
                     raise MonitorFailure(f"request_file_physical_id_mismatch:{path.name}")
                 request_rows.extend(rows)
                 for row in rows:
+                    if expected_debt_priority_mode is not None and (
+                        priority_error := request_priority_error(row, expected_debt_priority_mode)
+                    ) is not None:
+                        raise MonitorFailure(
+                            f"request_priority_contract:{path.name}:{row['_line_no']}:{priority_error}"
+                        )
                     key = (path.name, int(row["_line_no"]))
                     outcome = row.get("outcome")
                     if outcome not in TERMINAL_OUTCOMES:
@@ -1896,6 +1908,7 @@ def monitor(
     monitor_term_grace: float = 1.0,
     num_gpus: int = 4,
     cuda_visible_devices: str = "",
+    expected_debt_priority_mode: str | None = None,
 ) -> int:
     if (admission_min, admission_max, admission_slack) != (4, 8, 2):
         raise MonitorFailure(
@@ -2013,6 +2026,7 @@ def monitor(
                 training_term_timeout=term_timeout,
                 num_gpus=num_gpus,
                 cuda_visible_devices=cuda_visible_devices,
+                expected_debt_priority_mode=expected_debt_priority_mode,
             )
             # Scan before enforcing the deadline so a complete semantic record
             # already on disk at the boundary gets counted.
@@ -2063,6 +2077,7 @@ def monitor(
                             training_term_timeout=term_timeout,
                             num_gpus=num_gpus,
                             cuda_visible_devices=cuda_visible_devices,
+                            expected_debt_priority_mode=expected_debt_priority_mode,
                         )
                         if scan_state.semantic_revision != final_revision:
                             last_progress_token = _evidence_progress_token(run_dir, scan_state)
@@ -2141,6 +2156,7 @@ def main() -> None:
     parser.add_argument("--monitor-term-grace", type=float, default=1.0)
     parser.add_argument("--num-gpus", type=int, required=True)
     parser.add_argument("--cuda-visible-devices", required=True)
+    parser.add_argument("--expected-debt-priority-mode", choices=("off", "on"))
     args = parser.parse_args()
     if args.pid <= 0:
         parser.error("--pid must be positive")
@@ -2208,6 +2224,7 @@ def main() -> None:
             monitor_term_grace=args.monitor_term_grace,
             num_gpus=args.num_gpus,
             cuda_visible_devices=args.cuda_visible_devices,
+            expected_debt_priority_mode=args.expected_debt_priority_mode,
         )
     )
 

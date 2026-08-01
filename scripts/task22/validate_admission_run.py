@@ -17,10 +17,8 @@ from typing import Any
 
 from relax.engine.rollout.request_observability import attempt_token_from_id
 from relax.utils.task22_runtime_attestation import attestation_matches_contract
-from scripts.task22.analyze_rollout_observability import (
-    analyze as analyze_requests,
-    export_placement_trace,
-)
+from scripts.task22.analyze_rollout_observability import analyze as analyze_requests
+from scripts.task22.analyze_rollout_observability import export_placement_trace
 
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
@@ -329,6 +327,7 @@ def validate_run(
     num_gpus: int = 4,
     cuda_visible_devices: str = "",
     evidence_profile: str = "qualification_v1",
+    expected_debt_priority_mode: str | None = None,
 ) -> dict[str, Any]:
     validation = Validation()
     driver_log = run_dir / "driver.log"
@@ -381,6 +380,8 @@ def validate_run(
         "num_gpus": num_gpus,
         "cuda_visible_devices": cuda_visible_devices,
     }
+    if expected_debt_priority_mode is not None:
+        expected_contract["debt_priority_mode"] = expected_debt_priority_mode
     if evidence_profile == "clean_ab_v1" or "evidence_profile" in contract:
         expected_contract["evidence_profile"] = evidence_profile
     validation.check(
@@ -662,6 +663,7 @@ def validate_run(
             observability_dir,
             expected_engines=expected_engines,
             require_resume=require_resume,
+            expected_debt_priority_mode=expected_debt_priority_mode,
         )
     except Exception as exc:  # noqa: BLE001
         request_analysis = {"verdict": "ERROR", "error": f"{type(exc).__name__}: {exc}"}
@@ -1787,6 +1789,7 @@ def main() -> None:
         default="qualification_v1",
     )
     parser.add_argument("--require-resume", action="store_true")
+    parser.add_argument("--expected-debt-priority-mode", choices=("off", "on"))
     parser.add_argument("--output-json", type=Path)
     args = parser.parse_args()
     if args.expected_rollouts <= 0:
@@ -1814,6 +1817,7 @@ def main() -> None:
         num_gpus=args.num_gpus,
         cuda_visible_devices=args.cuda_visible_devices,
         evidence_profile=args.evidence_profile,
+        expected_debt_priority_mode=args.expected_debt_priority_mode,
         require_resume=args.require_resume,
     )
     rendered = json.dumps(result, indent=2, sort_keys=True)

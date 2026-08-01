@@ -35,6 +35,7 @@ from relax.engine.rollout.request_observability import (
     fail_request_trace,
     finish_request_trace,
     request_observability_enabled,
+    request_priority_error,
 )
 from relax.utils.types import Sample
 
@@ -112,11 +113,23 @@ def test_request_observability_is_disabled_without_output_directory() -> None:
     assert request_observability_enabled(Namespace(rollout_request_observability_dir="/tmp/trace"))
 
 
+def test_request_priority_contract_distinguishes_off_and_on_rows() -> None:
+    assert request_priority_error({"work_origin": "old_debt"}, "off") is None
+    assert request_priority_error({"work_origin": "old_debt", "request_priority": 1}, "on") is None
+    assert request_priority_error({"work_origin": "fresh", "request_priority": 0}, "on") is None
+    assert request_priority_error({"work_origin": "surplus", "request_priority": 0}, "on") is None
+    assert request_priority_error({"work_origin": "old_debt", "request_priority": 0}, "on") is not None
+    assert request_priority_error({"work_origin": "fresh", "request_priority": 1}, "on") is not None
+    assert request_priority_error({"work_origin": "fresh", "request_priority": True}, "on") is not None
+    assert request_priority_error({"work_origin": "fresh", "request_priority": 0}, "off") is not None
+
+
 def test_request_trace_contains_counts_and_admission_context_without_prompt_content() -> None:
     payload = {
         "input_ids": [11, 12, 13],
         "sampling_params": {"max_new_tokens": 64},
         "return_logprob": True,
+        "priority": 1,
     }
 
     row, _ = begin_request_trace(
@@ -133,6 +146,7 @@ def test_request_trace_contains_counts_and_admission_context_without_prompt_cont
     assert row["attempt_kind"] == "resume"
     assert row["logical_prefix_tokens"] == 3
     assert row["partial_response_tokens"] == 2
+    assert row["request_priority"] == 1
     assert row["admission_mode"] == "on"
     assert row["admission_release_remaining"] == 2
     assert attempt_token_from_id(row["rid"]) == int(row["rid"].rsplit(":", 1)[-1], 16)

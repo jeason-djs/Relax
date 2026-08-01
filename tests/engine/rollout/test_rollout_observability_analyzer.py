@@ -72,6 +72,60 @@ def _valid_single_engine_log(rids: list[str]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def test_rollout_observability_analyzer_enforces_debt_priority_mapping(tmp_path) -> None:
+    request_dir = tmp_path / "requests"
+    request_dir.mkdir()
+    rids = [
+        "relax:p1:kresume:g1:s1:a1:abc",
+        "relax:p1:kfresh:g2:s2:a0:def",
+    ]
+    rows = [_finished_row(rid) for rid in rids]
+    rows[0].update({"attempt_kind": "resume", "work_origin": "old_debt", "request_priority": 1})
+    rows[1].update({"work_origin": "fresh", "request_priority": 0})
+    lifecycle = request_dir / "request_lifecycle_rollout_1.jsonl"
+    lifecycle.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    driver_log = tmp_path / "driver.log"
+    driver_log.write_text(_valid_single_engine_log(rids), encoding="utf-8")
+
+    result = analyze(
+        driver_log,
+        request_dir,
+        expected_engines=1,
+        require_resume=True,
+        expected_debt_priority_mode="on",
+    )
+
+    assert result["verdict"] == "PASS"
+    assert result["request_priority"]["by_work_origin"] == {
+        "fresh": {"0": 1},
+        "old_debt": {"1": 1},
+    }
+
+    rows[1]["request_priority"] = 1
+    lifecycle.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    result = analyze(
+        driver_log,
+        request_dir,
+        expected_engines=1,
+        require_resume=True,
+        expected_debt_priority_mode="on",
+    )
+    assert result["verdict"] == "FAIL"
+    assert not result["checks"]["request_priority_matches_contract"]
+
+    for row in rows:
+        row.pop("request_priority")
+    lifecycle.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    result = analyze(
+        driver_log,
+        request_dir,
+        expected_engines=1,
+        require_resume=True,
+        expected_debt_priority_mode="off",
+    )
+    assert result["verdict"] == "PASS"
+
+
 def test_rollout_observability_analyzer_maps_requests_and_summarizes_engine_shapes(tmp_path) -> None:
     request_dir = tmp_path / "requests"
     request_dir.mkdir()

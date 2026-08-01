@@ -75,6 +75,7 @@ def task22_env_sha256(env: dict[str, str] | None = None) -> str:
         "FLASHINFER_CUDA_ARCH_LIST",
         "SGLANG_LOG_SCHEDULER_STATUS_INTERVAL",
         "SGLANG_LOG_SCHEDULER_STATUS_TARGET",
+        "SGLANG_DEBT_PRIORITY_MODE",
         "TASK22_EVIDENCE_PROFILE",
         "TASK22_INPUT_MANIFEST",
         "TASK22_INPUT_ROOTS_JSON",

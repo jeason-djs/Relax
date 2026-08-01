@@ -134,6 +134,12 @@ MAX_STALENESS="${MAX_STALENESS:-2}"
 HEADLINE_LO="${HEADLINE_LO:-5}"
 HEADLINE_HI="${HEADLINE_HI:-14}"
 TASK22_ADMISSION_PROFILE="${TASK22_ADMISSION_PROFILE:-legacy_v1}"
+SGLANG_DEBT_PRIORITY_MODE="${SGLANG_DEBT_PRIORITY_MODE:-off}"
+if [[ "$SGLANG_DEBT_PRIORITY_MODE" != "off" ]]; then
+    echo "Admission matched A/B requires SGLANG_DEBT_PRIORITY_MODE=off" >&2
+    exit 4
+fi
+export SGLANG_DEBT_PRIORITY_MODE
 if [[ "$TASK22_ADMISSION_PROFILE" == "work_conserving_v2" ]]; then
     PARTITION_ADMISSION_POLICY="${PARTITION_ADMISSION_POLICY:-work_conserving}"
     PARTITION_ADMISSION_MIN="${PARTITION_ADMISSION_MIN:-12}"
@@ -336,6 +342,7 @@ for name in (
     "TASK22_EVIDENCE_PROFILE",
     "FLASHINFER_CUDA_ARCH_LIST",
     "RAY_DEDUP_LOGS",
+    "SGLANG_DEBT_PRIORITY_MODE",
     "TASK22_PYTHON",
 ):
     env_vars[name] = os.environ[name]
@@ -906,6 +913,7 @@ contract = {
     "request_placement_mode": os.environ["REQUEST_PLACEMENT_MODE"],
     "request_placement_policy": os.environ["REQUEST_PLACEMENT_POLICY"],
     "use_slime_router": os.environ["USE_SLIME_ROUTER"] == "1",
+    "debt_priority_mode": os.environ["SGLANG_DEBT_PRIORITY_MODE"],
     "num_rollout": int(os.environ["NUM_ROLLOUT"]),
     "expected_samples_per_partition": int(os.environ["EXPECTED_SAMPLES_PER_PARTITION"]),
     "expected_engines": int(os.environ["EXPECTED_ENGINES"]),
@@ -1029,6 +1037,7 @@ PY
     REQUEST_PLACEMENT_MODE="$REQUEST_PLACEMENT_MODE" \
     REQUEST_PLACEMENT_POLICY="$REQUEST_PLACEMENT_POLICY" \
     USE_SLIME_ROUTER="$USE_SLIME_ROUTER" \
+    SGLANG_DEBT_PRIORITY_MODE="$SGLANG_DEBT_PRIORITY_MODE" \
     TRAIN_SEED="$TRAIN_SEED" \
     ROLLOUT_SEED="$ROLLOUT_SEED" \
     RUN_TIMEOUT_S="$RUN_TIMEOUT_S" \
@@ -1099,6 +1108,7 @@ PY
             --monitor-term-grace "$TASK22_MONITOR_TERM_GRACE_S" \
             --num-gpus "$NUM_GPUS" \
             --cuda-visible-devices "$TASK22_CUDA_VISIBLE_DEVICES_CONTRACT" \
+            --expected-debt-priority-mode "$SGLANG_DEBT_PRIORITY_MODE" \
             > "$run_dir/logs/online_monitor.log" 2>&1 &
     fi
     monitor_pid=$!
@@ -1198,6 +1208,7 @@ PY
         --training-term-timeout "$TASK22_TRAINING_TERM_TIMEOUT_S" \
         --num-gpus "$NUM_GPUS" \
         --cuda-visible-devices "$TASK22_CUDA_VISIBLE_DEVICES_CONTRACT" \
+        --expected-debt-priority-mode "$SGLANG_DEBT_PRIORITY_MODE" \
         --require-resume \
         --output-json "$run_dir/validation.json" \
         > "$run_dir/validation.stdout.json"
@@ -1270,6 +1281,7 @@ export TASK22_HARD_FAILURE_GRACE_S TASK22_MONITOR_TIMEOUT_S
 export TASK22_MONITOR_TERM_GRACE_S TASK22_TRAINING_TERM_TIMEOUT_S
 export TASK22_EVIDENCE_PROFILE
 export TASK22_PAIR_COOLDOWN_S
+export SGLANG_DEBT_PRIORITY_MODE
 export NUM_GPUS TASK22_CUDA_VISIBLE_DEVICES_CONTRACT
 export TASK22_INPUT_MANIFEST="$INPUT_SNAPSHOT/MANIFEST.json"
 export TASK22_INPUT_ROOTS_JSON

@@ -5,12 +5,108 @@ from types import MethodType, SimpleNamespace
 
 import pytest
 
-from relax.engine.rollout.sglang_rollout import GenerateState, generate_and_rm
+import relax.engine.rollout.sglang_rollout as sglang_rollout
+from relax.engine.rollout.sglang_rollout import (
+    GenerateState,
+    generate,
+    generate_and_rm,
+    resolve_partition_request_priority,
+)
 from relax.utils.types import Sample
 
 
 def _group(origin: str, index: int) -> list[SimpleNamespace]:
     return [SimpleNamespace(metadata={"work_origin": origin}, index=index)]
+
+
+def test_partition_request_priority_is_omitted_when_sglang_feature_is_off() -> None:
+    args = SimpleNamespace(sglang_enable_priority_scheduling=False)
+    sample = _group("old_debt", 0)[0]
+
+    assert resolve_partition_request_priority(args, sample) is None
+
+
+@pytest.mark.parametrize(
+    ("origin", "expected"),
+    (("old_debt", 1), ("fresh", 0), ("surplus", 0), ("unknown", 0)),
+)
+def test_partition_request_priority_maps_old_debt_above_other_work(origin: str, expected: int) -> None:
+    args = SimpleNamespace(sglang_enable_priority_scheduling=True)
+    sample = _group(origin, 0)[0]
+
+    assert resolve_partition_request_priority(args, sample) == expected
+
+
+def test_partition_request_priority_treats_missing_metadata_as_fresh() -> None:
+    args = SimpleNamespace(sglang_enable_priority_scheduling=True)
+
+    assert resolve_partition_request_priority(args, SimpleNamespace()) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("evaluation", "expected_priority"),
+    ((False, 1), (True, 0)),
+)
+async def test_generate_sends_partition_priority_in_http_payload(
+    monkeypatch,
+    evaluation: bool,
+    expected_priority: int,
+) -> None:
+    payloads = []
+
+    class Tokenizer:
+        def encode(self, prompt, add_special_tokens=False):
+            del prompt, add_special_tokens
+            return [1, 2]
+
+    state = SimpleNamespace(
+        tokenizer=Tokenizer(),
+        processor=None,
+        opd_manager=None,
+        current_rollout_id=3,
+        request_observability_rows=[],
+    )
+
+    async def fake_post(url, payload, headers=None):
+        del url, headers
+        payloads.append(payload)
+        return {"output_ids": [9], "text": "x", "meta_info": {}}
+
+    monkeypatch.setattr(sglang_rollout, "GenerateState", lambda args: state)
+    monkeypatch.setattr(sglang_rollout, "post", fake_post)
+    args = SimpleNamespace(
+        ci_test=False,
+        sglang_router_ip="127.0.0.1",
+        sglang_router_port=30000,
+        sglang_enable_priority_scheduling=True,
+        use_rollout_routing_replay=False,
+        lora_rank=0,
+        rollout_request_observability_dir=None,
+        sglang_router_policy="round_robin",
+        slime_router_sticky=False,
+        use_slime_router=False,
+        slime_router_middleware_paths=[],
+    )
+    sample = SimpleNamespace(
+        status=Sample.Status.PENDING,
+        prompt="prompt",
+        response="",
+        response_length=0,
+        tokens=[],
+        rollout_tokens=[],
+        rollout_log_probs=None,
+        loss_mask=None,
+        multimodal_inputs=None,
+        metadata={"work_origin": "old_debt"},
+        session_id=None,
+        group_index=1,
+        update_from_meta_info=lambda args, meta_info: None,
+    )
+
+    await generate(args, sample, {"max_new_tokens": 1}, evaluation=evaluation)
+
+    assert payloads[0]["priority"] == expected_priority
 
 
 @pytest.mark.asyncio

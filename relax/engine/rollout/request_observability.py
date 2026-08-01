@@ -23,6 +23,20 @@ def request_observability_enabled(args: Any) -> bool:
     return bool(getattr(args, "rollout_request_observability_dir", None))
 
 
+def request_priority_error(row: dict[str, Any], expected_mode: str) -> str | None:
+    """Return why one request row violates the Task 22 debt-priority contract."""
+
+    if expected_mode not in {"off", "on"}:
+        raise ValueError(f"unsupported debt-priority mode: {expected_mode}")
+    actual = row.get("request_priority")
+    if expected_mode == "off":
+        return None if actual is None else f"expected omitted priority, got {actual!r}"
+    expected = 1 if row.get("work_origin") == "old_debt" else 0
+    if isinstance(actual, bool) or actual != expected:
+        return f"expected priority {expected}, got {actual!r}"
+    return None
+
+
 def _rid_component(value: Any) -> str:
     if value is None:
         return "na"
@@ -216,6 +230,7 @@ def begin_request_trace(
         "logical_prefix_tokens": len(payload.get("input_ids", [])),
         "partial_response_tokens": int(getattr(sample, "response_length", 0) or 0),
         "max_new_tokens": int(payload.get("sampling_params", {}).get("max_new_tokens", 0) or 0),
+        "request_priority": payload.get("priority"),
         "dispatch_abs": request_start_abs,
         "diff_realtime_monotonic": request_start_abs - request_start_monotonic,
         "client_status": "dispatched",

@@ -16,6 +16,8 @@ from pathlib import Path
 from statistics import mean, median
 from typing import Any
 
+from relax.engine.rollout.request_observability import request_priority_error
+
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 ENGINE_PID_RE = re.compile(r"\(SGLangEngine pid=(\d+)\)")
@@ -96,6 +98,11 @@ def _finite_float(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return parsed if math.isfinite(parsed) else None
+
+
+def _priority_label(row: dict[str, Any]) -> str:
+    value = row.get("request_priority")
+    return "null" if value is None else str(value)
 
 
 def _event_timestamp(event: dict[str, Any]) -> float | None:
@@ -357,7 +364,10 @@ def analyze(
     *,
     expected_engines: int,
     require_resume: bool,
+    expected_debt_priority_mode: str | None = None,
 ) -> dict[str, Any]:
+    if expected_debt_priority_mode not in {None, "off", "on"}:
+        raise ValueError(f"unsupported debt-priority mode: {expected_debt_priority_mode}")
     client_rows = _load_client_rows(request_dir)
     engine_to_gpu: dict[str, int] = {}
     received_engines: dict[str, set[str]] = defaultdict(set)
@@ -554,6 +564,19 @@ def analyze(
         and row.get("queue_time") is not None
         for row in finished_rows
     )
+    request_priority_errors = []
+    if expected_debt_priority_mode is not None:
+        request_priority_errors = [
+            {
+                "source": row["_source"],
+                "rid": row.get("rid"),
+                "work_origin": row.get("work_origin"),
+                "request_priority": row.get("request_priority"),
+                "error": error,
+            }
+            for row in client_rows
+            if (error := request_priority_error(row, expected_debt_priority_mode)) is not None
+        ]
     checks = {
         "client_rows_present": bool(client_rows),
         "finished_client_rows_present": bool(finished_rows),
@@ -576,6 +599,17 @@ def analyze(
         "server_request_log_has_no_large_fields": not forbidden_fields,
         "resume_mapping_present": (not require_resume or (bool(resume_rids) and mapped_resume_rids == resume_rids)),
     }
+    if expected_debt_priority_mode is not None:
+        checks["request_priority_matches_contract"] = bool(client_rows) and not request_priority_errors
+    priority_distribution = Counter(_priority_label(row) for row in client_rows)
+    priorities_by_origin = {
+        origin: Counter(
+            _priority_label(row)
+            for row in client_rows
+            if str(row.get("work_origin", "unknown")) == origin
+        )
+        for origin in sorted({str(row.get("work_origin", "unknown")) for row in client_rows})
+    }
     return {
         "verdict": "PASS" if all(checks.values()) else "FAIL",
         "checks": checks,
@@ -595,6 +629,15 @@ def analyze(
             "server_interval_errors": len(server_interval_errors),
             "scheduler_shape_errors": len(scheduler_shape_errors),
             "forbidden_fields": len(forbidden_fields),
+            "request_priority_errors": len(request_priority_errors),
+        },
+        "request_priority": {
+            "expected_mode": expected_debt_priority_mode,
+            "distribution": dict(sorted(priority_distribution.items())),
+            "by_work_origin": {
+                origin: dict(sorted(distribution.items()))
+                for origin, distribution in priorities_by_origin.items()
+            },
         },
         "engine_summaries": engine_summaries,
         "failures": {
@@ -609,6 +652,7 @@ def analyze(
             "server_interval_errors": server_interval_errors[:20],
             "scheduler_shape_errors": scheduler_shape_errors[:20],
             "forbidden_fields": forbidden_fields[:20],
+            "request_priority_errors": request_priority_errors[:20],
         },
     }
 
@@ -619,6 +663,7 @@ def main() -> None:
     parser.add_argument("--request-dir", type=Path, required=True)
     parser.add_argument("--expected-engines", type=int, default=2)
     parser.add_argument("--require-resume", action="store_true")
+    parser.add_argument("--expected-debt-priority-mode", choices=("off", "on"))
     parser.add_argument("--output-json", type=Path)
     parser.add_argument("--placement-trace-jsonl", type=Path)
     args = parser.parse_args()
@@ -628,6 +673,7 @@ def main() -> None:
         args.request_dir,
         expected_engines=args.expected_engines,
         require_resume=args.require_resume,
+        expected_debt_priority_mode=args.expected_debt_priority_mode,
     )
     rendered = json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True)
     print(rendered)
