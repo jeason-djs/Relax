@@ -383,6 +383,9 @@ for raw_path in sys.argv[1:]:
         "PYTHONDONTWRITEBYTECODE": "1",
         "TASK22_PYTHON": os.path.realpath(sys.executable),
         "TASK22_AUTHORIZE_GPU_RUN": "1",
+        # Runner tests must not inherit the profile selected by an outer
+        # preflight invocation.  Individual v2 tests opt in explicitly.
+        "TASK22_ADMISSION_PROFILE": "legacy_v1",
         "MODEL_DIR": str(tmp_path / "model"),
         "DATA_DIR": str(tmp_path / "data"),
         "EXP_DIR": str(tmp_path / "model"),
@@ -394,6 +397,22 @@ for raw_path in sys.argv[1:]:
         "TASK22_MONITOR_POLL_INTERVAL": "0.01",
     }
     return repo, run_root, env
+
+
+def test_runner_accepts_work_conserving_v2_contract(tmp_path) -> None:
+    repo, _, env = _build_fake_repo(tmp_path)
+    runner = repo / "scripts/task22/run_admission_matched_ab.sh"
+
+    checked = subprocess.run(
+        ["bash", str(runner), "--check"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={**env, "TASK22_ADMISSION_PROFILE": "work_conserving_v2"},
+    )
+
+    assert checked.returncode == 0, checked.stderr
+    assert "verdict=READY" in checked.stdout
 
 
 def test_runner_fixture_passes_real_online_monitor_and_real_final_validator(tmp_path) -> None:
