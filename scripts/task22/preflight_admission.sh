@@ -55,6 +55,7 @@ bash -n \
     tests/engine/router/test_placement.py \
     tests/engine/router/test_router_placement.py \
     tests/engine/rollout/test_admission.py \
+    tests/engine/rollout/test_admission_dispatch.py \
     tests/engine/rollout/test_admission_health_monitor.py \
     tests/engine/rollout/test_sglang_rollout_cleanup.py \
     tests/engine/rollout/test_request_observability.py \
