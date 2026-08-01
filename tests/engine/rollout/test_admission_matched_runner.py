@@ -68,6 +68,8 @@ def test_real_local_wrapper_only_stops_explicit_job_pid_and_keeps_monitor(tmp_pa
             **os.environ,
             "PATH": f"{fake_bin}:{os.environ['PATH']}",
             "NUM_GPUS": "0",
+            "RAY_ADDRESS": "",
+            "TASK22_PYTHON": "",
             "RELAX_LOCAL_CLEANUP_PIDS": str(owned.pid),
         }
         result = subprocess.run(
