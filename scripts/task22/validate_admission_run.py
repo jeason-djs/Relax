@@ -731,8 +731,8 @@ def validate_run(
         str(row["rid"])
         for row in placement_trace_rows
         if isinstance(row.get("rid"), str)
-        and isinstance(row.get("actual_engine_id"), str)
-        and row["actual_engine_id"].startswith("engine-pid-")
+        and isinstance(row.get("actual_engine_pid_id"), str)
+        and row["actual_engine_pid_id"].startswith("engine-pid-")
         and isinstance(row.get("actual_engine_gpu_id"), int)
         and not isinstance(row.get("actual_engine_gpu_id"), bool)
     }

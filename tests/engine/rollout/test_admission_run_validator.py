@@ -320,9 +320,27 @@ def test_admission_run_validator_accepts_complete_evidence(tmp_path) -> None:
         .splitlines()
     ]
     assert [
-        (row["rid"], row["actual_engine_id"], row["actual_engine_gpu_id"])
+        (row["rid"], row["actual_engine_pid_id"], row["actual_engine_gpu_id"])
         for row in trace_rows
     ] == [(RID, "engine-pid-100", 2)]
+
+
+def test_admission_run_validator_accepts_stable_router_engine_id(tmp_path) -> None:
+    run_dir = _build_valid_run(tmp_path)
+    lifecycle = run_dir / "observability" / "request_lifecycle_rollout_0.jsonl"
+    row = json.loads(lifecycle.read_text(encoding="utf-8"))
+    row["placement_actual_engine_id"] = "engine-stable-a"
+    _jsonl(lifecycle, [row])
+
+    result = _validate(run_dir)
+
+    assert result["verdict"] == "PASS", result["failures"]
+    trace = json.loads(
+        (run_dir / "observability" / "placement_trace.jsonl").read_text(encoding="utf-8")
+    )
+    assert trace["actual_engine_id"] == "engine-stable-a"
+    assert trace["actual_engine_pid_id"] == "engine-pid-100"
+    assert trace["actual_engine_gpu_id"] == 2
 
 
 def test_admission_run_validator_requires_exact_logical_debt_close_transfer(tmp_path) -> None:

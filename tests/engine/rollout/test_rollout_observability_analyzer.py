@@ -371,7 +371,8 @@ def test_rollout_observability_analyzer_exports_prompt_free_placement_trace(tmp_
     assert exported["observed_work"] == 30
     assert exported["candidate_engine_ids"] == ["engine-a", "engine-b"]
     assert exported["actual_engine_id"] == "engine-a"
-    assert exported["actual_engine_gpu_id"] is None
+    assert exported["actual_engine_pid_id"] == "engine-pid-100"
+    assert exported["actual_engine_gpu_id"] == 2
     assert not {"prompt", "input_ids", "sampling_params", "output_ids"}.intersection(exported)
 
 
@@ -464,6 +465,7 @@ def test_placement_trace_maps_server_engine_pid_to_gpu(tmp_path) -> None:
     exported = json.loads(output_path.read_text(encoding="utf-8"))
 
     assert exported["actual_engine_id"] == "engine-pid-100"
+    assert exported["actual_engine_pid_id"] == "engine-pid-100"
     assert exported["actual_engine_gpu_id"] == 2
 
 

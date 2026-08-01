@@ -153,9 +153,10 @@ def _placement_trace_rows(
         if not rid or not _client_row_is_terminal(row):
             continue
         mapped = received_engines.get(rid, set())
+        actual_engine_pid_id = f"engine-pid-{next(iter(mapped))}" if len(mapped) == 1 else None
         actual_engine_id = row.get("placement_actual_engine_id")
-        if actual_engine_id is None and len(mapped) == 1:
-            actual_engine_id = f"engine-pid-{next(iter(mapped))}"
+        if actual_engine_id is None:
+            actual_engine_id = actual_engine_pid_id
 
         candidate_snapshots = row.get("placement_candidate_engines")
         if isinstance(candidate_snapshots, list) and candidate_snapshots:
@@ -206,6 +207,12 @@ def _placement_trace_rows(
                 "call_prompt_tokens": int(row.get("call_prompt_tokens", 0) or 0),
                 "call_cached_tokens": int(row.get("call_cached_tokens", 0) or 0),
                 "actual_engine_id": actual_engine_id,
+                # Direct-placement mode deliberately exposes a stable router
+                # engine id (``engine-*``), while the server log identifies the
+                # serving process as ``engine-pid-*``.  Preserve both identities:
+                # replay needs the stable id and qualification needs the
+                # independently observed PID/GPU provenance.
+                "actual_engine_pid_id": actual_engine_pid_id,
                 "candidate_engine_ids": candidate_engine_ids,
                 "candidate_snapshots": candidate_snapshots,
                 "placement_mode": row.get("placement_mode"),
@@ -291,10 +298,10 @@ def export_placement_trace(driver_log: Path, request_dir: Path, output_path: Pat
         scheduler_snapshots,
     )
     for row in rows:
-        actual_engine_id = row.get("actual_engine_id")
-        if isinstance(actual_engine_id, str) and actual_engine_id.startswith("engine-pid-"):
+        actual_engine_pid_id = row.get("actual_engine_pid_id")
+        if isinstance(actual_engine_pid_id, str) and actual_engine_pid_id.startswith("engine-pid-"):
             row["actual_engine_gpu_id"] = engine_to_gpu.get(
-                actual_engine_id.removeprefix("engine-pid-")
+                actual_engine_pid_id.removeprefix("engine-pid-")
             )
         else:
             row["actual_engine_gpu_id"] = None
