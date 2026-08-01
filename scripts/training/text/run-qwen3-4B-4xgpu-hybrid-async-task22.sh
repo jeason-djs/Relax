@@ -242,7 +242,8 @@ mkdir -p "$(dirname -- "$DRIVER_LOG_PATH")"
 if [[ -n "$TIMELINE_DUMP_DIR" ]]; then
     mkdir -p "$TIMELINE_DUMP_DIR"
 fi
-ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
+"$PYTHON_BIN" -m ray.scripts.scripts job submit ${RAY_NO_WAIT:+--no-wait} \
+    --address="http://127.0.0.1:8265" \
     ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \
     --runtime-env-json="${RUNTIME_ENV_JSON}" \
     -- env RUNTIME_ENV_JSON="$RUNTIME_ENV_JSON" \

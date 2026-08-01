@@ -132,9 +132,16 @@ def test_real_task22_entrypoint_passes_input_guard_env_in_runtime_env_and_comman
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     capture = tmp_path / "ray-argv"
+    task_python = fake_bin / "contract-python"
     _write(
-        fake_bin / "ray",
-        '#!/usr/bin/env bash\nprintf "%s\\0" "$@" > "$TASK22_TEST_RAY_ARGV"\n',
+        task_python,
+        f'''#!/usr/bin/env bash
+if [[ "$1" == "-m" && "$2" == "ray.scripts.scripts" ]]; then
+    printf "%s\\0" "$@" > "$TASK22_TEST_RAY_ARGV"
+    exit 0
+fi
+exec "{os.path.realpath(sys.executable)}" "$@"
+''',
         executable=True,
     )
     manifest = str(tmp_path / "snapshot/MANIFEST.json")
@@ -150,7 +157,7 @@ def test_real_task22_entrypoint_passes_input_guard_env_in_runtime_env_and_comman
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
         "RELAX_ENTRYPOINT_MODE": "test",
         "MODEL_CONFIG_DIR": str(REPO_ROOT / "scripts/models"),
-        "TASK22_PYTHON": os.path.realpath(sys.executable),
+        "TASK22_PYTHON": str(task_python),
         "TASK22_INPUT_MANIFEST": manifest,
         "TASK22_INPUT_ROOTS_JSON": roots_json,
         "TASK22_TEST_RAY_ARGV": str(capture),
@@ -184,9 +191,9 @@ def test_real_task22_entrypoint_passes_input_guard_env_in_runtime_env_and_comman
     assert "TASK22_RAY_JOB_RUNTIME_ENV_APPLIED=1" in argv
     assert f"TASK22_INPUT_MANIFEST={manifest}" in argv
     assert f"TASK22_INPUT_ROOTS_JSON={roots_json}" in argv
-    assert str(os.path.realpath(sys.executable)) in argv
+    assert str(task_python) in argv
     assert ["-m", "relax.entrypoints.train"] == argv[
-        argv.index(str(os.path.realpath(sys.executable))) + 1 : argv.index(str(os.path.realpath(sys.executable))) + 3
+        argv.index(str(task_python)) + 1 : argv.index(str(task_python)) + 3
     ]
 
 
