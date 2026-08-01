@@ -388,28 +388,51 @@ def validate_run(
         all(contract.get(key) == value for key, value in expected_contract.items()),
         {key: {"expected": value, "actual": contract.get(key)} for key, value in expected_contract.items()},
     )
+    admission_profile = contract.get("admission_profile", "legacy_v1")
+    admission_policy = contract.get("admission_policy", "legacy_debt_window")
+    admission_tuple = (
+        contract.get("admission_min"),
+        contract.get("admission_max"),
+        contract.get("admission_slack"),
+    )
+    supported_admission_contract = (
+        admission_profile == "legacy_v1"
+        and admission_policy == "legacy_debt_window"
+        and admission_tuple == (4, 8, 2)
+    ) or (
+        admission_profile == "work_conserving_v2"
+        and admission_policy == "work_conserving"
+        and admission_tuple == (12, 16, 4)
+    )
     validation.check(
-        "admission_contract_is_4_8_2",
-        (
-            contract.get("admission_min"),
-            contract.get("admission_max"),
-            contract.get("admission_slack"),
-        )
-        == (4, 8, 2),
+        "admission_contract_supported",
+        supported_admission_contract,
         {
+            "admission_profile": admission_profile,
+            "admission_policy": admission_policy,
             "admission_min": contract.get("admission_min"),
             "admission_max": contract.get("admission_max"),
             "admission_slack": contract.get("admission_slack"),
         },
     )
     validation.check(
-        "request_placement_is_off",
-        contract.get("request_placement_mode") == "off",
-        contract.get("request_placement_mode"),
+        "request_placement_contract_supported",
+        (
+            admission_profile == "legacy_v1" and contract.get("request_placement_mode") == "off"
+        )
+        or (
+            admission_profile == "work_conserving_v2"
+            and contract.get("request_placement_mode") == "on"
+            and contract.get("request_placement_policy") == "least_predicted_work"
+        ),
+        {
+            "mode": contract.get("request_placement_mode"),
+            "policy": contract.get("request_placement_policy"),
+        },
     )
     validation.check(
-        "slime_router_is_disabled",
-        contract.get("use_slime_router") is False,
+        "slime_router_contract_supported",
+        contract.get("use_slime_router") is (admission_profile == "work_conserving_v2"),
         contract.get("use_slime_router"),
     )
     if evidence_profile == "clean_ab_v1":
@@ -652,6 +675,28 @@ def validate_run(
         observability_dir,
         "request_lifecycle_rollout_*.jsonl",
         validation,
+    )
+    if admission_profile == "work_conserving_v2":
+        placement_runtime_valid = bool(request_rows) and all(
+            row.get("placement_mode") == "on"
+            and row.get("placement_policy") == "least_predicted_work"
+            and row.get("placement_actual_engine_id") == row.get("placement_selected_engine_id")
+            and row.get("placement_fallback_reason") is None
+            and isinstance(row.get("placement_candidate_engines"), list)
+            and len(row["placement_candidate_engines"]) == expected_engines
+            for row in request_rows
+        )
+    else:
+        placement_runtime_valid = all(row.get("placement_mode") in (None, "off") for row in request_rows)
+    validation.check(
+        "request_placement_runtime_matches_contract",
+        placement_runtime_valid,
+        {
+            "profile": admission_profile,
+            "request_rows": len(request_rows),
+            "placement_on_rows": sum(row.get("placement_mode") == "on" for row in request_rows),
+            "fallback_rows": sum(row.get("placement_fallback_reason") is not None for row in request_rows),
+        },
     )
     ledger_paths, ledger_rows = _load_glob(
         observability_dir,
@@ -899,10 +944,36 @@ def validate_run(
             isinstance(value, int) and not isinstance(value, bool) and value >= 0
             for value in (debt, inflight, available)
         )
-        expected_desired = 8
-        if valid_inputs and debt > 0:
-            expected_desired = max(4, min(8, debt + 2))
-        expected_bounded = min(available, max(expected_desired - inflight, 0)) if valid_inputs else None
+        admission_min = int(contract.get("admission_min", 0) or 0)
+        admission_max = int(contract.get("admission_max", 0) or 0)
+        admission_slack = int(contract.get("admission_slack", 0) or 0)
+        if admission_policy == "work_conserving":
+            expected_desired = max(admission_min, min(admission_max, debt + admission_slack))
+        else:
+            expected_desired = admission_max
+            if valid_inputs and debt > 0:
+                expected_desired = max(admission_min, min(admission_max, debt + admission_slack))
+        expected_admit = max(expected_desired - inflight, 0) if valid_inputs else None
+        inflight_requests = row.get("inflight_requests")
+        requests_per_group = row.get("requests_per_group")
+        if (
+            valid_inputs
+            and admission_policy == "work_conserving"
+            and isinstance(inflight_requests, int)
+            and not isinstance(inflight_requests, bool)
+            and isinstance(requests_per_group, int)
+            and not isinstance(requests_per_group, bool)
+            and requests_per_group > 0
+        ):
+            request_floor = admission_min * requests_per_group
+            request_ceiling = admission_max * requests_per_group
+            request_admit = max(
+                (request_floor - inflight_requests + requests_per_group - 1) // requests_per_group,
+                0,
+            )
+            request_capacity = max((request_ceiling - inflight_requests) // requests_per_group, 0)
+            expected_admit = min(max(expected_admit, request_admit), request_capacity)
+        expected_bounded = min(available, expected_admit) if valid_inputs else None
         validation.check(
             "admission_bounded_recomputes",
             valid_inputs

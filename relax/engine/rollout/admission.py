@@ -22,6 +22,13 @@ class AdmissionMode(str, Enum):
     ON = "on"
 
 
+class AdmissionPolicy(str, Enum):
+    """How an enabled controller turns debt into an in-flight window."""
+
+    LEGACY_DEBT_WINDOW = "legacy_debt_window"
+    WORK_CONSERVING = "work_conserving"
+
+
 class UnrecoverableFinalBackfillError(RuntimeError):
     """The durable partition is incomplete but volatile debt state is gone."""
 
@@ -43,6 +50,7 @@ class DebtAwareAdmissionConfig:
     """Bounded admission policy for one physical rollout."""
 
     mode: AdmissionMode = AdmissionMode.OFF
+    policy: AdmissionPolicy = AdmissionPolicy.LEGACY_DEBT_WINDOW
     min_inflight_groups: int = 1
     max_inflight_groups: int = 1
     slack_groups: int = 0
@@ -63,7 +71,10 @@ class AdmissionDecision:
     decision_id: str
     decision_sequence: int
     mode: AdmissionMode
+    policy: AdmissionPolicy
     inflight_groups: int
+    inflight_requests: int | None
+    requests_per_group: int
     debt_remaining: int
     available_groups: int
     eager_admit_groups: int
@@ -273,6 +284,16 @@ def config_from_namespace(args: Any) -> tuple[DebtAwareAdmissionConfig, str | No
         mode = raw_mode if isinstance(raw_mode, AdmissionMode) else AdmissionMode(str(raw_mode).lower())
         if mode is AdmissionMode.OFF:
             return DebtAwareAdmissionConfig(), None
+        raw_policy = getattr(
+            args,
+            "partition_critical_admission_policy",
+            AdmissionPolicy.LEGACY_DEBT_WINDOW.value,
+        )
+        policy = (
+            raw_policy
+            if isinstance(raw_policy, AdmissionPolicy)
+            else AdmissionPolicy(str(raw_policy).lower())
+        )
         required_names = (
             "partition_critical_admission_min_inflight_groups",
             "partition_critical_admission_max_inflight_groups",
@@ -283,6 +304,7 @@ def config_from_namespace(args: Any) -> tuple[DebtAwareAdmissionConfig, str | No
             raise ValueError(f"missing admission settings: {', '.join(missing)}")
         config = DebtAwareAdmissionConfig(
             mode=mode,
+            policy=policy,
             min_inflight_groups=int(args.partition_critical_admission_min_inflight_groups),
             max_inflight_groups=int(args.partition_critical_admission_max_inflight_groups),
             slack_groups=int(args.partition_critical_admission_slack_groups),
@@ -305,6 +327,19 @@ def validate_admission_namespace(args: Any) -> DebtAwareAdmissionConfig:
         raise ValueError("--partition-critical-admission-mode shadow/on requires --fully-async or --hybrid.")
     if config_error is not None:
         raise ValueError(f"Invalid partition-critical admission settings: {config_error}")
+    if config.policy is AdmissionPolicy.WORK_CONSERVING:
+        concurrency = getattr(args, "sglang_server_concurrency", None)
+        rollout_num_gpus = getattr(args, "rollout_num_gpus", None)
+        gpus_per_engine = getattr(args, "rollout_num_gpus_per_engine", None)
+        requests_per_group = getattr(args, "n_samples_per_prompt", None)
+        if all(value is not None for value in (concurrency, rollout_num_gpus, gpus_per_engine, requests_per_group)):
+            client_capacity = int(concurrency) * int(rollout_num_gpus) // int(gpus_per_engine)
+            required_capacity = config.max_inflight_groups * int(requests_per_group)
+            if required_capacity > client_capacity:
+                raise ValueError(
+                    "work_conserving admission requires client request capacity >= "
+                    f"max_inflight_groups * n_samples_per_prompt ({client_capacity} < {required_capacity})"
+                )
     return config
 
 
@@ -338,6 +373,8 @@ class DebtAwareAdmissionController:
         self,
         *,
         inflight_groups: int,
+        inflight_requests: int | None = None,
+        requests_per_group: int = 1,
         debt_remaining: int,
         available_groups: int,
         eager_admit_groups: int,
@@ -347,9 +384,14 @@ class DebtAwareAdmissionController:
             ("debt_remaining", debt_remaining),
             ("available_groups", available_groups),
             ("eager_admit_groups", eager_admit_groups),
+            ("requests_per_group", requests_per_group),
         ):
             if value < 0:
                 raise ValueError(f"{name} must be non-negative")
+        if requests_per_group <= 0:
+            raise ValueError("requests_per_group must be positive")
+        if inflight_requests is not None and inflight_requests < 0:
+            raise ValueError("inflight_requests must be non-negative")
 
         bypass_reason = None
         if self.config.mode is AdmissionMode.OFF:
@@ -359,13 +401,35 @@ class DebtAwareAdmissionController:
         elif self._failed_open_reason is not None:
             bypass_reason = f"fail_open:{self._failed_open_reason}"
 
-        desired_inflight = self.config.max_inflight_groups
-        if debt_remaining > 0:
+        if self.config.policy is AdmissionPolicy.WORK_CONSERVING:
+            # ``min_inflight_groups`` is a measured saturation floor in this
+            # policy, rather than merely a last-resort lower bound.  Keep that
+            # floor while debt closes and after it closes, but do not
+            # unconditionally jump to the ceiling late in the physical
+            # rollout.  This preserves continuous-batching efficiency while
+            # avoiding low-value fresh work immediately before a weight sync.
             desired_inflight = max(
                 self.config.min_inflight_groups,
                 min(self.config.max_inflight_groups, debt_remaining + self.config.slack_groups),
             )
-        bounded_admit = min(available_groups, max(desired_inflight - inflight_groups, 0))
+        else:
+            desired_inflight = self.config.max_inflight_groups
+            if debt_remaining > 0:
+                desired_inflight = max(
+                    self.config.min_inflight_groups,
+                    min(self.config.max_inflight_groups, debt_remaining + self.config.slack_groups),
+                )
+        group_window_admit = max(desired_inflight - inflight_groups, 0)
+        if self.config.policy is AdmissionPolicy.WORK_CONSERVING and inflight_requests is not None:
+            request_floor = self.config.min_inflight_groups * requests_per_group
+            request_ceiling = self.config.max_inflight_groups * requests_per_group
+            request_floor_admit = max(
+                (request_floor - inflight_requests + requests_per_group - 1) // requests_per_group,
+                0,
+            )
+            request_capacity = max((request_ceiling - inflight_requests) // requests_per_group, 0)
+            group_window_admit = min(max(group_window_admit, request_floor_admit), request_capacity)
+        bounded_admit = min(available_groups, group_window_admit)
         actual_admit = bounded_admit if self.config.mode is AdmissionMode.ON else eager_admit_groups
         if bypass_reason is not None:
             actual_admit = eager_admit_groups
@@ -379,7 +443,10 @@ class DebtAwareAdmissionController:
             decision_id="unrecorded",
             decision_sequence=0,
             mode=self.config.mode,
+            policy=self.config.policy,
             inflight_groups=inflight_groups,
+            inflight_requests=inflight_requests,
+            requests_per_group=requests_per_group,
             debt_remaining=debt_remaining,
             available_groups=available_groups,
             eager_admit_groups=eager_admit_groups,
@@ -393,12 +460,16 @@ class DebtAwareAdmissionController:
         self,
         *,
         inflight_groups: int,
+        inflight_requests: int | None = None,
+        requests_per_group: int = 1,
         debt_remaining: int,
         available_groups: int,
         eager_admit_groups: int,
     ) -> AdmissionDecision:
         decision = self.decide(
             inflight_groups=inflight_groups,
+            inflight_requests=inflight_requests,
+            requests_per_group=requests_per_group,
             debt_remaining=debt_remaining,
             available_groups=available_groups,
             eager_admit_groups=eager_admit_groups,
@@ -441,6 +512,8 @@ def plan_next_admission(
     progress_groups: int,
     transferred_groups: int,
     inflight_groups: int,
+    inflight_requests: int | None = None,
+    requests_per_group: int = 1,
     cumulative_submitted_groups: int,
     previous_debt_groups: int,
     transfer_batch_groups: int,
@@ -469,6 +542,8 @@ def plan_next_admission(
     )
     return controller.admit_count(
         inflight_groups=inflight_groups,
+        inflight_requests=inflight_requests,
+        requests_per_group=requests_per_group,
         debt_remaining=logical_debt_remaining,
         available_groups=available_groups,
         eager_admit_groups=eager_admit_groups,

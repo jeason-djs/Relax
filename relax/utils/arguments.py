@@ -750,6 +750,18 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--partition-critical-admission-policy",
+                type=str,
+                choices=["legacy_debt_window", "work_conserving"],
+                default="legacy_debt_window",
+                help=(
+                    "Select the enabled admission window policy. legacy_debt_window "
+                    "reproduces the original debt-tapering behavior; work_conserving "
+                    "treats min-inflight-groups as a measured engine-saturation floor "
+                    "and avoids jumping to max-inflight-groups after debt closes."
+                ),
+            )
+            parser.add_argument(
                 "--partition-critical-admission-min-inflight-groups",
                 type=_positive_int,
                 default=None,

@@ -794,9 +794,9 @@ def test_admission_run_validator_rejects_contract_drift(tmp_path) -> None:
     result = _validate(run_dir)
 
     assert result["verdict"] == "FAIL"
-    assert not result["checks"]["admission_contract_is_4_8_2"]
-    assert not result["checks"]["request_placement_is_off"]
-    assert not result["checks"]["slime_router_is_disabled"]
+    assert not result["checks"]["admission_contract_supported"]
+    assert not result["checks"]["request_placement_contract_supported"]
+    assert not result["checks"]["slime_router_contract_supported"]
 
 
 def test_admission_run_validator_rejects_downgraded_contract_schema(tmp_path) -> None:

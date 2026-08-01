@@ -38,6 +38,7 @@ MODEL_DIR="${MODEL_DIR:-${EXP_DIR}}"
 DATA_DIR="${DATA_DIR:-${EXP_DIR}}"
 NUM_ROLLOUT="${NUM_ROLLOUT:-15}"
 PARTITION_ADMISSION_MODE="${PARTITION_ADMISSION_MODE:-off}"
+PARTITION_ADMISSION_POLICY="${PARTITION_ADMISSION_POLICY:-legacy_debt_window}"
 REQUEST_PLACEMENT_MODE="${REQUEST_PLACEMENT_MODE:-off}"
 REQUEST_PLACEMENT_POLICY="${REQUEST_PLACEMENT_POLICY:-least_predicted_work}"
 REQUEST_OBSERVABILITY_DIR="${REQUEST_OBSERVABILITY_DIR:-}"
@@ -55,6 +56,11 @@ if [[ "$PARTITION_ADMISSION_MODE" != "off" ]]; then
     : "${PARTITION_ADMISSION_MIN:?Set PARTITION_ADMISSION_MIN for shadow/on}"
     : "${PARTITION_ADMISSION_MAX:?Set PARTITION_ADMISSION_MAX for shadow/on}"
     : "${PARTITION_ADMISSION_SLACK:?Set PARTITION_ADMISSION_SLACK for shadow/on}"
+fi
+if [[ "$PARTITION_ADMISSION_POLICY" != "legacy_debt_window" \
+    && "$PARTITION_ADMISSION_POLICY" != "work_conserving" ]]; then
+    echo "Unsupported PARTITION_ADMISSION_POLICY=$PARTITION_ADMISSION_POLICY" >&2
+    exit 2
 fi
 if [[ "$REQUEST_PLACEMENT_MODE" != "off" && "$REQUEST_PLACEMENT_MODE" != "shadow" && "$REQUEST_PLACEMENT_MODE" != "on" ]]; then
     echo "REQUEST_PLACEMENT_MODE must be off, shadow, or on" >&2
@@ -112,6 +118,7 @@ ROLLOUT_ARGS=(
 
 if [[ "$PARTITION_ADMISSION_MODE" != "off" ]]; then
     ROLLOUT_ARGS+=(
+        --partition-critical-admission-policy "$PARTITION_ADMISSION_POLICY"
         --partition-critical-admission-min-inflight-groups "$PARTITION_ADMISSION_MIN"
         --partition-critical-admission-max-inflight-groups "$PARTITION_ADMISSION_MAX"
         --partition-critical-admission-slack-groups "$PARTITION_ADMISSION_SLACK"

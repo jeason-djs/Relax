@@ -6,6 +6,7 @@ import pytest
 
 from relax.engine.rollout.admission import (
     AdmissionMode,
+    AdmissionPolicy,
     DebtAwareAdmissionConfig,
     DebtAwareAdmissionController,
     PartitionTransferPlanner,
@@ -26,6 +27,16 @@ def _enabled_config(mode: AdmissionMode = AdmissionMode.ON) -> DebtAwareAdmissio
         min_inflight_groups=4,
         max_inflight_groups=8,
         slack_groups=2,
+    )
+
+
+def _work_conserving_config(mode: AdmissionMode = AdmissionMode.ON) -> DebtAwareAdmissionConfig:
+    return DebtAwareAdmissionConfig(
+        mode=mode,
+        policy=AdmissionPolicy.WORK_CONSERVING,
+        min_inflight_groups=12,
+        max_inflight_groups=16,
+        slack_groups=4,
     )
 
 
@@ -95,6 +106,56 @@ def test_admission_on_uses_normal_max_window_after_debt_closes() -> None:
 
     assert decision.desired_inflight_groups == 8
     assert decision.actual_admit_groups == 6
+
+
+def test_work_conserving_policy_keeps_saturation_floor_after_debt_closes() -> None:
+    controller = DebtAwareAdmissionController(_work_conserving_config())
+
+    decision = controller.admit_count(
+        inflight_groups=6,
+        inflight_requests=48,
+        requests_per_group=8,
+        debt_remaining=0,
+        available_groups=8,
+        eager_admit_groups=0,
+    )
+
+    assert decision.desired_inflight_groups == 12
+    assert decision.actual_admit_groups == 6
+
+
+def test_work_conserving_policy_refills_partial_group_request_tail() -> None:
+    controller = DebtAwareAdmissionController(_work_conserving_config())
+
+    decision = controller.admit_count(
+        inflight_groups=12,
+        inflight_requests=40,
+        requests_per_group=8,
+        debt_remaining=5,
+        available_groups=4,
+        eager_admit_groups=0,
+    )
+
+    # Twelve whole group tasks are still alive, but only 40 of their 96
+    # request slots remain. Admit useful filler instead of treating every tail
+    # group as eight active requests.
+    assert decision.desired_inflight_groups == 12
+    assert decision.actual_admit_groups == 4
+
+
+def test_work_conserving_policy_respects_request_ceiling() -> None:
+    controller = DebtAwareAdmissionController(_work_conserving_config())
+
+    decision = controller.admit_count(
+        inflight_groups=12,
+        inflight_requests=124,
+        requests_per_group=8,
+        debt_remaining=5,
+        available_groups=4,
+        eager_admit_groups=0,
+    )
+
+    assert decision.actual_admit_groups == 0
 
 
 def test_admission_never_fetches_more_than_useful_available_groups() -> None:
@@ -448,6 +509,21 @@ def test_admission_config_accepts_complete_cli_namespace() -> None:
     assert config == _enabled_config()
 
 
+def test_admission_config_accepts_work_conserving_policy() -> None:
+    config, error = config_from_namespace(
+        Namespace(
+            partition_critical_admission_mode="on",
+            partition_critical_admission_policy="work_conserving",
+            partition_critical_admission_min_inflight_groups=12,
+            partition_critical_admission_max_inflight_groups=16,
+            partition_critical_admission_slack_groups=4,
+        )
+    )
+
+    assert error is None
+    assert config == _work_conserving_config()
+
+
 def test_admission_cli_validation_requires_fully_async_when_enabled() -> None:
     args = Namespace(
         fully_async=False,
@@ -485,6 +561,25 @@ def test_admission_cli_validation_accepts_hybrid_before_normalization() -> None:
     )
 
     assert validate_admission_namespace(args).mode is AdmissionMode.SHADOW
+
+
+def test_work_conserving_cli_validation_rejects_dispatch_capacity_below_ceiling() -> None:
+    args = Namespace(
+        fully_async=True,
+        hybrid=True,
+        partition_critical_admission_mode="on",
+        partition_critical_admission_policy="work_conserving",
+        partition_critical_admission_min_inflight_groups=12,
+        partition_critical_admission_max_inflight_groups=16,
+        partition_critical_admission_slack_groups=4,
+        sglang_server_concurrency=16,
+        rollout_num_gpus=2,
+        rollout_num_gpus_per_engine=1,
+        n_samples_per_prompt=8,
+    )
+
+    with pytest.raises(ValueError, match="client request capacity"):
+        validate_admission_namespace(args)
 
 
 @pytest.mark.parametrize(

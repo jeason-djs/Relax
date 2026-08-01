@@ -25,6 +25,7 @@ from relax.engine.rewards import async_rm, batched_async_rm
 from relax.engine.rollout import on_policy_distillation as opd
 from relax.engine.rollout.admission import (
     AdmissionMode,
+    AdmissionPolicy,
     DebtAwareAdmissionConfig,
     DebtAwareAdmissionController,
     PartitionTransferBatch,
@@ -149,6 +150,7 @@ class GenerateState(metaclass=SingletonMeta):
             set()
         )  # tasks that should not be aborted (abort_count >= partial_rollout_max_aborted_count)
         self.aborted = False
+        self.outstanding_generation_requests = 0
         self.evaluating = getattr(self, "evaluating", 0)  # preserve eval state across resets
         # Pre-fetched data ObjectRef for cross-step overlap.
         # Persisted across reset() calls so the ref submitted at the end of
@@ -167,9 +169,12 @@ class GenerateState(metaclass=SingletonMeta):
         samples: list[list[Sample]],
         *,
         admission_context: dict[str, Any] | None = None,
+        submission_events: list[asyncio.Event] | None = None,
     ) -> None:
+        if submission_events is not None and len(submission_events) != len(samples):
+            raise ValueError("submission_events must match the number of sample groups")
         max_aborted_count = getattr(self.args, "partial_rollout_max_aborted_count", None)
-        for group in samples:
+        for group_index, group in enumerate(samples):
             if admission_context is not None and request_observability_enabled(self.args):
                 for sample in group:
                     sample._relax_admission_context = admission_context
@@ -184,8 +189,12 @@ class GenerateState(metaclass=SingletonMeta):
                     group,
                     sampling_params=self.sampling_params.copy(),
                     evaluation=False,
+                    submitted_event=(submission_events[group_index] if submission_events else None),
                 )
             )
+            if submission_events is not None:
+                submission_event = submission_events[group_index]
+                task.add_done_callback(lambda _task, event=submission_event: event.set())
             # Keep the submitted samples reachable even when the coroutine
             # finishes exceptionally: Task.result() then raises and cannot
             # return the group needed to close its observability records.
@@ -197,6 +206,47 @@ class GenerateState(metaclass=SingletonMeta):
             else:
                 self.pendings.add(task)
         self.remaining_batch_size += len(samples)
+
+    async def submit_generate_tasks_debt_first(
+        self,
+        samples: list[list[Sample]],
+        *,
+        debt_group_limit: int,
+        admission_context: dict[str, Any] | None = None,
+    ) -> tuple[int, float]:
+        """Enqueue resumable old-debt groups before fresh filler groups.
+
+        The barrier waits only until every critical request has acquired its
+        client dispatch slot.  It does not wait for inference completion, so
+        fresh work can immediately fill the continuous batch while asyncio's
+        FIFO semaphore preserves the critical enqueue order.
+        """
+
+        if debt_group_limit < 0:
+            raise ValueError("debt_group_limit must be non-negative")
+        critical: list[list[Sample]] = []
+        filler: list[list[Sample]] = []
+        for group in samples:
+            is_old_debt = any(sample.metadata.get("work_origin") == "old_debt" for sample in group)
+            if is_old_debt and len(critical) < debt_group_limit:
+                critical.append(group)
+            else:
+                filler.append(group)
+
+        barrier_wall = 0.0
+        if critical:
+            barrier_start = monotonic()
+            submission_events = [asyncio.Event() for _ in critical]
+            self.submit_generate_tasks(
+                critical,
+                admission_context=admission_context,
+                submission_events=submission_events,
+            )
+            await asyncio.gather(*(event.wait() for event in submission_events))
+            barrier_wall = monotonic() - barrier_start
+        if filler:
+            self.submit_generate_tasks(filler, admission_context=admission_context)
+        return len(critical), barrier_wall
 
 
 async def _run_image_processor(
@@ -538,6 +588,7 @@ async def generate_and_rm(
     sample: Sample | list[Sample],
     sampling_params: dict[str, Any],
     evaluation: bool = False,
+    dispatch_started_event: asyncio.Event | None = None,
 ) -> Sample | list[Sample]:
     # mask previous off-policy generation for partial rollout
     if args.partial_rollout and args.mask_offpolicy_in_partial_rollout and sample.response_length > 0:
@@ -553,24 +604,31 @@ async def generate_and_rm(
     state = GenerateState(args)
 
     # generate
-    async with state.semaphore:
-        if state.aborted:
-            sample.mark_aborted()
-            return sample
+    state.outstanding_generation_requests += 1
+    try:
+        async with state.semaphore:
+            if dispatch_started_event is not None:
+                dispatch_started_event.set()
+            if state.aborted:
+                sample.mark_aborted()
+                return sample
 
-        with state.dp_rank_context() as _:
-            # Check sample.generate_function_path for per-sample custom_generate_function_path (e.g., from eval dataset config)
-            custom_func_path = getattr(sample, "generate_function_path", None) or args.custom_generate_function_path
+            with state.dp_rank_context() as _:
+                # Honor per-sample generation overrides (for example, eval datasets).
+                custom_func_path = getattr(sample, "generate_function_path", None) or args.custom_generate_function_path
 
-            if custom_func_path is not None:
-                custom_generate_func = load_function(custom_func_path)
-                # if signature has evaluation, pass evaluation
-                if "evaluation" in inspect.signature(custom_generate_func).parameters:
-                    sample = await custom_generate_func(args, sample, sampling_params, evaluation=evaluation)
+                if custom_func_path is not None:
+                    custom_generate_func = load_function(custom_func_path)
+                    # if signature has evaluation, pass evaluation
+                    if "evaluation" in inspect.signature(custom_generate_func).parameters:
+                        sample = await custom_generate_func(args, sample, sampling_params, evaluation=evaluation)
+                    else:
+                        sample = await custom_generate_func(args, sample, sampling_params)
                 else:
-                    sample = await custom_generate_func(args, sample, sampling_params)
-            else:
-                sample = await generate(args, sample, sampling_params, evaluation=evaluation)
+                    sample = await generate(args, sample, sampling_params, evaluation=evaluation)
+    finally:
+        state.outstanding_generation_requests -= 1
+        assert state.outstanding_generation_requests >= 0
 
     # for the rm that need the whole group, we will not do the rm here
     if args.group_rm:
@@ -637,7 +695,11 @@ def _aggregate_rollout_timing(all_samples: list[Sample], get_samples_times: list
 
 
 async def generate_and_rm_group(
-    args: Namespace, group: list[Sample], sampling_params: dict[str, Any], evaluation: bool = False
+    args: Namespace,
+    group: list[Sample],
+    sampling_params: dict[str, Any],
+    evaluation: bool = False,
+    submitted_event: asyncio.Event | None = None,
 ) -> list[Sample]:
     state = GenerateState(args)
 
@@ -666,14 +728,29 @@ async def generate_and_rm_group(
             sample._pre_encoded_mm_elapsed = t_enc
 
     tasks = []
+    dispatch_started_events = [asyncio.Event() for _ in group] if submitted_event is not None else None
     for idx, sample in enumerate(group):
         current_sampling_params = sampling_params.copy()
         if getattr(args, "sglang_enable_deterministic_inference", False):
             seed = state.group_sampling_seeds[idx]
             current_sampling_params["sampling_seed"] = seed
         tasks.append(
-            asyncio.create_task(generate_and_rm(args, sample, current_sampling_params, evaluation=evaluation))
+            asyncio.create_task(
+                generate_and_rm(
+                    args,
+                    sample,
+                    current_sampling_params,
+                    evaluation=evaluation,
+                    dispatch_started_event=(dispatch_started_events[idx] if dispatch_started_events else None),
+                )
+            )
         )
+    if submitted_event is not None:
+        async def mark_group_dispatched() -> None:
+            await asyncio.gather(*(event.wait() for event in dispatch_started_events or ()))
+            submitted_event.set()
+
+        asyncio.create_task(mark_group_dispatched())
 
     group = await asyncio.gather(*tasks)
     # The default SGLang path consumes this marker when it starts request
@@ -1118,6 +1195,8 @@ async def _generate_rollout_async_impl(
                     progress_groups=progress_groups,
                     transferred_groups=total_transfer_samples,
                     inflight_groups=inflight_groups,
+                    inflight_requests=state.outstanding_generation_requests,
+                    requests_per_group=args.n_samples_per_prompt,
                     cumulative_submitted_groups=state.remaining_batch_size,
                     previous_debt_groups=num_old_samples,
                     transfer_batch_groups=transfer_batch_size,
@@ -1128,6 +1207,8 @@ async def _generate_rollout_async_impl(
                 admission_controller.fail_open(type(exc).__name__)
                 admission_decision = admission_controller.admit_count(
                     inflight_groups=max(inflight_groups, 0),
+                    inflight_requests=max(state.outstanding_generation_requests, 0),
+                    requests_per_group=args.n_samples_per_prompt,
                     debt_remaining=0,
                     available_groups=max(target_data_size - progress_groups - inflight_groups, 0),
                     eager_admit_groups=(eager_fetch_groups if state.remaining_batch_size < target_data_size else 0),
@@ -1145,7 +1226,8 @@ async def _generate_rollout_async_impl(
                 logger.info(
                     "PARTITION_ADMISSION rollout_id=%s mode=%s logical_debt=%s "
                     "logical_debt_remaining=%s available=%s "
-                    "inflight=%s desired=%s bounded_admit=%s actual_admit=%s eager_admit=%s bypass=%s"
+                    "inflight=%s inflight_requests=%s desired=%s bounded_admit=%s "
+                    "actual_admit=%s eager_admit=%s policy=%s bypass=%s"
                     % (
                         rollout_id,
                         admission_decision.mode.value,
@@ -1153,10 +1235,12 @@ async def _generate_rollout_async_impl(
                         admission_decision.debt_remaining,
                         admission_decision.available_groups,
                         admission_decision.inflight_groups,
+                        admission_decision.inflight_requests,
                         admission_decision.desired_inflight_groups,
                         admission_decision.bounded_admit_groups,
                         admission_decision.actual_admit_groups,
                         admission_decision.eager_admit_groups,
+                        admission_decision.policy.value,
                         admission_decision.bypass_reason,
                     )
                 )
@@ -1173,22 +1257,39 @@ async def _generate_rollout_async_impl(
 
             samples = await loop.run_in_executor(None, ray.get, ref)
             get_samples_times.append(monotonic() - _t_get_samples)
-            state.submit_generate_tasks(
-                samples,
-                admission_context={
-                    "decision_id": admission_decision.decision_id,
-                    "decision_sequence": admission_decision.decision_sequence,
-                    "mode": admission_decision.mode.value,
-                    "logical_debt_remaining": admission_decision.debt_remaining,
-                    "inflight_before": admission_decision.inflight_groups,
-                    "desired_inflight": admission_decision.desired_inflight_groups,
-                    "available_groups": admission_decision.available_groups,
-                    "bounded_admit_groups": admission_decision.bounded_admit_groups,
-                    "eager_admit_groups": admission_decision.eager_admit_groups,
-                    "decision_admit_groups": admission_decision.actual_admit_groups,
-                    "bypass": admission_decision.bypass_reason,
-                },
-            )
+            admission_context = {
+                "decision_id": admission_decision.decision_id,
+                "decision_sequence": admission_decision.decision_sequence,
+                "mode": admission_decision.mode.value,
+                "logical_debt_remaining": admission_decision.debt_remaining,
+                "inflight_before": admission_decision.inflight_groups,
+                "desired_inflight": admission_decision.desired_inflight_groups,
+                "available_groups": admission_decision.available_groups,
+                "bounded_admit_groups": admission_decision.bounded_admit_groups,
+                "eager_admit_groups": admission_decision.eager_admit_groups,
+                "decision_admit_groups": admission_decision.actual_admit_groups,
+                "bypass": admission_decision.bypass_reason,
+                "policy": admission_decision.policy.value,
+                "inflight_requests_before": admission_decision.inflight_requests,
+                "requests_per_group": admission_decision.requests_per_group,
+            }
+            if admission_config.policy is AdmissionPolicy.WORK_CONSERVING:
+                critical_groups, barrier_wall = await state.submit_generate_tasks_debt_first(
+                    samples,
+                    debt_group_limit=admission_decision.debt_remaining,
+                    admission_context=admission_context,
+                )
+                logger.info(
+                    "PARTITION_ADMISSION_DISPATCH rollout_id=%s decision_id=%s "
+                    "critical_groups=%s filler_groups=%s barrier_wall=%.6f",
+                    rollout_id,
+                    admission_decision.decision_id,
+                    critical_groups,
+                    len(samples) - critical_groups,
+                    barrier_wall,
+                )
+            else:
+                state.submit_generate_tasks(samples, admission_context=admission_context)
             if admission_config.mode is AdmissionMode.ON:
                 break
 
@@ -1199,6 +1300,8 @@ async def _generate_rollout_async_impl(
             admission_controller.fail_open("no_progress")
             fallback_decision = admission_controller.admit_count(
                 inflight_groups=0,
+                inflight_requests=0,
+                requests_per_group=args.n_samples_per_prompt,
                 debt_remaining=admission_decision.debt_remaining,
                 available_groups=max(target_data_size - progress_groups, 0),
                 eager_admit_groups=eager_fetch_groups,
