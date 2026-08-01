@@ -89,6 +89,43 @@ def test_real_local_wrapper_only_stops_explicit_job_pid_and_keeps_monitor(tmp_pa
                 process.wait(timeout=5)
 
 
+def test_real_local_wrapper_uses_contract_python_for_ray_cli(tmp_path) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    capture = tmp_path / "ray-module-argv"
+    _write(fake_bin / "nvidia-smi", "#!/usr/bin/env bash\nexit 0\n", executable=True)
+    _write(
+        fake_bin / "contract-python",
+        """#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "$TASK22_TEST_RAY_MODULE_ARGV"
+[[ "$1" == "-m" && "$2" == "ray.scripts.scripts" ]]
+""",
+        executable=True,
+    )
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "NUM_GPUS": "0",
+        "RAY_ADDRESS": "",
+        "TASK22_PYTHON": str(fake_bin / "contract-python"),
+        "TASK22_TEST_RAY_MODULE_ARGV": str(capture),
+    }
+
+    result = subprocess.run(
+        ["bash", "-c", f'source "{LOCAL_ENTRYPOINT}"'],
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stderr
+    calls = capture.read_text(encoding="utf-8").splitlines()
+    assert calls[0] == "-m ray.scripts.scripts stop --force"
+    assert calls[1].startswith("-m ray.scripts.scripts start --head ")
+
+
 def test_real_task22_entrypoint_passes_input_guard_env_in_runtime_env_and_command(tmp_path) -> None:
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()

@@ -28,11 +28,27 @@ fi
 
 _LOCAL_SH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 
+_relax_ray() {
+    if [ -n "${TASK22_PYTHON:-}" ] && [ -x "${TASK22_PYTHON}" ]; then
+        "${TASK22_PYTHON}" -m ray.scripts.scripts "$@"
+    else
+        command ray "$@"
+    fi
+}
+
+_relax_ray_status() {
+    if [ -n "${TASK22_PYTHON:-}" ] && [ -x "${TASK22_PYTHON}" ]; then
+        timeout 5 "${TASK22_PYTHON}" -m ray.scripts.scripts status
+    else
+        timeout 5 ray status
+    fi
+}
+
 # ── delegate to ray-job.sh when inside an existing Ray cluster ─────────────
 # When RAY_ADDRESS is set AND `ray status` succeeds, we're already part of an
 # externally-managed Ray cluster. Skip local Ray startup / process cleanup and
 # fall through to ray-job.sh (source mode) for env setup.
-if [ -n "${RAY_ADDRESS:-}" ] && timeout 5 ray status >/dev/null 2>&1; then
+if [ -n "${RAY_ADDRESS:-}" ] && _relax_ray_status >/dev/null 2>&1; then
     echo "=== Detected existing Ray cluster (RAY_ADDRESS=$RAY_ADDRESS); delegating to ray-job.sh ==="
     # shellcheck source=./ray-job.sh
     source "${_LOCAL_SH_DIR}/ray-job.sh"
@@ -43,7 +59,7 @@ set -eo pipefail
 
 # ── process cleanup ─────────────────────────────────────────────────────────
 echo "=== Cleaning up stale processes ==="
-ray stop --force 2>/dev/null || true
+_relax_ray stop --force 2>/dev/null || true
 
 # Never use process-name-wide pkill here: local.sh is sourced from the training
 # wrapper while qualification monitors and other users' jobs may be Python
@@ -97,7 +113,7 @@ fi
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 echo "Starting Ray head node: MASTER_ADDR=$MASTER_ADDR, NUM_GPUS=$NUM_GPUS"
 
-ray start --head \
+_relax_ray start --head \
     --node-ip-address "${MASTER_ADDR}" \
     --num-gpus "${NUM_GPUS}" \
     --disable-usage-stats \
