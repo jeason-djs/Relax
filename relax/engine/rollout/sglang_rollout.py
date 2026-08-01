@@ -599,6 +599,12 @@ async def generate_and_rm(
         assert sample.response is not None
         if not args.group_rm:
             assert sample.reward is not None
+        # A debt-first dispatch barrier also covers samples that finished in a
+        # previous physical rollout.  They need no HTTP dispatch, so mark their
+        # slot as satisfied instead of making fresh filler wait for the rest of
+        # the group to finish.
+        if dispatch_started_event is not None:
+            dispatch_started_event.set()
         return sample
 
     state = GenerateState(args)

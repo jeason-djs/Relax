@@ -1,14 +1,34 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import asyncio
 from types import MethodType, SimpleNamespace
 
 import pytest
 
-from relax.engine.rollout.sglang_rollout import GenerateState
+from relax.engine.rollout.sglang_rollout import GenerateState, generate_and_rm
+from relax.utils.types import Sample
 
 
 def _group(origin: str, index: int) -> list[SimpleNamespace]:
     return [SimpleNamespace(metadata={"work_origin": origin}, index=index)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", (Sample.Status.COMPLETED, Sample.Status.TRUNCATED))
+async def test_completed_sample_satisfies_dispatch_barrier(status: Sample.Status) -> None:
+    dispatch_started = asyncio.Event()
+    sample = Sample(status=status, response="done", reward=1.0)
+    args = SimpleNamespace(partial_rollout=False, group_rm=False)
+
+    result = await generate_and_rm(
+        args,
+        sample,
+        sampling_params={},
+        dispatch_started_event=dispatch_started,
+    )
+
+    assert result is sample
+    assert dispatch_started.is_set()
 
 
 @pytest.mark.asyncio
