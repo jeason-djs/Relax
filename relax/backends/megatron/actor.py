@@ -1257,6 +1257,7 @@ class MegatronTrainRayActor(TrainRayActor):
         data_wait_begin = time.time()
         _task22_calibration_actor_phase(rollout_id, "data_wait_begin", data_wait_begin)
         logger.info(f"start to get rollout_id: {rollout_id} data from transfer queue for train_hybrid.")
+        self._begin_task22_sync_intent(rollout_id)
         dp_size = mpu.get_data_parallel_world_size(with_context_parallel=False)
         plan = build_rollout_minibatch_plan(self.args, dp_size)
         batch_size = plan.mini_local_sample_request
@@ -1473,6 +1474,7 @@ class MegatronTrainRayActor(TrainRayActor):
         tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
         dist.barrier(group=get_gloo_group())
         self._run_step_evaluation(rollout_id, end_update_weight=True)
+        self._verify_task22_sync_intent_cleared(rollout_id)
 
         # On the final training step the rollout component has already exited
         # its main loop, so the eval just triggered above will not be awaited
@@ -1480,6 +1482,73 @@ class MegatronTrainRayActor(TrainRayActor):
         # shutdown races with eval and tears down the SGLang engines mid-flight.
         if is_train_done:
             self._wait_for_previous_eval()
+
+    def _begin_task22_sync_intent(self, rollout_id: int) -> None:
+        if os.environ.get("RELAX_TASK22_SYNC_INTENT_GUARD", "0").strip().lower() not in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            return
+        error_message = ""
+        if dist.get_rank() == 0:
+            try:
+                rollout_serve_url = get_serve_url("rollout")
+                response = requests.post(
+                    f"{rollout_serve_url}/task22_sync_intent",
+                    params={"sync_id": rollout_id + 1, "actor_rollout_id": rollout_id},
+                    timeout=10,
+                )
+                response.raise_for_status()
+                result = response.json()
+                if result.get("enabled") is not True or result.get("active") is not True:
+                    raise RuntimeError(f"sync intent was not activated: {result}")
+                logger.info(
+                    "TASK22_SYNC_INTENT phase=actor_begin sync_id=%s actor_rollout_id=%s",
+                    rollout_id + 1,
+                    rollout_id,
+                )
+            except Exception as error:
+                error_message = f"{type(error).__name__}: {error}"
+                logger.exception(
+                    "Failed to activate Task22 sync intent for rollout_id=%s; aborting ON run",
+                    rollout_id,
+                )
+        error_messages = [None] * dist.get_world_size(group=get_gloo_group())
+        dist.all_gather_object(error_messages, error_message, group=get_gloo_group())
+        failures = [message for message in error_messages if message]
+        if failures:
+            raise RuntimeError(f"Task22 sync intent activation failed consistently across ranks: {failures}")
+
+    def _verify_task22_sync_intent_cleared(self, rollout_id: int) -> None:
+        if os.environ.get("RELAX_TASK22_SYNC_INTENT_GUARD", "0").strip().lower() not in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            return
+        error_message = ""
+        if dist.get_rank() == 0:
+            try:
+                rollout_serve_url = get_serve_url("rollout")
+                response = requests.get(f"{rollout_serve_url}/task22_sync_intent", timeout=10)
+                response.raise_for_status()
+                result = response.json()
+                if result.get("enabled") is not True or result.get("active") is not False:
+                    raise RuntimeError(f"sync intent remained active after publication: {result}")
+            except Exception as error:
+                error_message = f"{type(error).__name__}: {error}"
+                logger.exception(
+                    "Task22 sync intent did not clear after rollout_id=%s publication",
+                    rollout_id,
+                )
+        error_messages = [None] * dist.get_world_size(group=get_gloo_group())
+        dist.all_gather_object(error_messages, error_message, group=get_gloo_group())
+        failures = [message for message in error_messages if message]
+        if failures:
+            raise RuntimeError(f"Task22 sync intent cleanup failed consistently across ranks: {failures}")
 
     def train_async(self, rollout_id) -> None:
         if self.args.use_routing_replay:

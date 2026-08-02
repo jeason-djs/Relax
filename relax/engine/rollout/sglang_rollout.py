@@ -45,6 +45,18 @@ from relax.engine.rollout.permit_observability import (
     output_dir as permit_observability_dir,
 )
 from relax.engine.rollout.request_permit import GenerationAborted, InferencePermitManager
+from relax.engine.rollout.sync_intent import (
+    DEFAULT_ROLLOUT_REQUEST_PRIORITY,
+    adaptive_oversampling_groups,
+    get_sync_intent,
+    mark_work_origin,
+    plan_adaptive_window_fetch,
+    plan_debt_early_flush,
+    plan_intent_guard_fetch,
+    resolve_partition_request_priority,
+    sync_intent_guard_enabled,
+    wait_for_sync_intent_end,
+)
 from relax.utils.async_utils import run
 from relax.utils.data.data import Dataset
 from relax.utils.data.processing_utils import (
@@ -70,7 +82,6 @@ from relax.utils.utils import CURRENT_ROLLOUT_BATCH, compute_dp_size, transfer_b
 __all__ = ["generate_rollout"]
 
 logger = get_logger(__name__)
-
 
 # Misuse guard for the per-request permit contract. Set while the session-level
 # lock (GenerateState.semaphore) is held so that a legacy custom function that
@@ -369,6 +380,13 @@ async def generate(
         "sampling_params": sampling_params,
         "return_logprob": not evaluation,
     }
+    request_priority = (
+        DEFAULT_ROLLOUT_REQUEST_PRIORITY
+        if evaluation and getattr(args, "sglang_enable_priority_scheduling", False)
+        else resolve_partition_request_priority(args, sample)
+    )
+    if request_priority is not None:
+        payload["priority"] = request_priority
 
     if args.use_rollout_routing_replay:
         payload["return_routed_experts"] = True
@@ -895,6 +913,13 @@ async def generate_rollout_async(
     oversample_surplus = []
     total_transfer_samples = 0
     get_samples_times: list[float] = []
+    intent_guard_wait_seconds = 0.0
+    intent_guard_wait_count = 0
+    intent_guard_debt_fetch_groups = 0
+    intent_guard_early_flush_groups = 0
+    adaptive_window_groups = adaptive_oversampling_groups() if sync_intent_guard_enabled() else None
+    admitted_groups = 0
+    intent_debt_groups_inflight = 0
 
     # is_last bookkeeping: a partition train_X is filled across two steps (step X
     # commits committed_current, step X+1 backfills the deficit). Mark is_last on
@@ -930,19 +955,78 @@ async def generate_rollout_async(
     # round admitting a full over_sampling_batch_size so the surplus absorbs aborts.
     while not target_reached():
         while state.remaining_batch_size < submit_target:
+            intent_snapshot = get_sync_intent() if sync_intent_guard_enabled() else None
+            baseline_fetch_groups = args.over_sampling_batch_size + num_old_samples
+            default_fetch_groups = plan_adaptive_window_fetch(
+                cumulative_submitted_groups=admitted_groups,
+                baseline_fetch_groups=baseline_fetch_groups,
+                commit_target_groups=target_data_size,
+            )
+            if default_fetch_groups == 0:
+                break
+            fetch_groups = (
+                plan_intent_guard_fetch(
+                    snapshot=intent_snapshot,
+                    physical_rollout_id=rollout_id,
+                    old_debt_groups=num_old_samples,
+                    completed_debt_groups=min(total_transfer_samples, num_old_samples),
+                    inflight_debt_groups=intent_debt_groups_inflight,
+                    default_fetch_groups=default_fetch_groups,
+                )
+                if intent_snapshot is not None
+                else default_fetch_groups
+            )
+            if fetch_groups == 0:
+                assert intent_snapshot is not None and intent_snapshot.sync_id is not None
+                if state.pendings or state.protected_pendings:
+                    break
+                wait_start = monotonic()
+                logger.info(
+                    "TASK22_SYNC_INTENT phase=fresh_guard_wait sync_id=%s rollout_id=%s "
+                    "old_debt=%s submitted=%s pending=%s",
+                    intent_snapshot.sync_id,
+                    rollout_id,
+                    num_old_samples,
+                    admitted_groups,
+                    len(state.pendings | state.protected_pendings),
+                )
+                await asyncio.to_thread(wait_for_sync_intent_end, intent_snapshot.sync_id)
+                wait_duration = monotonic() - wait_start
+                intent_guard_wait_seconds += wait_duration
+                intent_guard_wait_count += 1
+                logger.info(
+                    "TASK22_SYNC_INTENT phase=fresh_guard_release sync_id=%s rollout_id=%s wait=%.6f",
+                    intent_snapshot.sync_id,
+                    rollout_id,
+                    wait_duration,
+                )
+                continue
             _t_get_samples = monotonic()
 
-            if state.prefetched_samples_ref is not None:
+            use_prefetched = state.prefetched_samples_ref is not None and fetch_groups == default_fetch_groups
+            if use_prefetched:
                 ref = state.prefetched_samples_ref
                 state.prefetched_samples_ref = None
                 logger.info(f"Rollout step {rollout_id}: using pre-fetched data from previous step")
             else:
-                ref = data_source.get_samples.remote(args.over_sampling_batch_size + num_old_samples)
+                ref = data_source.get_samples.remote(fetch_groups)
 
             samples = await loop.run_in_executor(None, ray.get, ref)
 
             get_samples_times.append(monotonic() - _t_get_samples)
+            old_debt_in_fetch = max(min(num_old_samples - admitted_groups, len(samples)), 0)
+            mark_work_origin(samples, old_debt_in_fetch)
+            if intent_snapshot is not None and intent_snapshot.active and old_debt_in_fetch:
+                intent_guard_debt_fetch_groups += old_debt_in_fetch
+                intent_debt_groups_inflight += old_debt_in_fetch
+                logger.info(
+                    "TASK22_SYNC_INTENT phase=debt_dispatch sync_id=%s rollout_id=%s groups=%s",
+                    intent_snapshot.sync_id,
+                    rollout_id,
+                    old_debt_in_fetch,
+                )
             state.submit_generate_tasks(samples)
+            admitted_groups += len(samples)
         # wait for the generation to finish (from both normal and protected pending sets)
         all_pendings = state.pendings | state.protected_pendings
         done, remaining = await asyncio.wait(all_pendings, return_when=asyncio.FIRST_COMPLETED)
@@ -950,6 +1034,11 @@ async def generate_rollout_async(
         state.protected_pendings = state.protected_pendings & remaining
         for task in done:
             group: list[Sample] = task.result()
+            group_is_intent_debt = bool(group) and all(
+                sample.metadata.get("work_origin") == "old_debt" for sample in group
+            )
+            if group_is_intent_debt and intent_debt_groups_inflight > 0:
+                intent_debt_groups_inflight -= 1
 
             if do_print:
                 sample = group[0][0] if isinstance(group[0], list) else group[0]
@@ -1009,6 +1098,39 @@ async def generate_rollout_async(
             if args.fully_async
             else args.rollout_batch_size
         )  # Samples per batch to transfer
+        intent_snapshot = get_sync_intent() if sync_intent_guard_enabled() else None
+        debt_tail = (
+            plan_debt_early_flush(
+                snapshot=intent_snapshot,
+                old_debt_groups=num_old_samples,
+                committed_debt_groups=committed_prev,
+                total_completed_groups=total_transfer_samples,
+                staged_groups=len(batch_to_transfer),
+            )
+            if intent_snapshot is not None
+            else 0
+        )
+        if debt_tail:
+            transfer_task = asyncio.create_task(
+                transfer_batch_to_data_system(
+                    args,
+                    batch_to_transfer[:debt_tail],
+                    debt_tail,
+                    rollout_id - 1,
+                    data_system_client,
+                    is_last=True,
+                )
+            )
+            committed_prev += debt_tail
+            transfer_tasks.append(transfer_task)
+            batch_to_transfer = batch_to_transfer[debt_tail:]
+            intent_guard_early_flush_groups += debt_tail
+            logger.info(
+                "TASK22_SYNC_INTENT phase=debt_partition_closed sync_id=%s rollout_id=%s groups=%s",
+                intent_snapshot.sync_id,
+                rollout_id,
+                debt_tail,
+            )
         # in fully async mode, we transfer all remaining samples when we reach the target size
         if len(batch_to_transfer) >= transfer_batch_size:
             if total_transfer_samples <= num_old_samples:
@@ -1239,7 +1361,17 @@ async def generate_rollout_async(
 
     state.reset()
 
-    return RolloutFnTrainOutput(samples=data, metrics=metric_gatherer.collect()), aborted_samples
+    metrics = metric_gatherer.collect()
+    metrics.update(
+        {
+            "rollout/task22_sync_intent/adaptive_window_groups": adaptive_window_groups or 0,
+            "rollout/task22_sync_intent/wait_seconds": intent_guard_wait_seconds,
+            "rollout/task22_sync_intent/wait_count": intent_guard_wait_count,
+            "rollout/task22_sync_intent/debt_fetch_groups": intent_guard_debt_fetch_groups,
+            "rollout/task22_sync_intent/early_flush_groups": intent_guard_early_flush_groups,
+        }
+    )
+    return RolloutFnTrainOutput(samples=data, metrics=metrics), aborted_samples
 
 
 EVAL_PROMPT_DATASET = {}
