@@ -20,6 +20,7 @@ from relax.engine.rollout.sync_intent import (
     mark_work_origin,
     plan_adaptive_window_fetch,
     plan_baseline_window_fetch,
+    plan_carry_aware_oversampling_seed,
     plan_dp_aligned_extra_groups,
     plan_intent_guard_fetch,
     resolve_partition_request_priority,
@@ -279,6 +280,50 @@ def test_baseline_window_matches_fixed_batch_oversampling(
         )
         == expected_fetch_groups
     )
+
+
+@pytest.mark.parametrize(
+    ("adopted_current_groups", "missing_debt_groups", "expected_seed"),
+    (
+        (0, 0, 16),
+        (2, 0, 14),
+        (8, 0, 8),
+        (12, 0, 4),
+        (16, 0, 0),
+        (20, 0, 0),
+        (4, 2, 14),
+        (8, 1, 9),
+        (16, 3, 3),
+    ),
+)
+def test_carry_aware_oversampling_preserves_baseline_envelope(
+    adopted_current_groups: int,
+    missing_debt_groups: int,
+    expected_seed: int,
+) -> None:
+    assert (
+        plan_carry_aware_oversampling_seed(
+            oversampling_envelope_groups=16,
+            adopted_current_groups=adopted_current_groups,
+            missing_debt_groups=missing_debt_groups,
+        )
+        == expected_seed
+    )
+
+
+def test_carry_aware_oversampling_rejects_invalid_counts() -> None:
+    with pytest.raises(ValueError, match="must be non-negative"):
+        plan_carry_aware_oversampling_seed(
+            oversampling_envelope_groups=16,
+            adopted_current_groups=-1,
+            missing_debt_groups=0,
+        )
+    with pytest.raises(ValueError, match="must be positive"):
+        plan_carry_aware_oversampling_seed(
+            oversampling_envelope_groups=0,
+            adopted_current_groups=0,
+            missing_debt_groups=0,
+        )
 
 
 def test_old_debt_priority_is_opt_in(monkeypatch: pytest.MonkeyPatch) -> None:

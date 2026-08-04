@@ -387,6 +387,21 @@ def plan_baseline_window_fetch(
     return fetch_batch_groups
 
 
+def plan_carry_aware_oversampling_seed(
+    *,
+    oversampling_envelope_groups: int,
+    adopted_current_groups: int,
+    missing_debt_groups: int,
+) -> int:
+    """Seed missing debt plus the unoccupied part of the current candidate envelope."""
+
+    if min(oversampling_envelope_groups, adopted_current_groups, missing_debt_groups) < 0:
+        raise ValueError("oversampling envelope, adopted current, and missing debt groups must be non-negative")
+    if oversampling_envelope_groups == 0:
+        raise ValueError("oversampling_envelope_groups must be positive")
+    return missing_debt_groups + max(oversampling_envelope_groups - adopted_current_groups, 0)
+
+
 def mark_work_origin(
     samples: list[list[object]],
     old_debt_groups: int,

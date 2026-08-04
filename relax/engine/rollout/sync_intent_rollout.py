@@ -32,11 +32,12 @@ from relax.engine.rollout.sync_intent import (
     mark_work_origin,
     plan_adaptive_window_fetch,
     plan_baseline_window_fetch,
+    plan_carry_aware_oversampling_seed,
     plan_dp_aligned_extra_groups,
     plan_intent_guard_fetch,
-    sync_intent_admission_policy_enabled,
     sync_intent_abort_retry_interval_seconds,
     sync_intent_abort_timeout_seconds,
+    sync_intent_admission_policy_enabled,
     sync_intent_protected_drain_timeout_seconds,
     validate_disjoint_rollout_groups,
     wait_for_sync_intent_end,
@@ -262,6 +263,9 @@ async def generate_rollout_async_with_sync_intent(
         )
         completed_buffer_groups = int(completed_buffer_groups)
     if not admission_policy_enabled:
+        adopted_current_groups = adopted_cross_version_groups - adopted_debt_groups
+        minimal_envelope_seed_pending = cross_version_kv_enabled(args) and not is_final_backfill
+        initial_current_fresh_groups = max(args.over_sampling_batch_size - adopted_current_groups, 0)
         logger.info(
             "TASK22_A3 event=minimal_mode rollout_id=%s admission_policy=false "
             "progress_hedge=false priority=%s work_aware=%s",
@@ -269,6 +273,21 @@ async def generate_rollout_async_with_sync_intent(
             bool(getattr(args, "sglang_enable_priority_scheduling", False)),
             bool(getattr(args, "slime_router_work_aware", False)),
         )
+        if cross_version_kv_enabled(args) and not is_final_backfill:
+            logger.info(
+                "TASK22_A3 event=carry_aware_envelope rollout_id=%s envelope_groups=%s "
+                "adopted_groups=%s adopted_debt_groups=%s adopted_current_groups=%s "
+                "fresh_batch_groups=%s resident_groups=%s",
+                rollout_id,
+                args.over_sampling_batch_size,
+                adopted_cross_version_groups,
+                adopted_debt_groups,
+                adopted_current_groups,
+                initial_current_fresh_groups,
+                state.remaining_batch_size,
+            )
+    else:
+        minimal_envelope_seed_pending = False
 
     if is_final_backfill:
         logger.info(f"Starting final rollout backfill step {rollout_id}: target(prev)={target_data_size}")
@@ -303,11 +322,19 @@ async def generate_rollout_async_with_sync_intent(
                     completed_buffer_groups=completed_buffer_groups,
                 )
             else:
-                default_fetch_groups = plan_baseline_window_fetch(
-                    resident_groups=state.remaining_batch_size,
-                    submit_target_groups=target_data_size,
-                    fetch_batch_groups=baseline_fetch_groups,
-                )
+                if minimal_envelope_seed_pending:
+                    default_fetch_groups = plan_carry_aware_oversampling_seed(
+                        oversampling_envelope_groups=args.over_sampling_batch_size,
+                        adopted_current_groups=adopted_current_groups,
+                        missing_debt_groups=missing_debt_groups,
+                    )
+                    minimal_envelope_seed_pending = False
+                else:
+                    default_fetch_groups = plan_baseline_window_fetch(
+                        resident_groups=state.remaining_batch_size,
+                        submit_target_groups=target_data_size,
+                        fetch_batch_groups=baseline_fetch_groups,
+                    )
             default_fetch_groups = max(default_fetch_groups, missing_debt_groups)
             using_a3_progress_hedge = False
             if admission_policy_enabled and default_fetch_groups == 0 and missing_debt_groups == 0:
