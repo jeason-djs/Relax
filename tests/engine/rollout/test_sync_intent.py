@@ -8,6 +8,7 @@ from relax.engine.rollout.sync_intent import (
     CARRYOVER_RESUME_REQUEST_PRIORITY,
     DEFAULT_ROLLOUT_REQUEST_PRIORITY,
     OLD_DEBT_REQUEST_PRIORITY,
+    SYNC_INTENT_ADMISSION_POLICY_ENV,
     SYNC_INTENT_POLICY_ENV,
     SYNC_INTENT_PROTECTED_DRAIN_TIMEOUT_ENV,
     SYNC_INTENT_QUIESCE_FLOOR_ENV,
@@ -18,10 +19,12 @@ from relax.engine.rollout.sync_intent import (
     SyncIntentSnapshot,
     mark_work_origin,
     plan_adaptive_window_fetch,
+    plan_baseline_window_fetch,
     plan_dp_aligned_extra_groups,
     plan_intent_guard_fetch,
     resolve_partition_request_priority,
     should_admit_fresh,
+    sync_intent_admission_policy_enabled,
     sync_intent_policy_enabled,
     sync_intent_protected_drain_timeout_seconds,
     validate_disjoint_rollout_groups,
@@ -41,6 +44,22 @@ def test_policy_enable_values(monkeypatch: pytest.MonkeyPatch) -> None:
     for value in ("1", "true", "yes", "on"):
         monkeypatch.setenv(SYNC_INTENT_POLICY_ENV, value)
         assert sync_intent_policy_enabled()
+
+
+def test_admission_policy_defaults_to_sync_intent_and_can_be_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(SYNC_INTENT_ADMISSION_POLICY_ENV, raising=False)
+    monkeypatch.delenv(SYNC_INTENT_POLICY_ENV, raising=False)
+    assert not sync_intent_admission_policy_enabled()
+
+    monkeypatch.setenv(SYNC_INTENT_POLICY_ENV, "1")
+    assert sync_intent_admission_policy_enabled()
+
+    monkeypatch.setenv(SYNC_INTENT_ADMISSION_POLICY_ENV, "0")
+    assert not sync_intent_admission_policy_enabled()
+
+    monkeypatch.setenv(SYNC_INTENT_ADMISSION_POLICY_ENV, "invalid")
+    with pytest.raises(ValueError, match="must be a boolean"):
+        sync_intent_admission_policy_enabled()
 
 
 @pytest.mark.parametrize(
@@ -232,6 +251,31 @@ def test_adaptive_window_consumes_carryover_before_fresh_hedge(
             hedge_groups=8,
             window_initialized=False,
             completed_buffer_groups=completed_buffer_groups,
+        )
+        == expected_fetch_groups
+    )
+
+
+@pytest.mark.parametrize(
+    ("resident_groups", "submit_target_groups", "expected_fetch_groups"),
+    (
+        (0, 8, 16),
+        (7, 8, 16),
+        (8, 8, 0),
+        (20, 8, 0),
+        (0, 0, 0),
+    ),
+)
+def test_baseline_window_matches_fixed_batch_oversampling(
+    resident_groups: int,
+    submit_target_groups: int,
+    expected_fetch_groups: int,
+) -> None:
+    assert (
+        plan_baseline_window_fetch(
+            resident_groups=resident_groups,
+            submit_target_groups=submit_target_groups,
+            fetch_batch_groups=16,
         )
         == expected_fetch_groups
     )

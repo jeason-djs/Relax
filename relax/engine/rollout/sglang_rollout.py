@@ -1638,7 +1638,7 @@ def generate_rollout(
         output, _ = run(eval_rollout(args, rollout_id))
         return output
 
-    if sync_intent_policy_enabled():
+    if sync_intent_policy_enabled() or cross_version_kv_enabled(args):
         from relax.engine.rollout.sync_intent_rollout import generate_rollout_async_with_sync_intent
 
         output, aborted_samples = run(

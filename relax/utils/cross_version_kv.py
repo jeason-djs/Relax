@@ -179,7 +179,7 @@ def cross_version_kv_enabled(args: object) -> bool:
     return bool(getattr(args, "enable_cross_version_kv_continuation", False))
 
 
-def validate_cross_version_kv_args(args: object, *, sync_intent_enabled: bool) -> None:
+def validate_cross_version_kv_args(args: object) -> None:
     if not cross_version_kv_enabled(args):
         return
     if not getattr(args, "hybrid", False):
@@ -203,8 +203,6 @@ def validate_cross_version_kv_args(args: object, *, sync_intent_enabled: bool) -
     max_staleness = int(getattr(args, "max_staleness"))
     if max_gap > max_staleness:
         raise ValueError(f"--cross-version-kv-max-gap must not exceed --max-staleness ({max_gap} > {max_staleness}).")
-    if not sync_intent_enabled:
-        raise ValueError("--enable-cross-version-kv-continuation currently requires RELAX_SYNC_INTENT_POLICY=1.")
 
 
 def cross_version_kv_strict_refresh(weight_version: int, max_gap: int) -> bool:

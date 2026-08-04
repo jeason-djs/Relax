@@ -31,8 +31,10 @@ from relax.engine.rollout.sync_intent import (
     get_sync_intent,
     mark_work_origin,
     plan_adaptive_window_fetch,
+    plan_baseline_window_fetch,
     plan_dp_aligned_extra_groups,
     plan_intent_guard_fetch,
+    sync_intent_admission_policy_enabled,
     sync_intent_abort_retry_interval_seconds,
     sync_intent_abort_timeout_seconds,
     sync_intent_protected_drain_timeout_seconds,
@@ -250,12 +252,23 @@ async def generate_rollout_async_with_sync_intent(
     prev_target = num_old_samples
     curr_target = 0 if is_final_backfill else args.rollout_batch_size
     loop = asyncio.get_running_loop()
-    completed_buffer_groups = await loop.run_in_executor(
-        None,
-        ray.get,
-        data_source.get_completed_buffer_group_count.remote(target_data_size),
-    )
-    completed_buffer_groups = int(completed_buffer_groups)
+    admission_policy_enabled = sync_intent_admission_policy_enabled()
+    completed_buffer_groups = 0
+    if admission_policy_enabled:
+        completed_buffer_groups = await loop.run_in_executor(
+            None,
+            ray.get,
+            data_source.get_completed_buffer_group_count.remote(target_data_size),
+        )
+        completed_buffer_groups = int(completed_buffer_groups)
+    if not admission_policy_enabled:
+        logger.info(
+            "TASK22_A3 event=minimal_mode rollout_id=%s admission_policy=false "
+            "progress_hedge=false priority=%s work_aware=%s",
+            rollout_id,
+            bool(getattr(args, "sglang_enable_priority_scheduling", False)),
+            bool(getattr(args, "slime_router_work_aware", False)),
+        )
 
     if is_final_backfill:
         logger.info(f"Starting final rollout backfill step {rollout_id}: target(prev)={target_data_size}")
@@ -271,7 +284,6 @@ async def generate_rollout_async_with_sync_intent(
 
     while not target_reached():
         while True:
-            intent_snapshot = get_sync_intent()
             baseline_fetch_groups = args.over_sampling_batch_size + num_old_samples
             remaining_commit_groups = max(prev_target - accepted_debt_groups, 0) + max(
                 curr_target - progressed_fresh_groups,
@@ -281,17 +293,24 @@ async def generate_rollout_async_with_sync_intent(
                 num_old_samples - accepted_debt_groups - intent_debt_groups_inflight,
                 0,
             )
-            default_fetch_groups = plan_adaptive_window_fetch(
-                resident_groups=state.remaining_batch_size,
-                baseline_fetch_groups=baseline_fetch_groups,
-                remaining_commit_groups=remaining_commit_groups,
-                hedge_groups=original_hedge_groups,
-                window_initialized=candidate_window_initialized,
-                completed_buffer_groups=completed_buffer_groups,
-            )
+            if admission_policy_enabled:
+                default_fetch_groups = plan_adaptive_window_fetch(
+                    resident_groups=state.remaining_batch_size,
+                    baseline_fetch_groups=baseline_fetch_groups,
+                    remaining_commit_groups=remaining_commit_groups,
+                    hedge_groups=original_hedge_groups,
+                    window_initialized=candidate_window_initialized,
+                    completed_buffer_groups=completed_buffer_groups,
+                )
+            else:
+                default_fetch_groups = plan_baseline_window_fetch(
+                    resident_groups=state.remaining_batch_size,
+                    submit_target_groups=target_data_size,
+                    fetch_batch_groups=baseline_fetch_groups,
+                )
             default_fetch_groups = max(default_fetch_groups, missing_debt_groups)
             using_a3_progress_hedge = False
-            if default_fetch_groups == 0 and missing_debt_groups == 0:
+            if admission_policy_enabled and default_fetch_groups == 0 and missing_debt_groups == 0:
                 live_hedge = plan_cross_version_kv_progress_hedge(
                     adopted_groups=adopted_cross_version_groups,
                     adopted_debt_groups=adopted_debt_groups,
@@ -307,24 +326,30 @@ async def generate_rollout_async_with_sync_intent(
             if default_fetch_groups == 0:
                 break
 
-            observed_group_latency_seconds = (
-                statistics.median(state.recent_group_latency_seconds) if state.recent_group_latency_seconds else None
-            )
-            fetch_groups = plan_intent_guard_fetch(
-                snapshot=intent_snapshot,
-                physical_rollout_id=rollout_id,
-                old_debt_groups=num_old_samples,
-                completed_debt_groups=accepted_debt_groups,
-                inflight_debt_groups=intent_debt_groups_inflight,
-                observed_group_latency_seconds=observed_group_latency_seconds,
-                default_fetch_groups=default_fetch_groups,
-            )
-            if fetch_groups == 0:
-                if state.pendings or state.protected_pendings:
-                    break
-                assert intent_snapshot.sync_id is not None
-                await asyncio.to_thread(wait_for_sync_intent_end, intent_snapshot.sync_id)
-                continue
+            if admission_policy_enabled:
+                intent_snapshot = get_sync_intent()
+                observed_group_latency_seconds = (
+                    statistics.median(state.recent_group_latency_seconds)
+                    if state.recent_group_latency_seconds
+                    else None
+                )
+                fetch_groups = plan_intent_guard_fetch(
+                    snapshot=intent_snapshot,
+                    physical_rollout_id=rollout_id,
+                    old_debt_groups=num_old_samples,
+                    completed_debt_groups=accepted_debt_groups,
+                    inflight_debt_groups=intent_debt_groups_inflight,
+                    observed_group_latency_seconds=observed_group_latency_seconds,
+                    default_fetch_groups=default_fetch_groups,
+                )
+                if fetch_groups == 0:
+                    if state.pendings or state.protected_pendings:
+                        break
+                    assert intent_snapshot.sync_id is not None
+                    await asyncio.to_thread(wait_for_sync_intent_end, intent_snapshot.sync_id)
+                    continue
+            else:
+                fetch_groups = default_fetch_groups
             get_samples_started_at = monotonic()
             use_prefetched = state.prefetched_samples_ref is not None and fetch_groups == default_fetch_groups
             if use_prefetched:
@@ -350,9 +375,11 @@ async def generate_rollout_async_with_sync_intent(
                     max(curr_target - progressed_fresh_groups, 0),
                 )
 
-            active_guard = intent_snapshot.active and (
-                intent_snapshot.actor_rollout_id is None or rollout_id > intent_snapshot.actor_rollout_id
-            )
+            active_guard = False
+            if admission_policy_enabled:
+                active_guard = intent_snapshot.active and (
+                    intent_snapshot.actor_rollout_id is None or rollout_id > intent_snapshot.actor_rollout_id
+                )
             old_debt_in_fetch = min(missing_debt_groups, len(samples)) if num_old_samples > 0 else 0
             speculative_groups_in_fetch = len(samples) - old_debt_in_fetch if num_old_samples and active_guard else 0
             mark_work_origin(
@@ -361,14 +388,17 @@ async def generate_rollout_async_with_sync_intent(
                 fresh_origin="speculative_fresh" if speculative_groups_in_fetch else "fresh",
             )
             intent_debt_groups_inflight += old_debt_in_fetch
-            await _submit_generate_tasks_debt_first(
-                state,
-                args,
-                samples,
-                old_debt_in_fetch,
-                task_started_at,
-                task_groups,
-            )
+            if admission_policy_enabled:
+                await _submit_generate_tasks_debt_first(
+                    state,
+                    args,
+                    samples,
+                    old_debt_in_fetch,
+                    task_started_at,
+                    task_groups,
+                )
+            else:
+                _submit_generate_tasks(state, args, samples, task_started_at, task_groups)
             candidate_window_initialized = True
 
         all_pendings = state.pendings | state.protected_pendings
